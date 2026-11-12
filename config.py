@@ -1,7 +1,11 @@
 import os
 
-# 감시 유니버스 (코스피 시총 상위 우량주 및 대표 ETF)
-UNIVERSE = {
+# 동적 스크리닝 활성화 여부 (True: 매일 아침 시장 거래대금 TOP 우량주 자동 감시, False: 고정 코어 유니버스)
+DYNAMIC_SCREENING = True
+SCREENER_TOP_N = 20
+
+# 고정 코어 유니버스 (동적 스크리닝 비활성화 시 또는 오프라인 폴백용)
+DEFAULT_UNIVERSE = {
     "삼성전자": "005930",
     "SK하이닉스": "000660",
     "현대차": "005380",
@@ -43,5 +47,5 @@ POLL_INTERVAL_SECONDS = 60    # 장중 1분 주기 감시
 API_REQUEST_DELAY = 0.3       # API 연속 호출 시 0.3초 대기 (레이트 리밋 방어)
 
 # 키움 API 엔드포인트
-MOCK_API_BASE_URL = "https://openapivts.koreainvestment.com:29443" # REST 모의투자
+MOCK_API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 REAL_API_BASE_URL = "https://openapi.koreainvestment.com:9443"

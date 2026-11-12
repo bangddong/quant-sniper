@@ -4,12 +4,14 @@ import json
 import datetime
 import subprocess
 from config import (
-    UNIVERSE, STOP_LOSS_PCT, TRAILING_STOP_TRIGGER, TRAILING_STOP_LOCK,
+    DYNAMIC_SCREENING, SCREENER_TOP_N, DEFAULT_UNIVERSE,
+    STOP_LOSS_PCT, TRAILING_STOP_TRIGGER, TRAILING_STOP_LOCK,
     TAKE_PROFIT_PCT, MAX_HOLD_DAYS, MAX_ALLOC_PER_STOCK, MAX_POSITIONS,
     DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
+from screener import get_dynamic_universe
 
 TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades.json")
 POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
@@ -48,15 +50,32 @@ def is_market_open():
 
 def run_trading_loop():
     print("=" * 60)
-    print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작")
+    print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 활성화)")
     print("=" * 60)
     
     api = KiwoomRestAPI()
+    last_screened_date = None
+    active_universe = DEFAULT_UNIVERSE
     
     while True:
         try:
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             
+            # 매일 아침 당일 거래대금 TOP 우량주 동적 스크리닝 갱신
+            if DYNAMIC_SCREENING and (last_screened_date != today_str):
+                print(f"[{now_str}] 🔍 당일 거래대금 TOP 우량주 동적 스크리닝 가동...")
+                screened = get_dynamic_universe(SCREENER_TOP_N)
+                if screened:
+                    active_universe = screened
+                    last_screened_date = today_str
+                    print(f"[{now_str}] ✅ 오늘자 감시 유니버스 {len(active_universe)}종목 갱신 완료:")
+                    print("   ", ", ".join(list(active_universe.keys())[:10]), "...")
+                else:
+                    active_universe = DEFAULT_UNIVERSE
+                    print(f"[{now_str}] [WARN] 스크리닝 실패로 기본 코어 유니버스로 폴백합니다.")
+                    
             # 장 운영 시간 확인
             if not is_market_open():
                 print(f"[{now_str}] 정규장 운영 시간 외입니다. 대기 중...")
@@ -68,7 +87,7 @@ def run_trading_loop():
             
             # 1. 캔들 데이터 조회
             candles_dict = {}
-            for name, code in UNIVERSE.items():
+            for name, code in active_universe.items():
                 c = api.get_daily_candles(code, 30)
                 if c:
                     candles_dict[name] = c
@@ -151,7 +170,7 @@ def run_trading_loop():
                     if cash < alloc_cap * 0.8:
                         break
                         
-                    code = UNIVERSE[name]
+                    code = active_universe[name]
                     entry_p = sig["entry_price"]
                     shares = int(alloc_cap // entry_p)
                     if shares < 1:
