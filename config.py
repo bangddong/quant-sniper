@@ -45,7 +45,7 @@ MAX_POSITIONS = 4             # 최대 동시 보유 종목 수 (최소 20% 현�
 DAILY_KILL_SWITCH_PCT = 0.040 # 일일 계좌 누적 손실 -4.0% 도달 시 당일 올스톱
 
 # 감시 및 호출 주기
-POLL_INTERVAL_SECONDS = 60    # 장중 1분 주기 감시
+POLL_INTERVAL_SECONDS = 30    # 장중 30초 주기 초정밀 감시 (칼손절 및 익절 반응속도 극대화)
 API_REQUEST_DELAY = 0.3       # API 연속 호출 시 0.3초 대기 (레이트 리밋 방어)
 
 # 키움 API 엔드포인트
