@@ -4,6 +4,7 @@ import os
 DYNAMIC_SCREENING = True
 SCREENER_TOP_N = 20
 MIN_MARKET_CAP_KRW = 1_000_000_000_000 # 🛡️ 시가총액 최소 1조 원 이상 (하루짜리 잡주/테마주 원천 차단)
+MAX_MARKET_CAP_KRW = 5_000_000_000_000 # 🛡️ 시가총액 최대 5조 원 이하 (굼뜬 10조+ 메가캡 배제, 탄력적 황금구간)
 
 # 고정 코어 유니버스 (동적 스크리닝 비활성화 시 또는 오프라인 폴백용)
 DEFAULT_UNIVERSE = {

@@ -1,42 +1,60 @@
 import urllib.request
 import json
-from config import MIN_MARKET_CAP_KRW, SCREENER_TOP_N
+from config import MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, SCREENER_TOP_N
 
-def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW):
+def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW, max_market_cap=MAX_MARKET_CAP_KRW):
     """
-    코스피/코스닥 시장에서 당일 거래대금 및 시가총액 최상위 우량주를 실시간 동적 스크리닝
-    - 🛡️ 시가총액 최소 1조 원(1,000,000,000,000원) 이상 초대형 우량주만 필터링 (하루짜리 작전주·잡주 원천 차단)
+    코스피/코스닥 시장에서 당일 거래대금 및 시가총액 기준 우량주를 실시간 동적 스크리닝
+    - 🛡️ 시가총액 최소 1조 원(1,000,000,000,000원) 이상 (하루짜리 작전주·잡주 원천 차단)
+    - 🛡️ 시가총액 최대 5조 원(5,000,000,000,000원) 이하 (굼뜬 10조+ 메가캡 배제, 탄력성 극대화)
     - 🛡️ 우선주, 스팩, ETN 등 변칙 종목 원천 배제
     - 🛡️ 거래대금(기관·외인 실질 유동성) 최상위 순 정렬
     """
-    url = "https://m.stock.naver.com/api/stocks/marketValue/KOSPI?page=1&pageSize=100"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    all_raw = []
+    headers = {"User-Agent": "Mozilla/5.0"}
     
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[SCREENER ERR] 스크리너 데이터 수신 실패: {e}")
+    # KOSPI & KOSDAQ 상위권 스캔 (1~3페이지)
+    for market in ["KOSPI", "KOSDAQ"]:
+        for page in [1, 2, 3]:
+            url = f"https://m.stock.naver.com/api/stocks/marketValue/{market}?page={page}&pageSize=50"
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                    for s in data.get("stocks", []):
+                        all_raw.append(s)
+            except Exception as e:
+                # 개별 페이지 에러 시 패스
+                continue
+                
+    if not all_raw:
+        print("[SCREENER ERR] 스크리너 데이터 수신 실패")
         return {}
         
     candidates = []
-    for s in data.get("stocks", []):
+    seen_codes = set()
+    
+    for s in all_raw:
         name = s.get("stockName", "")
         code = s.get("itemCode", "")
         price = float(s.get("closePriceRaw", 0))
         trade_val = float(s.get("accumulatedTradingValueRaw", 0))
         market_cap = float(s.get("marketValueRaw", 0))
         
+        if code in seen_codes:
+            continue
+            
         # 1. 잡주·위험종목 필터링 (우선주, 스팩, ETN)
         if name.endswith("우") or "우B" in name or "스팩" in name or "ETN" in name:
             continue
         if price <= 0:
             continue
             
-        # 2. 🛡️ 시가총액 1조 원 미만 원천 컷 (하루 반짝 테마주·작전주 배제)
-        if market_cap < min_market_cap:
+        # 2. 🛡️ 황금 탄력 구간: 시총 1조 원 이상 ~ 5조 원 이하
+        if not (min_market_cap <= market_cap <= max_market_cap):
             continue
             
+        seen_codes.add(code)
         candidates.append({
             "name": name,
             "code": code,
@@ -53,6 +71,6 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
 
 if __name__ == "__main__":
     universe = get_dynamic_universe(20)
-    print(f"🎯 [시총 1조원 이상] 동적 스크리닝 결과 ({len(universe)}종목):")
+    print(f"🎯 [시총 1조~5조 황금구간] 동적 스크리닝 결과 ({len(universe)}종목):")
     for name, code in universe.items():
         print(f" - {name} ({code})")
