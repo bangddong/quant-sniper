@@ -15,6 +15,26 @@ from screener import get_dynamic_universe
 
 TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades.json")
 POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
+HEALTH_FILE = os.path.join(os.path.dirname(__file__), "health.json")
+
+def update_health_status(status="healthy", detail="", sync_git=False):
+    """봇 생존 및 헬스체크 상태 기록 (로컬 1분 갱신, 중요 이벤트 시 깃허브 동기화)"""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    health_data = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "detail": detail,
+        "pid": os.getpid(),
+        "is_market_open": is_market_open()
+    }
+    save_json(HEALTH_FILE, health_data)
+    if sync_git:
+        try:
+            subprocess.run(["git", "add", "health.json"], cwd=repo_dir, check=False)
+            subprocess.run(["git", "commit", "-m", f"[HEALTH] {detail}"], cwd=repo_dir, check=False)
+            subprocess.run(["git", "push"], cwd=repo_dir, check=False)
+        except Exception:
+            pass
 
 def load_json(filepath, default):
     if os.path.exists(filepath):
@@ -71,7 +91,10 @@ def run_trading_loop():
     print("=" * 60)
     
     # 깃 푸시 권한 사전 점검
-    check_git_permission()
+    git_ok = check_git_permission()
+    
+    # 가동 헬스체크 신호 기록 및 초기 푸시
+    update_health_status(status="running", detail="봇 최초 가동 시작", sync_git=git_ok)
     
     api = KiwoomRestAPI()
     last_screened_date = None
@@ -226,6 +249,7 @@ def run_trading_loop():
                     git_commit_and_push(f"매수 저격 체결: {', '.join(new_buys)}")
                     
             print(f"[{now_str}] 감시 완료. 현재 보유 종목: {list(positions.keys())}")
+            update_health_status(status="running", detail=f"정규 감시 중 (보유: {len(positions)}개)")
             time.sleep(POLL_INTERVAL_SECONDS)
             
         except Exception as e:
