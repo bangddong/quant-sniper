@@ -1,0 +1,14 @@
+[Unit]
+Description=Kiwoom Quant Sniper Trading Bot Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/quant-sniper
+ExecStart=/usr/bin/python3 /home/user/quant-sniper/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
