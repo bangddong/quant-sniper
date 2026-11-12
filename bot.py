@@ -17,9 +17,8 @@ TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades.json")
 POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
 HEALTH_FILE = os.path.join(os.path.dirname(__file__), "health.json")
 
-def update_health_status(status="healthy", detail="", sync_git=False):
-    """봇 생존 및 헬스체크 상태 기록 (로컬 1분 갱신, 중요 이벤트 시 깃허브 동기화)"""
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
+def update_health_status(status="healthy", detail=""):
+    """봇 생존 및 헬스체크 상태 로컬 파일 갱신 (1분 주기, 150바이트 고정)"""
     health_data = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": status,
@@ -28,13 +27,38 @@ def update_health_status(status="healthy", detail="", sync_git=False):
         "is_market_open": is_market_open()
     }
     save_json(HEALTH_FILE, health_data)
-    if sync_git:
-        try:
-            subprocess.run(["git", "add", "health.json"], cwd=repo_dir, check=False)
-            subprocess.run(["git", "commit", "-m", f"[HEALTH] {detail}"], cwd=repo_dir, check=False)
-            subprocess.run(["git", "push"], cwd=repo_dir, check=False)
-        except Exception:
-            pass
+
+def sync_health_to_status_branch(detail="정규 감시 중"):
+    """
+    main 브랜치를 전혀 건드리지 않고 status 브랜치에 health.json 단일 커밋 강제 푸시
+    - 🛡️ 잔디/메인 커밋 히스토리 오염 0% (메인과 완전 분리)
+    - 🛡️ status 브랜치에도 항상 커밋 딱 1개(0.1KB)만 덮어써져 용량 증가 0%
+    - 🛡️ 깃허브 무료 플랜 완전 최적화
+    """
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    health_path = os.path.join(repo_dir, "health.json")
+    if not os.path.exists(health_path):
+        return
+    try:
+        # 1. blob 생성
+        blob_res = subprocess.run(["git", "hash-object", "-w", "health.json"], cwd=repo_dir, capture_output=True, text=True, check=True)
+        blob_sha = blob_res.stdout.strip()
+        
+        # 2. tree 생성
+        tree_input = f"100644 blob {blob_sha}\thealth.json\n"
+        tree_res = subprocess.run(["git", "mktree"], cwd=repo_dir, input=tree_input, capture_output=True, text=True, check=True)
+        tree_sha = tree_res.stdout.strip()
+        
+        # 3. 부모 없는 단일 커밋 생성 (히스토리 누적 방지)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        commit_res = subprocess.run(["git", "commit-tree", tree_sha, "-m", f"heartbeat: {now_str} ({detail})"], cwd=repo_dir, capture_output=True, text=True, check=True)
+        commit_sha = commit_res.stdout.strip()
+        
+        # 4. remote status 브랜치로 강제 푸시
+        subprocess.run(["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/status"], cwd=repo_dir, capture_output=True, check=True)
+        print(f"[HEALTH] 🌐 status 브랜치 심장박동 동기화 완료: {detail}")
+    except Exception as e:
+        print(f"[HEALTH WARN] status 브랜치 동기화 실패 (무시됨): {e}")
 
 def load_json(filepath, default):
     if os.path.exists(filepath):
@@ -93,11 +117,14 @@ def run_trading_loop():
     # 깃 푸시 권한 사전 점검
     git_ok = check_git_permission()
     
-    # 가동 헬스체크 신호 기록 및 초기 푸시
-    update_health_status(status="running", detail="봇 최초 가동 시작", sync_git=git_ok)
+    # 가동 헬스체크 신호 기록 및 status 브랜치 초기 핑 동기화
+    update_health_status(status="running", detail="봇 최초 가동 시작")
+    if git_ok:
+        sync_health_to_status_branch(detail="봇 최초 가동 시작")
     
     api = KiwoomRestAPI()
     last_screened_date = None
+    last_health_sync_time = time.time()
     active_universe = DEFAULT_UNIVERSE
     
     while True:
@@ -250,6 +277,12 @@ def run_trading_loop():
                     
             print(f"[{now_str}] 감시 완료. 현재 보유 종목: {list(positions.keys())}")
             update_health_status(status="running", detail=f"정규 감시 중 (보유: {len(positions)}개)")
+            
+            # 30분(1800초)마다 status 브랜치에 가벼운 단일 커밋 심장박동 동기화
+            if git_ok and (time.time() - last_health_sync_time >= 1800):
+                sync_health_to_status_branch(detail=f"정규 감시 중 (보유: {len(positions)}개)")
+                last_health_sync_time = time.time()
+                
             time.sleep(POLL_INTERVAL_SECONDS)
             
         except Exception as e:
