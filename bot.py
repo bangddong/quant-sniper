@@ -29,12 +29,29 @@ def save_json(filepath, data):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def check_git_permission():
+    """봇 기동 시 깃 푸시 권한 사전 점검"""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        res = subprocess.run(["git", "push", "--dry-run"], cwd=repo_dir, capture_output=True, text=True)
+        if res.returncode == 0:
+            print("[GIT] ✅ 깃허브 푸시 권한 정상 확인 (피클 비서 실시간 연동 준비 완료)")
+            return True
+        else:
+            print(f"[GIT WARN] ⚠️ 깃허브 푸시 권한 없음: {res.stderr.strip() or '인증 필요'}")
+            print("          (거래는 로컬에 기록되나, 깃 인증 전까지 비서 알림이 보류됩니다.)")
+            return False
+    except Exception as e:
+        print(f"[GIT WARN] git 실행 오류: {e}")
+        return False
+
 def git_commit_and_push(commit_msg):
     """체결 내역 발생 시 깃허브 자동 푸시 (피클 비서 보고 연동)"""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        subprocess.run(["git", "add", "trades.json", "positions.json"], check=False)
-        subprocess.run(["git", "commit", "-m", commit_msg], check=False)
-        subprocess.run(["git", "push"], check=False)
+        subprocess.run(["git", "add", "trades.json", "positions.json"], cwd=repo_dir, check=False)
+        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=False)
+        subprocess.run(["git", "push"], cwd=repo_dir, check=False)
         print(f"[GIT] 자동 커밋 및 푸시 완료: {commit_msg}")
     except Exception as e:
         print(f"[GIT ERR] 푸시 실패 (무시됨): {e}")
@@ -52,6 +69,9 @@ def run_trading_loop():
     print("=" * 60)
     print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 활성화)")
     print("=" * 60)
+    
+    # 깃 푸시 권한 사전 점검
+    check_git_permission()
     
     api = KiwoomRestAPI()
     last_screened_date = None
