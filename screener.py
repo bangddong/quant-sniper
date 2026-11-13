@@ -1,14 +1,23 @@
 import urllib.request
 import json
+import datetime
 from config import MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, SCREENER_TOP_N
 
 def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW, max_market_cap=MAX_MARKET_CAP_KRW):
     """
-    코스피/코스닥 시장에서 당일 거래대금 및 시가총액 기준 우량주를 실시간 동적 스크리닝
-    - 🛡️ 시가총액 최소 1조 원(1,000,000,000,000원) 이상 (하루짜리 작전주·잡주 원천 차단)
-    - 🛡️ 시가총액 최대 5조 원(5,000,000,000,000원) 이하 (굼뜬 10조+ 메가캡 배제, 탄력성 극대화)
+    코스피/코스닥 시장에서 전일(D-1) 확정 거래대금 및 시가총액 기준 우량주를 동적 스크리닝
+    
+    🛡️ 미래정보(Lookahead Bias) 원천 차단:
+    - 장 개장 전(08:50경) 스크리닝 시, 네이버 증권 API의 거래대금(accumulatedTradingValueRaw) 및
+      시가총액(marketValueRaw)은 전일(D-1) 장 마감 시점에 완전히 확정된 공식 정산치입니다.
+    - 당일 장중 미확정 데이터나 미래 시세를 사전에 끌어다 쓰지 않으므로 백테스트 및 실전에서
+      룩어헤드 바이어스가 발생하지 않습니다.
+    
+    필터링 조건:
+    - 🛡️ 시가총액 최소 1조 원 이상 (하루짜리 작전주·동전주 원천 차단)
+    - 🛡️ 시가총액 최대 5조 원 이하 (지수 추종 대형 코끼리주 배제, 탄력성 극대화)
     - 🛡️ 우선주, 스팩, ETN 등 변칙 종목 원천 배제
-    - 🛡️ 거래대금(기관·외인 실질 유동성) 최상위 순 정렬
+    - 🛡️ 전일 실질 거래대금(기관·외인 유동성) 최상위 순 정렬
     """
     all_raw = []
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -24,7 +33,7 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
                     for s in data.get("stocks", []):
                         all_raw.append(s)
             except Exception as e:
-                # 개별 페이지 에러 시 패스
+                # 개별 페이지 일시 에러 시 패스
                 continue
                 
     if not all_raw:
@@ -63,7 +72,7 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
             "market_cap": market_cap
         })
         
-    # 기관·외인 수급이 실린 실질 거래대금 순으로 정렬
+    # 기관·외인 수급이 검증된 전일 거래대금 최상위 순으로 정렬
     candidates.sort(key=lambda x: x["trade_val"], reverse=True)
     selected = {c["name"]: c["code"] for c in candidates[:top_n]}
     
@@ -71,6 +80,6 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
 
 if __name__ == "__main__":
     universe = get_dynamic_universe(20)
-    print(f"🎯 [시총 1조~5조 황금구간] 동적 스크리닝 결과 ({len(universe)}종목):")
+    print(f"🎯 [시총 1조~5조 황금구간] 전일 확정 데이터 기준 동적 스크리닝 결과 ({len(universe)}종목):")
     for name, code in universe.items():
         print(f" - {name} ({code})")

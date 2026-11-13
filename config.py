@@ -29,25 +29,38 @@ DEFAULT_UNIVERSE = {
 
 # 전략 파라미터
 RSI_PERIOD = 14
-RSI_BUY_THRESHOLD = 28.0      # RSI 28 이하 시 과매도 저격 매수
-VBO_K = 0.5                   # 변동성 돌파 계수 (전일 레인지의 0.5)
+RSI_BUY_THRESHOLD = 28.0       # RSI 28 이하 시 과매도 저격 매수
+VBO_K = 0.5                    # 변동성 돌파 계수 (전일 레인지의 0.5)
 
-# 청산 및 리스크 관리 규칙
-STOP_LOSS_PCT = 0.020         # -2.0% 기계적 칼손절
-TRAILING_STOP_TRIGGER = 0.040 # +4.0% 수익 시 트레일링 스탑 발동
-TRAILING_STOP_LOCK = 0.010    # 발동 후 손절선을 매수가 +1.0%로 상향
-TAKE_PROFIT_PCT = 0.080       # +8.0% 목표 익절
-MAX_HOLD_DAYS = 7             # 최대 보유일 (7거래일 경과 시 타임스탑)
+# 💡 ATR 기반 동적 손절 및 손익비 규칙 (휩소 노이즈 방어)
+ATR_PERIOD = 14
+ATR_STOP_MULTIPLIER = 1.5      # 변동성(ATR) 기반 동적 손절 배수
+MIN_STOP_LOSS_PCT = 0.025      # 최소 손절선 2.5% (과매도 바닥권 일중 흔들림 노이즈 방어)
+MAX_STOP_LOSS_PCT = 0.040      # 최대 손절선 4.0% (과도한 손실 캡)
+MIN_RISK_REWARD_RATIO = 2.0    # 최소 손익비 1:2 (목표 익절폭 = 손절폭 × 2.0)
+
+# 청산 및 리스크 관리 기본값
+STOP_LOSS_PCT = 0.030          # 기본 손절 기준선 (-3.0%)
+TRAILING_STOP_TRIGGER = 0.040  # +4.0% 수익 시 트레일링 스탑 발동
+TRAILING_STOP_LOCK = 0.010     # 발동 후 손절선을 매수가 +1.0%로 상향
+TAKE_PROFIT_PCT = 0.080        # 기본 목표 익절 (+8.0%)
+MAX_HOLD_DAYS = 7              # 최대 보유일 (7거래일 경과 시 타임스탑)
+
+# 💡 거래비용 및 슬리피지 보수적 반영 규칙
+TRANSACTION_TAX_PCT = 0.0018   # 증권거래세 0.18%
+BROKER_COMMISSION_PCT = 0.00015 # 키움증권 온라인 위탁수수료 0.015%
+SLIPPAGE_ESTIMATE_PCT = 0.0010 # 시장가 진입/청산 슬리피지 0.10% 보수적 추정
+TOTAL_ROUNDTRIP_COST_PCT = TRANSACTION_TAX_PCT + (BROKER_COMMISSION_PCT * 2) + (SLIPPAGE_ESTIMATE_PCT * 2) # 왕복 총비용 약 0.41%
 
 # 자금 관리 규칙
-MAX_ALLOC_PER_STOCK = 0.20    # 1종목당 계좌 총자산의 최대 20%
-MAX_POSITIONS = 4             # 최대 동시 보유 종목 수 (최소 20% 현금 버퍼 유지)
-DAILY_KILL_SWITCH_PCT = 0.040 # 일일 계좌 누적 손실 -4.0% 도달 시 당일 올스톱
+MAX_ALLOC_PER_STOCK = 0.20     # 1종목당 계좌 총자산의 최대 20%
+MAX_POSITIONS = 4              # 최대 동시 보유 종목 수 (최소 20% 현금 버퍼 유지)
+DAILY_KILL_SWITCH_PCT = 0.040  # 일일 계좌 누적 손실 -4.0% 도달 시 당일 올스톱
 
 # 감시 및 호출 주기
-POLL_INTERVAL_SECONDS = 30    # 장중 30초 주기 초정밀 감시 (칼손절 및 익절 반응속도 극대화)
-API_REQUEST_DELAY = 0.3       # API 연속 호출 시 0.3초 대기 (레이트 리밋 방어)
+POLL_INTERVAL_SECONDS = 30     # 장중 30초 주기 초정밀 감시
+API_REQUEST_DELAY = 0.3        # API 연속 호출 시 0.3초 대기 (레이트 리밋 방어)
 
-# 키움 API 엔드포인트
-MOCK_API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
-REAL_API_BASE_URL = "https://openapi.koreainvestment.com:9443"
+# 키움 REST API 공식 엔드포인트
+MOCK_API_BASE_URL = "https://mockapi.kiwoom.com"
+REAL_API_BASE_URL = "https://api.kiwoom.com"

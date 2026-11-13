@@ -7,7 +7,9 @@ from config import (
     DYNAMIC_SCREENING, SCREENER_TOP_N, DEFAULT_UNIVERSE,
     STOP_LOSS_PCT, TRAILING_STOP_TRIGGER, TRAILING_STOP_LOCK,
     TAKE_PROFIT_PCT, MAX_HOLD_DAYS, MAX_ALLOC_PER_STOCK, MAX_POSITIONS,
-    DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY
+    DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY,
+    TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
+    SLIPPAGE_ESTIMATE_PCT
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
@@ -55,7 +57,7 @@ def sync_health_to_status_branch(detail="정규 감시 중"):
         commit_sha = commit_res.stdout.strip()
         
         # 4. remote status 브랜치로 강제 푸시
-        subprocess.run(["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/status"], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/status"], cwd=repo_dir, capture_output=True, text=True, check=True)
         print(f"[HEALTH] 🌐 status 브랜치 심장박동 동기화 완료: {detail}")
     except Exception as e:
         print(f"[HEALTH WARN] status 브랜치 동기화 실패 (무시됨): {e}")
@@ -111,7 +113,9 @@ def is_market_open():
 
 def run_trading_loop():
     print("=" * 60)
-    print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 활성화)")
+    print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 & ATR 손익비 엔진)")
+    print(f"   [비용 설정] 거래세: {TRANSACTION_TAX_PCT*100:.2f}% | 수수료: {BROKER_COMMISSION_PCT*100:.3f}%×2 | 슬리피지: {SLIPPAGE_ESTIMATE_PCT*100:.2f}%×2")
+    print(f"   [왕복 총비용] 약 {TOTAL_ROUNDTRIP_COST_PCT*100:.2f}% 실질 차감 적용")
     print("=" * 60)
     
     # 깃 푸시 권한 사전 점검
@@ -133,9 +137,9 @@ def run_trading_loop():
             today_str = now.strftime("%Y-%m-%d")
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             
-            # 매일 아침 당일 거래대금 TOP 우량주 동적 스크리닝 갱신
+            # 매일 아침 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 갱신 (Lookahead 방지)
             if DYNAMIC_SCREENING and (last_screened_date != today_str):
-                print(f"[{now_str}] 🔍 당일 거래대금 TOP 우량주 동적 스크리닝 가동...")
+                print(f"[{now_str}] 🔍 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 가동...")
                 screened = get_dynamic_universe(SCREENER_TOP_N)
                 if screened:
                     active_universe = screened
@@ -163,7 +167,7 @@ def run_trading_loop():
                     candles_dict[name] = c
                 time.sleep(API_REQUEST_DELAY) # Rate limit 방어
                 
-            # 2. 보유 포지션 감시 및 청산 체크 (손절, 트레일링 스탑, 익절)
+            # 2. 보유 포지션 감시 및 청산 체크 (동적 손절, 트레일링 스탑, 익절)
             closed_positions = []
             for name, pos in list(positions.items()):
                 if name not in candles_dict:
@@ -174,6 +178,10 @@ def run_trading_loop():
                 high_p = c["high"]
                 low_p = c["low"]
                 
+                # 종목별 맞춤 손절/익절선 (ATR 기반 동적 산출값, 없을 시 기본값 폴백)
+                pos_stop_pct = pos.get("stop_loss_pct", STOP_LOSS_PCT)
+                pos_tp_pct = pos.get("take_profit_pct", TAKE_PROFIT_PCT)
+                
                 # 트레일링 스탑 발동 여부 (+4%)
                 if high_p >= buy_p * (1 + TRAILING_STOP_TRIGGER):
                     pos["trailing_active"] = True
@@ -182,23 +190,28 @@ def run_trading_loop():
                 exit_reason = None
                 
                 # 손절선 계산
-                stop_price = buy_p * (1 - STOP_LOSS_PCT)
+                stop_price = buy_p * (1 - pos_stop_pct)
                 if pos.get("trailing_active", False):
                     stop_price = buy_p * (1 + TRAILING_STOP_LOCK) # +1% 수익 잠금
                     
                 if low_p <= stop_price:
                     exit_price = stop_price
-                    exit_reason = "트레일링 스탑 (+1% 익절 잠금)" if pos.get("trailing_active") else "기계적 칼손절 (-2.0%)"
-                elif high_p >= buy_p * (1 + TAKE_PROFIT_PCT):
-                    exit_price = buy_p * (1 + TAKE_PROFIT_PCT)
-                    exit_reason = "목표 익절 달성 (+8.0%)"
+                    exit_reason = "트레일링 스탑 (+1.0% 익절 잠금)" if pos.get("trailing_active") else f"동적 손절 (-{pos_stop_pct*100:.1f}% ATR 보정)"
+                elif high_p >= buy_p * (1 + pos_tp_pct):
+                    exit_price = buy_p * (1 + pos_tp_pct)
+                    exit_reason = f"목표 익절 달성 (+{pos_tp_pct*100:.1f}%)"
                 elif pos.get("days_held", 0) >= MAX_HOLD_DAYS:
                     exit_price = curr_p
                     exit_reason = f"타임스탑 (최대 보유 {MAX_HOLD_DAYS}일 경과)"
                     
                 if exit_price:
-                    ret_pct = ((exit_price - buy_p) / buy_p - 0.002) * 100
-                    profit = pos["shares"] * (exit_price - buy_p) - (pos["shares"] * exit_price * 0.002)
+                    # 거래비용(거래세 + 위탁수수료 + 슬리피지 약 0.41%) 실질 차감
+                    gross_ret_pct = ((exit_price - buy_p) / buy_p) * 100
+                    cost_krw = pos["shares"] * exit_price * TOTAL_ROUNDTRIP_COST_PCT
+                    gross_profit_krw = pos["shares"] * (exit_price - buy_p)
+                    net_profit_krw = gross_profit_krw - cost_krw
+                    net_ret_pct = (net_profit_krw / (pos["shares"] * buy_p)) * 100
+                    
                     api.send_sell_order(pos["code"], name, pos["shares"], exit_price, exit_reason)
                     
                     trade_record = {
@@ -209,8 +222,10 @@ def run_trading_loop():
                         "shares": pos["shares"],
                         "entry_price": buy_p,
                         "exit_price": exit_price,
-                        "return_pct": round(ret_pct, 2),
-                        "profit_krw": round(profit, 0),
+                        "gross_return_pct": round(gross_ret_pct, 2),
+                        "net_return_pct": round(net_ret_pct, 2),
+                        "cost_fee_krw": round(cost_krw, 0),
+                        "net_profit_krw": round(net_profit_krw, 0),
                         "reason": exit_reason
                     }
                     trades.append(trade_record)
@@ -244,7 +259,7 @@ def run_trading_loop():
                     entry_p = sig["entry_price"]
                     shares = int(alloc_cap // entry_p)
                     if shares < 1:
-                        shares = 1 # 최소 1주
+                        shares = 1 # 최소 1주 (소액 가설 검증 지원)
                         
                     invest = shares * entry_p
                     if cash >= invest:
@@ -253,6 +268,8 @@ def run_trading_loop():
                             "code": code,
                             "shares": shares,
                             "buy_price": entry_p,
+                            "stop_loss_pct": sig.get("stop_loss_pct", STOP_LOSS_PCT),
+                            "take_profit_pct": sig.get("take_profit_pct", TAKE_PROFIT_PCT),
                             "days_held": 0,
                             "trailing_active": False,
                             "strategy": sig["strategy"]
@@ -265,6 +282,8 @@ def run_trading_loop():
                             "code": code,
                             "shares": shares,
                             "entry_price": entry_p,
+                            "stop_loss_pct": sig.get("stop_loss_pct", STOP_LOSS_PCT),
+                            "take_profit_pct": sig.get("take_profit_pct", TAKE_PROFIT_PCT),
                             "strategy": sig["strategy"]
                         }
                         trades.append(trade_record)
