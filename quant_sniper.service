@@ -6,7 +6,6 @@ After=network.target
 Type=simple
 User=niphyang
 WorkingDirectory=/home/niphyang/quant-sniper
-EnvironmentFile=/home/niphyang/quant-sniper/.env
 ExecStart=/usr/bin/python3 /home/niphyang/quant-sniper/bot.py
 Restart=always
 RestartSec=10
