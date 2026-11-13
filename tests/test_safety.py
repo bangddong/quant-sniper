@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import config
 from bot import (
+    account_drawdown_controls, calculate_entry_shares,
     build_operational_status, confirm_persistent_signals, git_commit_and_push, is_entry_window,
     is_market_open, market_session_progress, save_json, trading_days_held,
     update_position_stop,
@@ -25,6 +26,30 @@ class FakeResponse:
 
 
 class SafetyTests(unittest.TestCase):
+    def test_position_size_obeys_allocation_and_trade_risk(self):
+        # 30만원, 2만원 주식, 3% 손절: 비중 한도는 3주, 위험 한도도 3주다.
+        self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03), 3)
+        # 1주가 20% 비중 한도를 넘으면 강제 1주 주문을 만들지 않는다.
+        self.assertEqual(calculate_entry_shares(300000, 300000, 70000, 0.03), 0)
+        # -8% 감속 구간에서는 신규 주문 수량이 절반 수준으로 줄어든다.
+        self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03, 0.5), 1)
+
+    def test_equity_drawdown_slows_then_halts_entries(self):
+        peak, drawdown, multiplier, halted = account_drawdown_controls(920000, 1000000)
+        self.assertEqual(peak, 1000000)
+        self.assertAlmostEqual(drawdown, 0.08)
+        self.assertEqual(multiplier, 0.5)
+        self.assertFalse(halted)
+        _, drawdown, multiplier, halted = account_drawdown_controls(880000, peak)
+        self.assertAlmostEqual(drawdown, 0.12)
+        self.assertEqual(multiplier, 0.5)
+        self.assertTrue(halted)
+        peak, drawdown, multiplier, halted = account_drawdown_controls(1100000, peak)
+        self.assertEqual(peak, 1100000)
+        self.assertEqual(drawdown, 0)
+        self.assertEqual(multiplier, 1.0)
+        self.assertFalse(halted)
+
     def test_operational_status_preserves_risk_reason(self):
         status, detail = build_operational_status(
             True, ["계좌 조회 실패", "계좌 조회 실패", "체결 미확인"], 1

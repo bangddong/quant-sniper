@@ -17,7 +17,8 @@ from config import (
     TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
     SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS,
     MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME, AUTO_GIT_PUSH,
-    MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW
+    MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, MAX_RISK_PER_TRADE_PCT,
+    EQUITY_SLOWDOWN_DRAWDOWN_PCT, EQUITY_HALT_DRAWDOWN_PCT
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
@@ -188,6 +189,28 @@ def get_kiwoom_candles(api, realtime, cache, code, now, count=70):
             candles.append(live_candle)
     return candles[-count:]
 
+def account_drawdown_controls(current_assets, peak_assets):
+    """계좌 고점을 갱신하고 낙폭에 따른 신규 주문 배율과 중단 여부를 반환한다."""
+    current_assets = max(float(current_assets or 0), 0)
+    peak_assets = max(float(peak_assets or 0), current_assets)
+    drawdown = (peak_assets - current_assets) / peak_assets if peak_assets else 0.0
+    halted = drawdown >= EQUITY_HALT_DRAWDOWN_PCT
+    size_multiplier = 0.5 if drawdown >= EQUITY_SLOWDOWN_DRAWDOWN_PCT else 1.0
+    return peak_assets, drawdown, size_multiplier, halted
+
+def calculate_entry_shares(total_assets, cash, entry_price, stop_loss_pct,
+                           size_multiplier=1.0):
+    """투자금 20%와 거래당 계획 손실 0.7%를 모두 지키는 정수 수량을 산출한다."""
+    if min(total_assets, cash, entry_price, stop_loss_pct, size_multiplier) <= 0:
+        return 0
+    allocation_cap = total_assets * MAX_ALLOC_PER_STOCK * size_multiplier
+    risk_budget = total_assets * MAX_RISK_PER_TRADE_PCT * size_multiplier
+    risk_per_share = entry_price * stop_loss_pct
+    shares_by_allocation = int(allocation_cap // entry_price)
+    shares_by_risk = int(risk_budget // risk_per_share)
+    shares_by_cash = int(cash // entry_price)
+    return max(0, min(shares_by_allocation, shares_by_risk, shares_by_cash))
+
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
     if not AUTO_GIT_PUSH:
@@ -277,6 +300,8 @@ def run_trading_loop():
     last_published_state = ("running", "봇 최초 가동 시작")
     signal_confirmations = {}
     daily_candle_cache = {}
+    peak_assets = None
+    entry_size_multiplier = 1.0
     
     while True:
         try:
@@ -360,6 +385,8 @@ def run_trading_loop():
             # 실계좌가 상태의 원본이다. 조회 실패 시 신규 주문을 차단한다.
             account = api.get_account_snapshot()
             risk_state = load_json(RISK_FILE, {})
+            if peak_assets is None:
+                peak_assets = risk_state.get("peak_assets") or None
             if not account.get("ok"):
                 trading_halted = True
                 risk_reasons.append(f"계좌 조회 실패: {account.get('error', 'unknown')}")
@@ -368,24 +395,46 @@ def run_trading_loop():
                 risk_date = today_str
                 if risk_state.get("date") == today_str:
                     opening_assets = risk_state.get("opening_assets") or None
+                    peak_assets = risk_state.get("peak_assets") or peak_assets
                     trading_halted = bool(risk_state.get("halted", False))
                     if trading_halted:
                         risk_reasons.append(f"지속 중인 거래 중단: {risk_state.get('reason', 'unknown')}")
                 else:
                     opening_assets = account.get("total_assets") or None
                     trading_halted = False
-                    save_json(RISK_FILE, {
+                    risk_state = {
                         "date": today_str, "opening_assets": opening_assets,
+                        "peak_assets": peak_assets,
                         "halted": False,
-                    })
+                    }
+                    save_json(RISK_FILE, risk_state)
 
             if account.get("ok") and opening_assets:
                 current_assets = account.get("total_assets", opening_assets)
+                peak_assets, account_drawdown, entry_size_multiplier, drawdown_halted = (
+                    account_drawdown_controls(current_assets, peak_assets)
+                )
+                risk_state.update({
+                    "date": today_str, "opening_assets": opening_assets,
+                    "peak_assets": peak_assets,
+                })
+                if drawdown_halted:
+                    trading_halted = True
+                    risk_state.update({"halted": True, "reason": "equity_drawdown_limit"})
+                    risk_reasons.append(
+                        f"계좌 고점 대비 낙폭 한도 도달: -{account_drawdown*100:.2f}%"
+                    )
+                elif account_drawdown >= EQUITY_SLOWDOWN_DRAWDOWN_PCT:
+                    risk_reasons.append(
+                        f"계좌 낙폭 감속 적용: -{account_drawdown*100:.2f}% (주문 50%)"
+                    )
+                save_json(RISK_FILE, risk_state)
                 daily_return = (current_assets - opening_assets) / opening_assets
                 if daily_return <= -DAILY_KILL_SWITCH_PCT:
                     trading_halted = True
                     save_json(RISK_FILE, {
                         "date": today_str, "opening_assets": opening_assets,
+                        "peak_assets": peak_assets,
                         "halted": True, "reason": "daily_loss_limit",
                     })
                     risk_reasons.append(f"일일 손실 한도 도달: {daily_return*100:.2f}%")
@@ -546,7 +595,9 @@ def run_trading_loop():
                         live_signals.append(sig)
                 signals = live_signals
                 cash = api.get_cash_balance()
-                alloc_cap = (cash + sum(p["shares"] * p["buy_price"] for p in positions.values())) * MAX_ALLOC_PER_STOCK
+                total_assets = float(account.get("total_assets") or (
+                    cash + sum(p["shares"] * p["buy_price"] for p in positions.values())
+                ))
                 
                 new_buys = []
                 for sig in signals:
@@ -555,14 +606,16 @@ def run_trading_loop():
                         continue
                     if len(positions) >= MAX_POSITIONS:
                         break
-                    if cash < alloc_cap * 0.8:
-                        break
-                        
                     code = active_universe[name]
                     entry_p = sig["entry_price"]
-                    shares = int(alloc_cap // entry_p)
+                    stop_loss_pct = float(sig.get("stop_loss_pct", STOP_LOSS_PCT))
+                    shares = calculate_entry_shares(
+                        total_assets, cash, entry_p, stop_loss_pct,
+                        entry_size_multiplier,
+                    )
                     if shares < 1:
-                        shares = 1 # 최소 1주 (소액 가설 검증 지원)
+                        print(f"[{now_str}] [SKIP] {name}: 1주가 투자/위험 한도를 초과")
+                        continue
                         
                     invest = shares * entry_p
                     if cash >= invest:
@@ -591,7 +644,7 @@ def run_trading_loop():
                             "code": code,
                             "shares": filled_qty,
                             "buy_price": fill_price,
-                            "stop_loss_pct": sig.get("stop_loss_pct", STOP_LOSS_PCT),
+                            "stop_loss_pct": stop_loss_pct,
                             "take_profit_pct": sig.get("take_profit_pct", TAKE_PROFIT_PCT),
                             "days_held": 1,
                             "entry_date": today_str,
