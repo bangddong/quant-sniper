@@ -7,8 +7,9 @@ from unittest.mock import patch
 import config
 from bot import (
     build_operational_status, git_commit_and_push, is_entry_window,
-    market_session_progress, save_json, trading_days_held,
+    is_market_open, market_session_progress, save_json, trading_days_held,
 )
+from krx_calendar import is_krx_trading_day
 from kiwoom_api import KiwoomRestAPI
 from screener import get_dynamic_universe
 
@@ -46,6 +47,19 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(is_entry_window(datetime.datetime(2026, 11, 13, 14, 31)))
         self.assertEqual(market_session_progress(datetime.datetime(2026, 11, 13, 9, 0)), 0)
         self.assertEqual(market_session_progress(datetime.datetime(2026, 11, 13, 15, 30)), 1)
+
+    def test_krx_calendar_blocks_weekday_holidays_and_unknown_years(self):
+        import datetime
+        self.assertTrue(is_krx_trading_day(datetime.date(2026, 11, 13)))
+        self.assertFalse(is_krx_trading_day(datetime.date(2026, 9, 25)))
+        self.assertFalse(is_krx_trading_day(datetime.date(2026, 11, 14)))
+        self.assertFalse(is_krx_trading_day(datetime.date(2027, 1, 4)))
+
+    def test_market_open_requires_krx_trading_day(self):
+        import datetime
+        self.assertTrue(is_market_open(datetime.datetime(2026, 11, 13, 10, 0)))
+        self.assertFalse(is_market_open(datetime.datetime(2026, 9, 25, 10, 0)))
+        self.assertFalse(is_market_open(datetime.datetime(2026, 11, 13, 8, 59)))
 
     def test_live_mode_requires_explicit_enable(self):
         with patch.object(config, "LIVE_TRADING_ENABLED", False):
