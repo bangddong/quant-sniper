@@ -1,6 +1,6 @@
 # 🎯 quant-sniper
-> **키움증권 REST API 기반 소액 가설 검증용 퀀트 트레이딩 봇**
-> 서용태 님(@rundevelrun)의 알고리즘 트레이딩 가설 검증 및 실전 데이터 수집을 위한 프로토타입 시스템
+> **키움증권 REST API 기반 자동매매 시스템**
+> 기본값은 모의투자이며, 실전 모드는 명시적인 이중 안전 설정을 해야만 활성화됩니다.
 
 ---
 
@@ -105,9 +105,29 @@ KIWOOM_APP_KEY=발급받은_실전_APP_KEY
 KIWOOM_APP_SECRET=발급받은_실전_APP_SECRET
 KIWOOM_ACCOUNT_NO=실전_계좌번호_8자리
 KIWOOM_ACCOUNT_TYPE=01
-KIWOOM_USE_MOCK=false
+KIWOOM_USE_MOCK=true
+LIVE_TRADING_ENABLED=false
+ORDER_CONFIRM_TIMEOUT_SECONDS=20
 ```
 *(※ `.env`는 `.gitignore` 최상단에 등록되어 GitHub에 절대 커밋되지 않습니다.)*
+
+실전 전환은 모의투자 검증 후 `KIWOOM_USE_MOCK=false`와
+`LIVE_TRADING_ENABLED=true`를 **둘 다** 설정해야 합니다. 하나라도 충족되지 않으면
+실전 API 시작을 거부합니다.
+
+### 주문·계좌 안전 규칙
+
+- 주문 접수만으로 체결 처리하지 않고 `kt00009` 체결 조회에서 주문수량 전체와 실제 가중평균 체결가를 확인합니다.
+- 체결 확인 실패 시 로컬 장부를 변경하지 않고 그날의 신규 주문을 중단합니다.
+- `kt00018` 실계좌 잔고와 로컬 포지션이 다르면 신규 주문을 중단합니다.
+- 동적 유니버스에서 빠진 기존 보유 종목도 별도로 계속 감시합니다.
+- 일일 손실 킬스위치 상태, 보유일수, 트레일링 상태를 재시작 후에도 보존합니다.
+- ETF·ETN·스팩·우선주는 개별주 전략의 신규 유니버스에서 제외합니다.
+- 동일 프로세스의 중복 실행을 잠금 파일로 차단합니다.
+
+실전 키를 연결하기 전에 공식 모의투자 환경에서 주문 접수·부분체결·거절·재시작
+시나리오를 반드시 확인해야 합니다. 저장소의 자동 테스트는 API 형식과 내부 상태 전이를
+검사하지만 실제 키움 서버의 전체 체결 흐름을 대신하지 않습니다.
 
 ### 3단계: 봇 가동 (2가지 방법 중 선택)
 
@@ -160,6 +180,7 @@ quant-sniper/
 ├── config.py             # 1조~5조 필터, ATR 동적 손절, 거래비용(0.41%), 키움 API 설정
 ├── screener.py           # 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리너 (Lookahead 방지)
 ├── strategy.py           # RSI 과매도 반등, 변동성 돌파 및 ATR 손익비 엔진
+├── env_loader.py         # 외부 패키지 없는 .env 로더
 ├── kiwoom_api.py         # 키움증권 최신 공식 REST API 래퍼 (무설치, SOR 시장가 집행)
 ├── bot.py                # 24/7 메인 감시 루프 및 status 브랜치 헬스체크 엔진
 ├── run.sh                # Git 권한 사전 검증 및 nohup 백그라운드 실행기
@@ -168,5 +189,6 @@ quant-sniper/
 ├── positions.json        # 현재 보유 포지션 관리 장부
 ├── health.json           # 로컬 1분 주기 헬스체크 파일
 ├── .env.example          # 키움 API 키 템플릿
+├── tests/                # 주문·계좌 안전장치 자동 테스트
 └── .gitignore            # 민감 파일(.env 등) 깃 제외 목록
 ```

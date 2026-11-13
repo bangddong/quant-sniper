@@ -3,21 +3,41 @@ import time
 import json
 import datetime
 import subprocess
+import fcntl
+from env_loader import load_dotenv
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 from config import (
     DYNAMIC_SCREENING, SCREENER_TOP_N, DEFAULT_UNIVERSE,
     STOP_LOSS_PCT, TRAILING_STOP_TRIGGER, TRAILING_STOP_LOCK,
     TAKE_PROFIT_PCT, MAX_HOLD_DAYS, MAX_ALLOC_PER_STOCK, MAX_POSITIONS,
     DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY,
     TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
-    SLIPPAGE_ESTIMATE_PCT
+    SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
 from screener import get_dynamic_universe
 
-TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades.json")
-POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
-HEALTH_FILE = os.path.join(os.path.dirname(__file__), "health.json")
+TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
+POSITIONS_FILE = os.path.join(BASE_DIR, "positions.json")
+HEALTH_FILE = os.path.join(BASE_DIR, "health.json")
+UNIVERSE_FILE = os.path.join(BASE_DIR, "universe.json")
+RISK_FILE = os.path.join(BASE_DIR, "risk_state.json")
+LOCK_FILE = os.path.join(BASE_DIR, ".quant_sniper.lock")
+
+def acquire_instance_lock():
+    lock_handle = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_handle.close()
+        raise RuntimeError("quant-sniper가 이미 실행 중입니다.") from exc
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    return lock_handle
 
 def update_health_status(status="healthy", detail=""):
     """봇 생존 및 헬스체크 상태 로컬 파일 갱신 (1분 주기, 150바이트 고정)"""
@@ -72,8 +92,31 @@ def load_json(filepath, default):
     return default
 
 def save_json(filepath, data):
-    with open(filepath, "w", encoding="utf-8") as f:
+    temp_path = f"{filepath}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, filepath)
+
+def confirm_order_fill(api, order_id, code, expected_qty,
+                       timeout=ORDER_CONFIRM_TIMEOUT_SECONDS):
+    deadline = time.time() + timeout
+    last_result = None
+    while time.time() < deadline:
+        result = api.get_order_execution(order_id, code)
+        last_result = result
+        if result.get("ok") and result.get("filled_qty", 0) >= expected_qty:
+            return result
+        time.sleep(1.1)
+    return last_result or {"ok": False, "error": "체결 확인 시간 초과"}
+
+def trading_days_held(pos, today_str):
+    """실행 중 관측된 거래일을 날짜당 한 번만 누적한다."""
+    if pos.get("last_held_date") != today_str:
+        pos["days_held"] = pos.get("days_held", 0) + 1
+        pos["last_held_date"] = today_str
+    return pos.get("days_held", 0)
 
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
@@ -130,6 +173,9 @@ def run_trading_loop():
     last_screened_date = None
     last_health_sync_time = time.time()
     active_universe = DEFAULT_UNIVERSE
+    risk_date = None
+    opening_assets = None
+    trading_halted = False
     
     while True:
         try:
@@ -138,17 +184,25 @@ def run_trading_loop():
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             
             # 매일 아침 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 갱신 (Lookahead 방지)
-            if DYNAMIC_SCREENING and (last_screened_date != today_str):
+            universe_cache = load_json(UNIVERSE_FILE, {})
+            if universe_cache.get("date") == today_str and universe_cache.get("symbols"):
+                active_universe = universe_cache["symbols"]
+                last_screened_date = today_str
+
+            # 08:30~08:59에만 조회해야 네이버 누적 거래대금이 전일 확정치다.
+            screening_window = now.hour == 8 and now.minute >= 30
+            if DYNAMIC_SCREENING and last_screened_date != today_str and screening_window:
                 print(f"[{now_str}] 🔍 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 가동...")
                 screened = get_dynamic_universe(SCREENER_TOP_N)
                 if screened:
                     active_universe = screened
                     last_screened_date = today_str
+                    save_json(UNIVERSE_FILE, {"date": today_str, "symbols": screened})
                     print(f"[{now_str}] ✅ 오늘자 감시 유니버스 {len(active_universe)}종목 갱신 완료:")
                     print("   ", ", ".join(list(active_universe.keys())[:10]), "...")
                 else:
-                    active_universe = DEFAULT_UNIVERSE
-                    print(f"[{now_str}] [WARN] 스크리닝 실패로 기본 코어 유니버스로 폴백합니다.")
+                    active_universe = {}
+                    print(f"[{now_str}] [WARN] D-1 스크리닝 실패: 오늘 신규매수를 차단합니다.")
                     
             # 장 운영 시간 확인
             if not is_market_open():
@@ -158,6 +212,46 @@ def run_trading_loop():
                 
             positions = load_json(POSITIONS_FILE, {})
             trades = load_json(TRADES_FILE, [])
+
+            # 실계좌가 상태의 원본이다. 조회 실패 시 신규 주문을 차단한다.
+            account = api.get_account_snapshot()
+            risk_state = load_json(RISK_FILE, {})
+            if not account.get("ok"):
+                trading_halted = True
+                update_health_status("degraded", f"계좌 조회 실패: {account.get('error', 'unknown')}")
+                print(f"[{now_str}] [RISK] 계좌 조회 실패로 신규 주문을 중단합니다.")
+            elif risk_date != today_str:
+                risk_date = today_str
+                if risk_state.get("date") == today_str:
+                    opening_assets = risk_state.get("opening_assets") or None
+                    trading_halted = bool(risk_state.get("halted", False))
+                else:
+                    opening_assets = account.get("total_assets") or None
+                    trading_halted = False
+                    save_json(RISK_FILE, {
+                        "date": today_str, "opening_assets": opening_assets,
+                        "halted": False,
+                    })
+
+            if account.get("ok") and opening_assets:
+                current_assets = account.get("total_assets", opening_assets)
+                daily_return = (current_assets - opening_assets) / opening_assets
+                if daily_return <= -DAILY_KILL_SWITCH_PCT:
+                    trading_halted = True
+                    save_json(RISK_FILE, {
+                        "date": today_str, "opening_assets": opening_assets,
+                        "halted": True, "reason": "daily_loss_limit",
+                    })
+                    print(f"[{now_str}] [KILL SWITCH] 일일 손실 {daily_return*100:.2f}%로 신규 주문 중단")
+
+            # 브로커에만 있거나 로컬에만 있는 포지션은 자동 추정하지 않고 신규매수를 차단한다.
+            if account.get("ok") and not api.sim_mode:
+                broker_codes = set(account["positions"])
+                local_codes = {p.get("code") for p in positions.values()}
+                if broker_codes != local_codes:
+                    trading_halted = True
+                    print(f"[{now_str}] [RISK] 계좌/로컬 포지션 불일치로 신규 주문 중단 "
+                          f"(broker={sorted(broker_codes)}, local={sorted(local_codes)})")
             
             # 1. 캔들 데이터 조회
             candles_dict = {}
@@ -166,6 +260,15 @@ def run_trading_loop():
                 if c:
                     candles_dict[name] = c
                 time.sleep(API_REQUEST_DELAY) # Rate limit 방어
+
+            # 신규 후보와 무관하게 모든 보유 종목을 반드시 감시한다.
+            for name, pos in positions.items():
+                if name in candles_dict:
+                    continue
+                c = api.get_daily_candles(pos["code"], 30)
+                if c:
+                    candles_dict[name] = c
+                time.sleep(API_REQUEST_DELAY)
                 
             # 2. 보유 포지션 감시 및 청산 체크 (동적 손절, 트레일링 스탑, 익절)
             closed_positions = []
@@ -173,6 +276,7 @@ def run_trading_loop():
                 if name not in candles_dict:
                     continue
                 c = candles_dict[name][-1]
+                trading_days_held(pos, today_str)
                 buy_p = pos["buy_price"]
                 curr_p = c["close"]
                 high_p = c["high"]
@@ -205,14 +309,37 @@ def run_trading_loop():
                     exit_reason = f"타임스탑 (최대 보유 {MAX_HOLD_DAYS}일 경과)"
                     
                 if exit_price:
-                    # 거래비용(거래세 + 위탁수수료 + 슬리피지 약 0.41%) 실질 차감
-                    gross_ret_pct = ((exit_price - buy_p) / buy_p) * 100
-                    cost_krw = pos["shares"] * exit_price * TOTAL_ROUNDTRIP_COST_PCT
-                    gross_profit_krw = pos["shares"] * (exit_price - buy_p)
+                    if account.get("ok") and not api.sim_mode:
+                        broker_qty = int(account["positions"].get(pos["code"], {}).get("shares", 0))
+                        if broker_qty < pos["shares"]:
+                            trading_halted = True
+                            print(f"[{now_str}] [CRITICAL] {name} 실보유수량 불일치로 매도 주문 차단 "
+                                  f"(broker={broker_qty}, local={pos['shares']})")
+                            continue
+                    before_qty = pos["shares"]
+                    order = api.send_sell_order(pos["code"], name, before_qty, exit_price, exit_reason)
+                    actual_exit_price = exit_price
+                    if order.get("status") == "filled":
+                        confirmed = True
+                    elif order.get("status") == "accepted":
+                        fill = confirm_order_fill(
+                            api, order.get("order_id"), pos["code"], before_qty
+                        )
+                        confirmed = fill.get("filled_qty", 0) >= before_qty
+                        if confirmed:
+                            actual_exit_price = fill["fill_price"]
+                    else:
+                        confirmed = False
+                    if not confirmed:
+                        trading_halted = True
+                        print(f"[{now_str}] [CRITICAL] 매도 체결 미확인: {name}; 포지션 유지 및 신규주문 중단")
+                        continue
+
+                    gross_ret_pct = ((actual_exit_price - buy_p) / buy_p) * 100
+                    cost_krw = pos["shares"] * actual_exit_price * TOTAL_ROUNDTRIP_COST_PCT
+                    gross_profit_krw = pos["shares"] * (actual_exit_price - buy_p)
                     net_profit_krw = gross_profit_krw - cost_krw
                     net_ret_pct = (net_profit_krw / (pos["shares"] * buy_p)) * 100
-                    
-                    api.send_sell_order(pos["code"], name, pos["shares"], exit_price, exit_reason)
                     
                     trade_record = {
                         "timestamp": now_str,
@@ -221,7 +348,8 @@ def run_trading_loop():
                         "code": pos["code"],
                         "shares": pos["shares"],
                         "entry_price": buy_p,
-                        "exit_price": exit_price,
+                        "exit_price": actual_exit_price,
+                        "price_source": "broker_execution" if order.get("status") == "accepted" else "simulation",
                         "gross_return_pct": round(gross_ret_pct, 2),
                         "net_return_pct": round(net_ret_pct, 2),
                         "cost_fee_krw": round(cost_krw, 0),
@@ -233,6 +361,9 @@ def run_trading_loop():
                     
             for name in closed_positions:
                 del positions[name]
+
+            # 보유일수와 트레일링 상태도 매 루프 원자적으로 보존한다.
+            save_json(POSITIONS_FILE, positions)
                 
             if closed_positions:
                 save_json(POSITIONS_FILE, positions)
@@ -240,7 +371,11 @@ def run_trading_loop():
                 git_commit_and_push(f"매도 체결: {', '.join(closed_positions)}")
                 
             # 3. 신규 매수 신호 탐색 및 진입 집행
-            if len(positions) < MAX_POSITIONS:
+            if DYNAMIC_SCREENING and last_screened_date != today_str:
+                trading_halted = True
+                print(f"[{now_str}] [RISK] 오늘자 D-1 유니버스가 없어 신규 주문을 중단합니다.")
+
+            if not trading_halted and len(positions) < MAX_POSITIONS:
                 signals = evaluate_signals(candles_dict)
                 cash = api.get_cash_balance()
                 alloc_cap = (cash + sum(p["shares"] * p["buy_price"] for p in positions.values())) * MAX_ALLOC_PER_STOCK
@@ -263,25 +398,46 @@ def run_trading_loop():
                         
                     invest = shares * entry_p
                     if cash >= invest:
-                        api.send_buy_order(code, name, shares, entry_p)
+                        before_qty = 0
+                        if account.get("ok"):
+                            before_qty = int(account["positions"].get(code, {}).get("shares", 0))
+                        order = api.send_buy_order(code, name, shares, entry_p)
+                        if order.get("status") == "filled":
+                            filled_qty = shares
+                            fill_price = entry_p
+                        elif order.get("status") == "accepted":
+                            fill = confirm_order_fill(
+                                api, order.get("order_id"), code, shares
+                            )
+                            filled_qty = int(fill.get("filled_qty", 0))
+                            fill_price = float(fill.get("fill_price", 0))
+                        else:
+                            filled_qty = 0
+                            fill_price = 0
+                        if filled_qty <= 0:
+                            trading_halted = True
+                            print(f"[{now_str}] [CRITICAL] 매수 체결 미확인: {name}; 장부 미반영 및 신규주문 중단")
+                            break
                         positions[name] = {
                             "code": code,
-                            "shares": shares,
-                            "buy_price": entry_p,
+                            "shares": filled_qty,
+                            "buy_price": fill_price,
                             "stop_loss_pct": sig.get("stop_loss_pct", STOP_LOSS_PCT),
                             "take_profit_pct": sig.get("take_profit_pct", TAKE_PROFIT_PCT),
-                            "days_held": 0,
+                            "days_held": 1,
+                            "entry_date": today_str,
+                            "last_held_date": today_str,
                             "trailing_active": False,
                             "strategy": sig["strategy"]
                         }
-                        cash -= invest
+                        cash -= filled_qty * fill_price
                         trade_record = {
                             "timestamp": now_str,
                             "type": "BUY",
                             "name": name,
                             "code": code,
-                            "shares": shares,
-                            "entry_price": entry_p,
+                            "shares": filled_qty,
+                            "entry_price": fill_price,
                             "stop_loss_pct": sig.get("stop_loss_pct", STOP_LOSS_PCT),
                             "take_profit_pct": sig.get("take_profit_pct", TAKE_PROFIT_PCT),
                             "strategy": sig["strategy"]
@@ -309,4 +465,5 @@ def run_trading_loop():
             time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
+    _instance_lock = acquire_instance_lock()
     run_trading_loop()

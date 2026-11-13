@@ -2,5 +2,9 @@
 __pycache__/
 *.pyc
 *.log
+universe.json
+risk_state.json
+.quant_sniper.lock
+*.tmp
 venv/
 .DS_Store

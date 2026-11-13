@@ -1,7 +1,7 @@
 import urllib.request
 import json
 import datetime
-from config import MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, SCREENER_TOP_N
+from config import MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, SCREENER_TOP_N, EXCLUDE_ETFS
 
 def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW, max_market_cap=MAX_MARKET_CAP_KRW):
     """
@@ -46,6 +46,7 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
     for s in all_raw:
         name = s.get("stockName", "")
         code = s.get("itemCode", "")
+        product_type = s.get("stockEndType", "")
         price = float(s.get("closePriceRaw", 0))
         trade_val = float(s.get("accumulatedTradingValueRaw", 0))
         market_cap = float(s.get("marketValueRaw", 0))
@@ -55,6 +56,8 @@ def get_dynamic_universe(top_n=SCREENER_TOP_N, min_market_cap=MIN_MARKET_CAP_KRW
             
         # 1. 잡주·위험종목 필터링 (우선주, 스팩, ETN)
         if name.endswith("우") or "우B" in name or "스팩" in name or "ETN" in name:
+            continue
+        if EXCLUDE_ETFS and product_type != "stock":
             continue
         if price <= 0:
             continue

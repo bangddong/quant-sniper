@@ -1,5 +1,15 @@
 import os
 
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+KIWOOM_USE_MOCK = env_bool("KIWOOM_USE_MOCK", True)
+LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", False)
+ORDER_CONFIRM_TIMEOUT_SECONDS = int(os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "20"))
+
 # 동적 스크리닝 활성화 여부
 DYNAMIC_SCREENING = True
 SCREENER_TOP_N = 20
@@ -56,6 +66,7 @@ TOTAL_ROUNDTRIP_COST_PCT = TRANSACTION_TAX_PCT + (BROKER_COMMISSION_PCT * 2) + (
 MAX_ALLOC_PER_STOCK = 0.20     # 1종목당 계좌 총자산의 최대 20%
 MAX_POSITIONS = 4              # 최대 동시 보유 종목 수 (최소 20% 현금 버퍼 유지)
 DAILY_KILL_SWITCH_PCT = 0.040  # 일일 계좌 누적 손실 -4.0% 도달 시 당일 올스톱
+EXCLUDE_ETFS = True             # 개별주 전략에서 ETF/레버리지/인버스 상품 제외
 
 # 감시 및 호출 주기
 POLL_INTERVAL_SECONDS = 30     # 장중 30초 주기 초정밀 감시

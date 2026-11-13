@@ -4,6 +4,12 @@ import json
 import urllib.request
 import urllib.parse
 
+def _number(value, default=0.0):
+    try:
+        return float(str(value).replace(",", "").strip() or 0)
+    except (TypeError, ValueError):
+        return default
+
 class KiwoomRestAPI:
     """
     키움증권 최신 공식 REST API 클라이언트
@@ -14,17 +20,24 @@ class KiwoomRestAPI:
       * 주식 주문: POST /api/dostk/ordr (kt10000: 매수, kt10001: 매도)
       * 예수금 조회: POST /api/dostk/acnt (kt00001)
     """
-    def __init__(self, app_key=None, app_secret=None, account_no=None, is_mock=False):
+    def __init__(self, app_key=None, app_secret=None, account_no=None, is_mock=None):
+        from config import KIWOOM_USE_MOCK, LIVE_TRADING_ENABLED
         self.app_key = (app_key or os.getenv("KIWOOM_APP_KEY", "")).strip()
         self.app_secret = (app_secret or os.getenv("KIWOOM_APP_SECRET", "")).strip()
         self.account_no = (account_no or os.getenv("KIWOOM_ACCOUNT_NO", "")).strip()
-        self.is_mock = is_mock
-        self.base_url = "https://mockapi.kiwoom.com" if is_mock else "https://api.kiwoom.com"
+        self.is_mock = KIWOOM_USE_MOCK if is_mock is None else is_mock
+        self.live_trading_enabled = LIVE_TRADING_ENABLED
+        self.base_url = "https://mockapi.kiwoom.com" if self.is_mock else "https://api.kiwoom.com"
         self.token = None
         self.token_expiry = 0
         
         # 키 미설정 시 안전 시뮬레이션 모드로 자동 폴백
         self.sim_mode = not (self.app_key and self.app_secret and self.app_key != "your_app_key_here")
+        if not self.is_mock and not self.live_trading_enabled:
+            raise RuntimeError(
+                "실전 API 사용이 차단되었습니다. 실전 주문은 KIWOOM_USE_MOCK=false와 "
+                "LIVE_TRADING_ENABLED=true를 모두 명시해야 합니다."
+            )
         if self.sim_mode:
             print("[INFO] 키움 REST API 키가 미설정되어 '시뮬레이션 모드'로 가동됩니다.")
 
@@ -78,24 +91,105 @@ class KiwoomRestAPI:
             "authorization": f"Bearer {token}",
             "api-id": "kt00001"
         }
-        body = {
-            "acnt_no": self.account_no
-        }
+        body = {"qry_tp": "3"}
         req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers=headers,
-            method="POST"
+            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8"))
-                # 예수금 또는 주문가능금액 추출
-                cash = float(data.get("ord_psbl_cash", data.get("dnca_tot_amt", 0.0)))
-                return cash
+                return _number(data.get("ord_alow_amt", data.get("entr", 0.0)))
         except Exception as e:
             print(f"[ERR] 예수금 조회 실패: {e}")
             return 0.0
+
+    def get_account_snapshot(self):
+        """kt00018 기준 실계좌 보유수량/평균매입가/평가자산을 조회한다."""
+        if self.sim_mode:
+            return {"ok": True, "positions": {}, "total_assets": 500000.0,
+                    "total_pnl": 0.0, "cash": 500000.0}
+        token = self.get_token()
+        if not token:
+            return {"ok": False, "error": "토큰 발급 실패"}
+        url = f"{self.base_url}/api/dostk/acnt"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "api-id": "kt00018",
+        }
+        body = {"qry_tp": "1", "dmst_stex_tp": "KRX"}
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data.get("return_code") != 0:
+                return {"ok": False, "error": data.get("return_msg", "잔고 조회 실패")}
+            positions = {}
+            for item in data.get("acnt_evlt_remn_indv_tot", []):
+                code = str(item.get("stk_cd", "")).lstrip("AJQ")[-6:]
+                qty = int(_number(item.get("rmnd_qty")))
+                if code and qty > 0:
+                    positions[code] = {
+                        "code": code,
+                        "name": str(item.get("stk_nm", "")).strip(),
+                        "shares": qty,
+                        "available_shares": int(_number(item.get("trde_able_qty"))),
+                        "buy_price": abs(_number(item.get("pur_pric"))),
+                        "current_price": abs(_number(item.get("cur_prc"))),
+                        "evaluation_pnl": _number(item.get("evltv_prft")),
+                    }
+            return {
+                "ok": True,
+                "positions": positions,
+                "total_assets": _number(data.get("prsm_dpst_aset_amt")),
+                "total_pnl": _number(data.get("tot_evlt_pl")),
+                "cash": self.get_cash_balance(),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def get_order_execution(self, order_id, code=""):
+        """kt00009에서 주문번호별 실제 체결수량과 가중평균 체결가를 조회한다."""
+        if self.sim_mode:
+            return {"ok": True, "filled_qty": 0, "fill_price": 0.0}
+        token = self.get_token()
+        if not token:
+            return {"ok": False, "error": "토큰 발급 실패"}
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "api-id": "kt00009",
+        }
+        body = {
+            "ord_dt": time.strftime("%Y%m%d"),
+            "stk_bond_tp": "1", "mrkt_tp": "0", "sell_tp": "0",
+            "qry_tp": "1", "stk_cd": code, "fr_ord_no": str(order_id),
+            "dmst_stex_tp": "%",
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/api/dostk/acnt",
+            data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data.get("return_code") != 0:
+                return {"ok": False, "error": data.get("return_msg", "체결 조회 실패")}
+            fills = [
+                item for item in data.get("acnt_ord_cntr_prst_array", [])
+                if str(item.get("ord_no", "")).lstrip("0") == str(order_id).lstrip("0")
+                and int(_number(item.get("cntr_qty"))) > 0
+            ]
+            qty = sum(int(_number(item.get("cntr_qty"))) for item in fills)
+            amount = sum(
+                int(_number(item.get("cntr_qty"))) * abs(_number(item.get("cntr_uv")))
+                for item in fills
+            )
+            return {"ok": True, "filled_qty": qty,
+                    "fill_price": amount / qty if qty else 0.0}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def get_daily_candles(self, code, count=30):
         """종목 일봉 캔들 데이터 조회 (네이버 금융 공용 엔드포인트 - API 호출 한도 절약)"""
@@ -131,7 +225,7 @@ class KiwoomRestAPI:
         if self.sim_mode:
             print(f"[ORDER BUY/SIM] {name}({code}) {qty}주 @ {price:,.0f}원 (모의)")
             return {
-                "status": "success",
+                "status": "filled",
                 "order_id": f"SIM_B_{int(time.time())}",
                 "code": code,
                 "name": name,
@@ -170,7 +264,7 @@ class KiwoomRestAPI:
                     ord_no = res.get("ord_no", "")
                     print(f"✅ [실전 매수 완료] {name}({code}) {qty}주 | 주문번호: {ord_no}")
                     return {
-                        "status": "success",
+                        "status": "accepted",
                         "order_id": ord_no,
                         "code": code,
                         "name": name,
@@ -193,7 +287,7 @@ class KiwoomRestAPI:
         if self.sim_mode:
             print(f"[ORDER SELL/SIM] {name}({code}) {qty}주 매도 ({reason}) (모의)")
             return {
-                "status": "success",
+                "status": "filled",
                 "order_id": f"SIM_S_{int(time.time())}",
                 "code": code,
                 "name": name,
@@ -233,7 +327,7 @@ class KiwoomRestAPI:
                     ord_no = res.get("ord_no", "")
                     print(f"🚨 [실전 매도 완료] {name}({code}) {qty}주 | {reason} | 주문번호: {ord_no}")
                     return {
-                        "status": "success",
+                        "status": "accepted",
                         "order_id": ord_no,
                         "code": code,
                         "name": name,
