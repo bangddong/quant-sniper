@@ -78,6 +78,24 @@ class KiwoomRestAPI:
         if not token:
             return 0.0
 
+        url = f"{self.base_url}/api/dostk/acnt"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "api-id": "kt00001"
+        }
+        body = {"qry_tp": "3"}
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                return _number(data.get("ord_alow_amt", data.get("entr", 0.0)))
+        except Exception as e:
+            print(f"[ERR] 예수금 조회 실패: {e}")
+            return 0.0
+
     def _post_domestic(self, path, api_id, body):
         """국내주식 조회 TR 공통 호출. 실패 시 원인을 포함한 dict를 반환한다."""
         token = self.get_token()
@@ -140,24 +158,6 @@ class KiwoomRestAPI:
                 if len(selected) >= top_n:
                     break
         return selected
-
-        url = f"{self.base_url}/api/dostk/acnt"
-        headers = {
-            "Content-Type": "application/json;charset=UTF-8",
-            "authorization": f"Bearer {token}",
-            "api-id": "kt00001"
-        }
-        body = {"qry_tp": "3"}
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8"))
-                return _number(data.get("ord_alow_amt", data.get("entr", 0.0)))
-        except Exception as e:
-            print(f"[ERR] 예수금 조회 실패: {e}")
-            return 0.0
 
     def get_account_snapshot(self):
         """kt00018 기준 실계좌 보유수량/평균매입가/평가자산을 조회한다."""
