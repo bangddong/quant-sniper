@@ -78,6 +78,69 @@ class KiwoomRestAPI:
         if not token:
             return 0.0
 
+    def _post_domestic(self, path, api_id, body):
+        """국내주식 조회 TR 공통 호출. 실패 시 원인을 포함한 dict를 반환한다."""
+        token = self.get_token()
+        if not token:
+            return {"return_code": -1, "return_msg": "토큰 발급 실패"}
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "api-id": api_id,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}{path}", data=json.dumps(body).encode("utf-8"),
+            headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            return {"return_code": -1, "return_msg": str(exc)}
+
+    def get_previous_day_universe(self, top_n, min_market_cap, max_market_cap):
+        """키움 전일 거래대금 순위와 전일 시총으로 장중에도 유니버스를 복구한다."""
+        ranking = self._post_domestic(
+            "/api/dostk/rkinfo", "ka10031",
+            {"mrkt_tp": "000", "qry_tp": "2", "rank_strt": "0",
+             "rank_end": "100", "stex_tp": "1"},
+        )
+        if ranking.get("return_code") != 0:
+            print(f"[SCREENER ERR] 키움 전일 거래대금 순위 실패: {ranking.get('return_msg')}")
+            return {}
+
+        selected = {}
+        for item in ranking.get("pred_trde_qty_upper", []):
+            code = str(item.get("stk_cd", "")).lstrip("AJQ")[-6:]
+            name = str(item.get("stk_nm", "")).strip()
+            if not code or not name:
+                continue
+            info = self._post_domestic(
+                "/api/dostk/stkinfo", "ka10100", {"stk_cd": code}
+            )
+            time.sleep(0.22)
+            if info.get("return_code") != 0:
+                continue
+            # ka10100의 전일종가와 상장주식수만 사용해 장중 가격 혼입을 막는다.
+            previous_close = abs(_number(info.get("lastPrice")))
+            listed_shares = abs(_number(info.get("listCount")))
+            previous_market_cap = previous_close * listed_shares
+            unsafe_name = (
+                name.endswith("우") or "우B" in name or "스팩" in name
+                or "ETN" in name or "ETF" in str(info.get("marketName", "")).upper()
+            )
+            audit_info = str(info.get("auditInfo", "")).strip()
+            unsafe_state = audit_info not in {"", "정상"} or str(
+                info.get("orderWarning", "0")
+            ).strip() not in {"", "0"}
+            if unsafe_name or unsafe_state:
+                continue
+            if min_market_cap <= previous_market_cap <= max_market_cap:
+                selected[name] = code
+                if len(selected) >= top_n:
+                    break
+        return selected
+
         url = f"{self.base_url}/api/dostk/acnt"
         headers = {
             "Content-Type": "application/json;charset=UTF-8",

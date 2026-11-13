@@ -16,7 +16,8 @@ from config import (
     DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY,
     TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
     SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS,
-    MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME, AUTO_GIT_PUSH
+    MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME, AUTO_GIT_PUSH,
+    MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
@@ -128,6 +129,20 @@ def build_operational_status(trading_halted, risk_reasons, position_count):
         return "halted", detail
     return "running", f"정규 감시 중 (보유: {position_count}개)"
 
+def confirm_persistent_signals(signals, confirmations, required=3):
+    """연속 루프에서 동일하게 유지된 신호만 반환한다."""
+    current_keys = {(sig["name"], sig["strategy"]) for sig in signals}
+    confirmations = {
+        key: count for key, count in confirmations.items() if key in current_keys
+    }
+    for key in current_keys:
+        confirmations[key] = confirmations.get(key, 0) + 1
+    confirmed = [
+        sig for sig in signals
+        if confirmations.get((sig["name"], sig["strategy"]), 0) >= required
+    ]
+    return confirmed, confirmations
+
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
     if not AUTO_GIT_PUSH:
@@ -214,6 +229,7 @@ def run_trading_loop():
     opening_assets = None
     trading_halted = False
     last_published_state = ("running", "봇 최초 가동 시작")
+    signal_confirmations = {}
     
     while True:
         try:
@@ -249,6 +265,31 @@ def run_trading_loop():
                         last_published_state = ("halted", alert_detail)
                         last_health_sync_time = time.time()
                     print(f"[{now_str}] [WARN] D-1 스크리닝 실패: 오늘 신규매수를 차단합니다.")
+
+            # 장중 최초 기동 시에도 키움의 '전일' 확정 순위로만 오늘 유니버스를 복구한다.
+            intraday_bootstrap = (
+                DYNAMIC_SCREENING
+                and last_screened_date != today_str
+                and is_market_open(now)
+                and is_entry_window(now)
+            )
+            if intraday_bootstrap:
+                print(f"[{now_str}] 🔄 키움 전일 거래대금 기준 장중 유니버스 복구...")
+                screened = api.get_previous_day_universe(
+                    SCREENER_TOP_N, MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW
+                )
+                if screened:
+                    active_universe = screened
+                    last_screened_date = today_str
+                    save_json(UNIVERSE_FILE, {
+                        "date": today_str, "symbols": screened,
+                        "source": "kiwoom_ka10031_previous_day",
+                    })
+                    print(f"[{now_str}] ✅ 장중 유니버스 {len(screened)}종목 복구 완료")
+                else:
+                    trading_halted = True
+                    risk_reasons.append("키움 전일 유니버스 복구 실패")
+                    print(f"[{now_str}] [RISK] 장중 유니버스 복구 실패: 신규 주문 중단")
                     
             # 장 운영 시간 확인
             if not is_market_open():
@@ -437,6 +478,11 @@ def run_trading_loop():
                 market_candles = api.get_daily_candles(MARKET_PROXY_CODE, 70)
                 signals = evaluate_signals(
                     candles_dict, market_candles, market_session_progress(now)
+                )
+                # 재기동 직후의 일시적/이미 끝난 신호 추격을 막는다. 동일 전략 신호가
+                # 30초 간격으로 3회 연속 유지될 때만 신규 주문 후보로 인정한다.
+                signals, signal_confirmations = confirm_persistent_signals(
+                    signals, signal_confirmations, required=3
                 )
                 cash = api.get_cash_balance()
                 alloc_cap = (cash + sum(p["shares"] * p["buy_price"] for p in positions.values())) * MAX_ALLOC_PER_STOCK
