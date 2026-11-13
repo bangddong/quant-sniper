@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/home/user/quant-sniper
-EnvironmentFile=/home/user/quant-sniper/.env
-ExecStart=/usr/bin/python3 /home/user/quant-sniper/bot.py
+User=niphyang
+WorkingDirectory=/home/niphyang/quant-sniper
+EnvironmentFile=/home/niphyang/quant-sniper/.env
+ExecStart=/usr/bin/python3 /home/niphyang/quant-sniper/bot.py
 Restart=always
 RestartSec=10
 
