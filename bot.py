@@ -275,7 +275,6 @@ def run_trading_loop():
                         "date": today_str, "opening_assets": opening_assets,
                         "halted": False,
                     })
-                    risk_reasons.append(f"일일 손실 한도 도달: {daily_return*100:.2f}%")
 
             if account.get("ok") and opening_assets:
                 current_assets = account.get("total_assets", opening_assets)
@@ -286,6 +285,7 @@ def run_trading_loop():
                         "date": today_str, "opening_assets": opening_assets,
                         "halted": True, "reason": "daily_loss_limit",
                     })
+                    risk_reasons.append(f"일일 손실 한도 도달: {daily_return*100:.2f}%")
                     print(f"[{now_str}] [KILL SWITCH] 일일 손실 {daily_return*100:.2f}%로 신규 주문 중단")
 
             # 브로커에만 있거나 로컬에만 있는 포지션은 자동 추정하지 않고 신규매수를 차단한다.
