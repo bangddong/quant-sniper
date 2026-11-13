@@ -1,8 +1,19 @@
 from config import (
-    RSI_PERIOD, RSI_BUY_THRESHOLD, VBO_K,
+    RSI_PERIOD, RSI_BUY_THRESHOLD, RSI_RECOVERY_THRESHOLD, VBO_K,
+    MARKET_MA_PERIOD, VOLUME_CONFIRM_MULTIPLIER, MAX_ENTRY_GAP_PCT,
+    MAX_ENTRY_DAY_RETURN_PCT, MAX_UPPER_WICK_RATIO,
     ATR_PERIOD, ATR_STOP_MULTIPLIER, MIN_STOP_LOSS_PCT, MAX_STOP_LOSS_PCT,
     MIN_RISK_REWARD_RATIO, STOP_LOSS_PCT, TAKE_PROFIT_PCT
 )
+
+def is_favorable_market(market_candles):
+    """시장 프록시가 장기 이동평균 위이고 장기선이 상승할 때만 진입한다."""
+    if not market_candles or len(market_candles) < MARKET_MA_PERIOD + 1:
+        return False
+    closes = [c["close"] for c in market_candles]
+    ma_now = sum(closes[-MARKET_MA_PERIOD:]) / MARKET_MA_PERIOD
+    ma_prev = sum(closes[-MARKET_MA_PERIOD - 1:-1]) / MARKET_MA_PERIOD
+    return closes[-1] > ma_now and ma_now > ma_prev
 
 def calculate_rsi(closes, period=RSI_PERIOD):
     """14일 RSI 지표 계산"""
@@ -48,7 +59,7 @@ def calculate_atr(candles, period=ATR_PERIOD):
         
     return sum(tr_list[-period:]) / period
 
-def evaluate_signals(candles_dict):
+def evaluate_signals(candles_dict, market_candles=None, volume_progress=1.0):
     """
     전 종목의 캔들 데이터를 분석하여 매수 신호 탐색 및 우선순위 랭킹 반환
     candles_dict: {name: [{"open", "high", "low", "close", "vol"}, ...]}
@@ -58,6 +69,8 @@ def evaluate_signals(candles_dict):
     2. 최소 손익비 1:2 원칙에 따라 목표 익절폭을 동적 연동
     """
     candidates = []
+    if not is_favorable_market(market_candles):
+        return candidates
     
     for name, candles in candles_dict.items():
         if len(candles) < 25:
@@ -68,18 +81,46 @@ def evaluate_signals(candles_dict):
         prev = candles[-2]
         
         rsi = calculate_rsi(closes)
+        prev_rsi = calculate_rsi(closes[:-1])
         ma20 = sum(closes[-20:]) / 20.0
+        prev_ma20 = sum(closes[-21:-1]) / 20.0
         atr = calculate_atr(candles)
+
+        prev_close = prev["close"]
+        gap_pct = (curr["open"] - prev_close) / prev_close if prev_close else 0.0
+        day_return_pct = (curr["close"] - prev_close) / prev_close if prev_close else 0.0
+        candle_range = max(curr["high"] - curr["low"], 1.0)
+        upper_wick_ratio = (curr["high"] - max(curr["open"], curr["close"])) / candle_range
+        price_quality_ok = (
+            gap_pct <= MAX_ENTRY_GAP_PCT
+            and day_return_pct <= MAX_ENTRY_DAY_RETURN_PCT
+            and upper_wick_ratio <= MAX_UPPER_WICK_RATIO
+        )
         
         # 전략 1: RSI 극단 과매도 반등
-        is_rsi_signal = (rsi <= RSI_BUY_THRESHOLD)
+        is_rsi_signal = (
+            prev_rsi <= RSI_BUY_THRESHOLD
+            and rsi > RSI_RECOVERY_THRESHOLD
+            and curr["close"] > curr["open"]
+            and curr["close"] > prev["high"]
+            and price_quality_ok
+        )
         
         # 전략 2: 20일선 위 변동성 돌파
         target_price = curr["open"] + (prev["high"] - prev["low"]) * VBO_K
+        avg_volume20 = sum(c["vol"] for c in candles[-21:-1]) / 20.0
+        expected_volume = avg_volume20 * max(0.05, min(1.0, volume_progress))
+        volume_confirmed = (
+            expected_volume > 0
+            and curr["vol"] >= expected_volume * VOLUME_CONFIRM_MULTIPLIER
+        )
         is_vbo_signal = (
-            (curr["high"] >= target_price) and 
+            (curr["close"] >= target_price) and
             (curr["close"] > curr["open"]) and 
-            (curr["close"] > ma20)
+            (curr["close"] > ma20) and
+            (ma20 > prev_ma20) and
+            volume_confirmed and
+            price_quality_ok
         )
         
         if is_rsi_signal:
@@ -96,14 +137,16 @@ def evaluate_signals(candles_dict):
                 "score": rsi,
                 "entry_price": entry_p,
                 "rsi": round(rsi, 1),
+                "previous_rsi": round(prev_rsi, 1),
                 "atr": round(atr, 0),
                 "stop_loss_pct": round(dynamic_stop_pct, 4),
                 "take_profit_pct": round(dynamic_take_profit_pct, 4)
             })
         elif is_vbo_signal:
-            entry_p = target_price
+            # 시장가 주문 수량은 이미 지나간 돌파선이 아니라 현재가로 산정한다.
+            entry_p = curr["close"]
             atr_pct = (atr / entry_p) if entry_p > 0 else 0.03
-            breakout_pct = (curr["high"] - target_price) / target_price * 100
+            breakout_pct = (curr["close"] - target_price) / target_price * 100
             
             dynamic_stop_pct = max(MIN_STOP_LOSS_PCT, min(MAX_STOP_LOSS_PCT, atr_pct * ATR_STOP_MULTIPLIER))
             dynamic_take_profit_pct = max(TAKE_PROFIT_PCT, dynamic_stop_pct * MIN_RISK_REWARD_RATIO)
@@ -112,8 +155,9 @@ def evaluate_signals(candles_dict):
                 "name": name,
                 "strategy": "변동성 돌파 (추세)",
                 "score": 50.0 + breakout_pct,
-                "entry_price": target_price,
+                "entry_price": entry_p,
                 "rsi": round(rsi, 1),
+                "volume_pace_ratio": round(curr["vol"] / expected_volume, 2),
                 "atr": round(atr, 0),
                 "stop_loss_pct": round(dynamic_stop_pct, 4),
                 "take_profit_pct": round(dynamic_take_profit_pct, 4)

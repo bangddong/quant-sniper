@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import config
-from bot import save_json, trading_days_held
+from bot import is_entry_window, market_session_progress, save_json, trading_days_held
 from kiwoom_api import KiwoomRestAPI
 from screener import get_dynamic_universe
 
@@ -22,6 +22,15 @@ class FakeResponse:
 
 
 class SafetyTests(unittest.TestCase):
+    def test_entry_window_avoids_open_and_late_session(self):
+        import datetime
+        self.assertFalse(is_entry_window(datetime.datetime(2026, 11, 13, 9, 14)))
+        self.assertTrue(is_entry_window(datetime.datetime(2026, 11, 13, 9, 15)))
+        self.assertTrue(is_entry_window(datetime.datetime(2026, 11, 13, 14, 30)))
+        self.assertFalse(is_entry_window(datetime.datetime(2026, 11, 13, 14, 31)))
+        self.assertEqual(market_session_progress(datetime.datetime(2026, 11, 13, 9, 0)), 0)
+        self.assertEqual(market_session_progress(datetime.datetime(2026, 11, 13, 15, 30)), 1)
+
     def test_live_mode_requires_explicit_enable(self):
         with patch.object(config, "KIWOOM_USE_MOCK", False), \
              patch.object(config, "LIVE_TRADING_ENABLED", False):

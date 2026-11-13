@@ -15,7 +15,8 @@ from config import (
     TAKE_PROFIT_PCT, MAX_HOLD_DAYS, MAX_ALLOC_PER_STOCK, MAX_POSITIONS,
     DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY,
     TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
-    SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS
+    SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS,
+    MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
@@ -154,6 +155,21 @@ def is_market_open():
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+def is_entry_window(now=None):
+    now = now or datetime.datetime.now()
+    start_hour, start_minute = map(int, ENTRY_START_TIME.split(":"))
+    end_hour, end_minute = map(int, ENTRY_END_TIME.split(":"))
+    start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    return start <= now <= end
+
+def market_session_progress(now=None):
+    now = now or datetime.datetime.now()
+    market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    total = (market_close - market_open).total_seconds()
+    return max(0.0, min(1.0, (now - market_open).total_seconds() / total))
+
 def run_trading_loop():
     print("=" * 60)
     print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 & ATR 손익비 엔진)")
@@ -256,7 +272,7 @@ def run_trading_loop():
             # 1. 캔들 데이터 조회
             candles_dict = {}
             for name, code in active_universe.items():
-                c = api.get_daily_candles(code, 30)
+                c = api.get_daily_candles(code, 70)
                 if c:
                     candles_dict[name] = c
                 time.sleep(API_REQUEST_DELAY) # Rate limit 방어
@@ -265,7 +281,7 @@ def run_trading_loop():
             for name, pos in positions.items():
                 if name in candles_dict:
                     continue
-                c = api.get_daily_candles(pos["code"], 30)
+                c = api.get_daily_candles(pos["code"], 70)
                 if c:
                     candles_dict[name] = c
                 time.sleep(API_REQUEST_DELAY)
@@ -375,8 +391,14 @@ def run_trading_loop():
                 trading_halted = True
                 print(f"[{now_str}] [RISK] 오늘자 D-1 유니버스가 없어 신규 주문을 중단합니다.")
 
-            if not trading_halted and len(positions) < MAX_POSITIONS:
-                signals = evaluate_signals(candles_dict)
+            if not is_entry_window(now):
+                print(f"[{now_str}] [ENTRY] 신규 진입 허용 시간({ENTRY_START_TIME}~{ENTRY_END_TIME}) 외")
+
+            if not trading_halted and is_entry_window(now) and len(positions) < MAX_POSITIONS:
+                market_candles = api.get_daily_candles(MARKET_PROXY_CODE, 70)
+                signals = evaluate_signals(
+                    candles_dict, market_candles, market_session_progress(now)
+                )
                 cash = api.get_cash_balance()
                 alloc_cap = (cash + sum(p["shares"] * p["buy_price"] for p in positions.values())) * MAX_ALLOC_PER_STOCK
                 

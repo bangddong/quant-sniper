@@ -40,7 +40,16 @@ DEFAULT_UNIVERSE = {
 # 전략 파라미터
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 28.0       # RSI 28 이하 시 과매도 저격 매수
+RSI_RECOVERY_THRESHOLD = 30.0  # 과매도 진입 후 30 상향 돌파 확인
 VBO_K = 0.5                    # 변동성 돌파 계수 (전일 레인지의 0.5)
+MARKET_PROXY_CODE = "069500"   # KODEX 200: 국내 시장 추세 프록시
+MARKET_MA_PERIOD = 60
+VOLUME_CONFIRM_MULTIPLIER = 1.5
+MAX_ENTRY_GAP_PCT = 0.04
+MAX_ENTRY_DAY_RETURN_PCT = 0.10
+MAX_UPPER_WICK_RATIO = 0.40
+ENTRY_START_TIME = "09:15"
+ENTRY_END_TIME = "14:30"
 
 # 💡 ATR 기반 동적 손절 및 손익비 규칙 (휩소 노이즈 방어)
 ATR_PERIOD = 14
