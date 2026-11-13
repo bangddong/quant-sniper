@@ -6,7 +6,6 @@ def env_bool(name, default=False):
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-KIWOOM_USE_MOCK = env_bool("KIWOOM_USE_MOCK", True)
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", False)
 AUTO_GIT_PUSH = env_bool("AUTO_GIT_PUSH", True)
 ORDER_CONFIRM_TIMEOUT_SECONDS = int(os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "20"))
@@ -83,5 +82,4 @@ POLL_INTERVAL_SECONDS = 30     # 장중 30초 주기 초정밀 감시
 API_REQUEST_DELAY = 0.3        # API 연속 호출 시 0.3초 대기 (레이트 리밋 방어)
 
 # 키움 REST API 공식 엔드포인트
-MOCK_API_BASE_URL = "https://mockapi.kiwoom.com"
 REAL_API_BASE_URL = "https://api.kiwoom.com"

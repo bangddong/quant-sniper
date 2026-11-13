@@ -48,10 +48,14 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(market_session_progress(datetime.datetime(2026, 11, 13, 15, 30)), 1)
 
     def test_live_mode_requires_explicit_enable(self):
-        with patch.object(config, "KIWOOM_USE_MOCK", False), \
-             patch.object(config, "LIVE_TRADING_ENABLED", False):
+        with patch.object(config, "LIVE_TRADING_ENABLED", False):
             with self.assertRaises(RuntimeError):
                 KiwoomRestAPI("key", "secret", "account")
+
+    def test_live_mode_requires_account_number(self):
+        with patch.object(config, "LIVE_TRADING_ENABLED", True):
+            with self.assertRaises(RuntimeError):
+                KiwoomRestAPI("key", "secret", "")
 
     def test_atomic_json_save(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -79,7 +83,8 @@ class SafetyTests(unittest.TestCase):
                 "evltv_prft": "3000",
             }],
         })
-        api = KiwoomRestAPI("key", "secret", "account", is_mock=True)
+        with patch.object(config, "LIVE_TRADING_ENABLED", True):
+            api = KiwoomRestAPI("key", "secret", "account")
         api.get_token = lambda: "token"
         api.get_cash_balance = lambda: 500000
         snapshot = api.get_account_snapshot()
@@ -96,7 +101,8 @@ class SafetyTests(unittest.TestCase):
                 {"ord_no": "0000123", "cntr_qty": "1", "cntr_uv": "10300"},
             ],
         })
-        api = KiwoomRestAPI("key", "secret", "account", is_mock=True)
+        with patch.object(config, "LIVE_TRADING_ENABLED", True):
+            api = KiwoomRestAPI("key", "secret", "account")
         api.get_token = lambda: "token"
         result = api.get_order_execution("123", "005930")
         self.assertEqual(result["filled_qty"], 3)

@@ -289,7 +289,7 @@ def run_trading_loop():
                     print(f"[{now_str}] [KILL SWITCH] 일일 손실 {daily_return*100:.2f}%로 신규 주문 중단")
 
             # 브로커에만 있거나 로컬에만 있는 포지션은 자동 추정하지 않고 신규매수를 차단한다.
-            if account.get("ok") and not api.sim_mode:
+            if account.get("ok"):
                 broker_codes = set(account["positions"])
                 local_codes = {p.get("code") for p in positions.values()}
                 if broker_codes != local_codes:
@@ -354,7 +354,7 @@ def run_trading_loop():
                     exit_reason = f"타임스탑 (최대 보유 {MAX_HOLD_DAYS}일 경과)"
                     
                 if exit_price:
-                    if account.get("ok") and not api.sim_mode:
+                    if account.get("ok"):
                         broker_qty = int(account["positions"].get(pos["code"], {}).get("shares", 0))
                         if broker_qty < pos["shares"]:
                             trading_halted = True
@@ -396,7 +396,7 @@ def run_trading_loop():
                         "shares": pos["shares"],
                         "entry_price": buy_p,
                         "exit_price": actual_exit_price,
-                        "price_source": "broker_execution" if order.get("status") == "accepted" else "simulation",
+                        "price_source": "broker_execution",
                         "gross_return_pct": round(gross_ret_pct, 2),
                         "net_return_pct": round(net_ret_pct, 2),
                         "cost_fee_krw": round(cost_krw, 0),

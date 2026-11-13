@@ -20,32 +20,28 @@ class KiwoomRestAPI:
       * 주식 주문: POST /api/dostk/ordr (kt10000: 매수, kt10001: 매도)
       * 예수금 조회: POST /api/dostk/acnt (kt00001)
     """
-    def __init__(self, app_key=None, app_secret=None, account_no=None, is_mock=None):
-        from config import KIWOOM_USE_MOCK, LIVE_TRADING_ENABLED
+    def __init__(self, app_key=None, app_secret=None, account_no=None):
+        from config import LIVE_TRADING_ENABLED
         self.app_key = (app_key or os.getenv("KIWOOM_APP_KEY", "")).strip()
         self.app_secret = (app_secret or os.getenv("KIWOOM_APP_SECRET", "")).strip()
         self.account_no = (account_no or os.getenv("KIWOOM_ACCOUNT_NO", "")).strip()
-        self.is_mock = KIWOOM_USE_MOCK if is_mock is None else is_mock
         self.live_trading_enabled = LIVE_TRADING_ENABLED
-        self.base_url = "https://mockapi.kiwoom.com" if self.is_mock else "https://api.kiwoom.com"
+        self.base_url = "https://api.kiwoom.com"
         self.token = None
         self.token_expiry = 0
-        
-        # 키 미설정 시 안전 시뮬레이션 모드로 자동 폴백
-        self.sim_mode = not (self.app_key and self.app_secret and self.app_key != "your_app_key_here")
-        if not self.is_mock and not self.live_trading_enabled:
-            raise RuntimeError(
-                "실전 API 사용이 차단되었습니다. 실전 주문은 KIWOOM_USE_MOCK=false와 "
-                "LIVE_TRADING_ENABLED=true를 모두 명시해야 합니다."
-            )
-        if self.sim_mode:
-            print("[INFO] 키움 REST API 키가 미설정되어 '시뮬레이션 모드'로 가동됩니다.")
+
+        missing = [name for name, value in (
+            ("KIWOOM_APP_KEY", self.app_key),
+            ("KIWOOM_APP_SECRET", self.app_secret),
+            ("KIWOOM_ACCOUNT_NO", self.account_no),
+        ) if not value or value.startswith("your_")]
+        if missing:
+            raise RuntimeError(f"실전 필수 설정 누락: {', '.join(missing)}")
+        if not self.live_trading_enabled:
+            raise RuntimeError("실전 주문이 잠겨 있습니다. LIVE_TRADING_ENABLED=true가 필요합니다.")
 
     def get_token(self):
         """OAuth 2.0 접근 토큰 발급 (au10001) 및 캐싱"""
-        if self.sim_mode:
-            return "sim_token_ok"
-            
         if self.token and time.time() < self.token_expiry - 60:
             return self.token
 
@@ -78,9 +74,6 @@ class KiwoomRestAPI:
 
     def get_cash_balance(self):
         """계좌 예수금(주문 가능 현금) 조회 (kt00001)"""
-        if self.sim_mode:
-            return 500000.0  # 시뮬레이션 초기 현금 50만 원
-
         token = self.get_token()
         if not token:
             return 0.0
@@ -105,9 +98,6 @@ class KiwoomRestAPI:
 
     def get_account_snapshot(self):
         """kt00018 기준 실계좌 보유수량/평균매입가/평가자산을 조회한다."""
-        if self.sim_mode:
-            return {"ok": True, "positions": {}, "total_assets": 500000.0,
-                    "total_pnl": 0.0, "cash": 500000.0}
         token = self.get_token()
         if not token:
             return {"ok": False, "error": "토큰 발급 실패"}
@@ -151,8 +141,6 @@ class KiwoomRestAPI:
 
     def get_order_execution(self, order_id, code=""):
         """kt00009에서 주문번호별 실제 체결수량과 가중평균 체결가를 조회한다."""
-        if self.sim_mode:
-            return {"ok": True, "filled_qty": 0, "fill_price": 0.0}
         token = self.get_token()
         if not token:
             return {"ok": False, "error": "토큰 발급 실패"}
@@ -222,17 +210,6 @@ class KiwoomRestAPI:
         - trade_type: "0" 보통(지정가), "3" 시장가 (기본값: 체결 지연 방지용 시장가)
         - dmst_stex_tp: "SOR" (최선주문집행) 또는 "KRX"
         """
-        if self.sim_mode:
-            print(f"[ORDER BUY/SIM] {name}({code}) {qty}주 @ {price:,.0f}원 (모의)")
-            return {
-                "status": "filled",
-                "order_id": f"SIM_B_{int(time.time())}",
-                "code": code,
-                "name": name,
-                "qty": qty,
-                "price": price
-            }
-
         token = self.get_token()
         if not token:
             return {"status": "error", "message": "토큰 없음"}
@@ -284,18 +261,6 @@ class KiwoomRestAPI:
         주식 매도 주문 집행 (kt10001)
         - 칼손절 및 이익 보존을 위해 기본 '3' 시장가로 즉시 청산
         """
-        if self.sim_mode:
-            print(f"[ORDER SELL/SIM] {name}({code}) {qty}주 매도 ({reason}) (모의)")
-            return {
-                "status": "filled",
-                "order_id": f"SIM_S_{int(time.time())}",
-                "code": code,
-                "name": name,
-                "qty": qty,
-                "price": price,
-                "reason": reason
-            }
-
         token = self.get_token()
         if not token:
             return {"status": "error", "message": "토큰 없음"}
