@@ -8,6 +8,7 @@ def env_bool(name, default=False):
 
 KIWOOM_USE_MOCK = env_bool("KIWOOM_USE_MOCK", True)
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", False)
+AUTO_GIT_PUSH = env_bool("AUTO_GIT_PUSH", True)
 ORDER_CONFIRM_TIMEOUT_SECONDS = int(os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "20"))
 
 # 동적 스크리닝 활성화 여부

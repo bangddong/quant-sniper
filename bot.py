@@ -16,7 +16,7 @@ from config import (
     DAILY_KILL_SWITCH_PCT, POLL_INTERVAL_SECONDS, API_REQUEST_DELAY,
     TOTAL_ROUNDTRIP_COST_PCT, TRANSACTION_TAX_PCT, BROKER_COMMISSION_PCT,
     SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS,
-    MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME
+    MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME, AUTO_GIT_PUSH
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
@@ -61,7 +61,7 @@ def sync_health_to_status_branch(detail="정규 감시 중"):
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     health_path = os.path.join(repo_dir, "health.json")
     if not os.path.exists(health_path):
-        return
+        return False
     try:
         # 1. blob 생성
         blob_res = subprocess.run(["git", "hash-object", "-w", "health.json"], cwd=repo_dir, capture_output=True, text=True, check=True)
@@ -80,8 +80,10 @@ def sync_health_to_status_branch(detail="정규 감시 중"):
         # 4. remote status 브랜치로 강제 푸시
         subprocess.run(["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/status"], cwd=repo_dir, capture_output=True, text=True, check=True)
         print(f"[HEALTH] 🌐 status 브랜치 심장박동 동기화 완료: {detail}")
+        return True
     except Exception as e:
-        print(f"[HEALTH WARN] status 브랜치 동기화 실패 (무시됨): {e}")
+        print(f"[HEALTH WARN] status 브랜치 동기화 실패: {e}")
+        return False
 
 def load_json(filepath, default):
     if os.path.exists(filepath):
@@ -119,8 +121,17 @@ def trading_days_held(pos, today_str):
         pos["last_held_date"] = today_str
     return pos.get("days_held", 0)
 
+def build_operational_status(trading_halted, risk_reasons, position_count):
+    if trading_halted:
+        detail = "; ".join(dict.fromkeys(risk_reasons)) or "안전장치에 의해 신규 주문 중단"
+        return "halted", detail
+    return "running", f"정규 감시 중 (보유: {position_count}개)"
+
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
+    if not AUTO_GIT_PUSH:
+        print("[GIT] AUTO_GIT_PUSH=false: GitHub 연동이 비활성화되었습니다.")
+        return False
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
         res = subprocess.run(["git", "push", "--dry-run"], cwd=repo_dir, capture_output=True, text=True)
@@ -139,12 +150,17 @@ def git_commit_and_push(commit_msg):
     """체결 내역 발생 시 깃허브 자동 푸시 (피클 비서 보고 연동)"""
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        subprocess.run(["git", "add", "trades.json", "positions.json"], cwd=repo_dir, check=False)
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=False)
-        subprocess.run(["git", "push"], cwd=repo_dir, check=False)
+        subprocess.run(["git", "add", "trades.json", "positions.json"], cwd=repo_dir,
+                       capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir,
+                       capture_output=True, text=True, check=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir,
+                       capture_output=True, text=True, check=True)
         print(f"[GIT] 자동 커밋 및 푸시 완료: {commit_msg}")
+        return True
     except Exception as e:
-        print(f"[GIT ERR] 푸시 실패 (무시됨): {e}")
+        print(f"[GIT ERR] 체결 내역 push 실패: {e}")
+        return False
 
 def is_market_open():
     """한국 거래소 정규장 개장 여부 체크 (09:00 ~ 15:30, 월~금)"""
@@ -192,12 +208,14 @@ def run_trading_loop():
     risk_date = None
     opening_assets = None
     trading_halted = False
+    last_published_state = ("running", "봇 최초 가동 시작")
     
     while True:
         try:
             now = datetime.datetime.now()
             today_str = now.strftime("%Y-%m-%d")
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            risk_reasons = []
             
             # 매일 아침 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 갱신 (Lookahead 방지)
             universe_cache = load_json(UNIVERSE_FILE, {})
@@ -218,6 +236,13 @@ def run_trading_loop():
                     print("   ", ", ".join(list(active_universe.keys())[:10]), "...")
                 else:
                     active_universe = {}
+                    risk_reasons.append("D-1 스크리닝 실패")
+                    trading_halted = True
+                    alert_detail = "D-1 스크리닝 실패: 오늘 신규 주문 중단"
+                    update_health_status("halted", alert_detail)
+                    if git_ok and sync_health_to_status_branch(alert_detail):
+                        last_published_state = ("halted", alert_detail)
+                        last_health_sync_time = time.time()
                     print(f"[{now_str}] [WARN] D-1 스크리닝 실패: 오늘 신규매수를 차단합니다.")
                     
             # 장 운영 시간 확인
@@ -234,13 +259,15 @@ def run_trading_loop():
             risk_state = load_json(RISK_FILE, {})
             if not account.get("ok"):
                 trading_halted = True
-                update_health_status("degraded", f"계좌 조회 실패: {account.get('error', 'unknown')}")
+                risk_reasons.append(f"계좌 조회 실패: {account.get('error', 'unknown')}")
                 print(f"[{now_str}] [RISK] 계좌 조회 실패로 신규 주문을 중단합니다.")
             elif risk_date != today_str:
                 risk_date = today_str
                 if risk_state.get("date") == today_str:
                     opening_assets = risk_state.get("opening_assets") or None
                     trading_halted = bool(risk_state.get("halted", False))
+                    if trading_halted:
+                        risk_reasons.append(f"지속 중인 거래 중단: {risk_state.get('reason', 'unknown')}")
                 else:
                     opening_assets = account.get("total_assets") or None
                     trading_halted = False
@@ -248,6 +275,7 @@ def run_trading_loop():
                         "date": today_str, "opening_assets": opening_assets,
                         "halted": False,
                     })
+                    risk_reasons.append(f"일일 손실 한도 도달: {daily_return*100:.2f}%")
 
             if account.get("ok") and opening_assets:
                 current_assets = account.get("total_assets", opening_assets)
@@ -266,6 +294,7 @@ def run_trading_loop():
                 local_codes = {p.get("code") for p in positions.values()}
                 if broker_codes != local_codes:
                     trading_halted = True
+                    risk_reasons.append("계좌/로컬 포지션 불일치")
                     print(f"[{now_str}] [RISK] 계좌/로컬 포지션 불일치로 신규 주문 중단 "
                           f"(broker={sorted(broker_codes)}, local={sorted(local_codes)})")
             
@@ -329,6 +358,7 @@ def run_trading_loop():
                         broker_qty = int(account["positions"].get(pos["code"], {}).get("shares", 0))
                         if broker_qty < pos["shares"]:
                             trading_halted = True
+                            risk_reasons.append(f"{name} 실보유수량 불일치")
                             print(f"[{now_str}] [CRITICAL] {name} 실보유수량 불일치로 매도 주문 차단 "
                                   f"(broker={broker_qty}, local={pos['shares']})")
                             continue
@@ -348,6 +378,7 @@ def run_trading_loop():
                         confirmed = False
                     if not confirmed:
                         trading_halted = True
+                        risk_reasons.append(f"{name} 매도 체결 미확인")
                         print(f"[{now_str}] [CRITICAL] 매도 체결 미확인: {name}; 포지션 유지 및 신규주문 중단")
                         continue
 
@@ -384,11 +415,14 @@ def run_trading_loop():
             if closed_positions:
                 save_json(POSITIONS_FILE, positions)
                 save_json(TRADES_FILE, trades)
-                git_commit_and_push(f"매도 체결: {', '.join(closed_positions)}")
+                if git_ok and not git_commit_and_push(f"매도 체결: {', '.join(closed_positions)}"):
+                    trading_halted = True
+                    risk_reasons.append("매도 체결 내역 GitHub push 실패")
                 
             # 3. 신규 매수 신호 탐색 및 진입 집행
             if DYNAMIC_SCREENING and last_screened_date != today_str:
                 trading_halted = True
+                risk_reasons.append("오늘자 D-1 유니버스 없음")
                 print(f"[{now_str}] [RISK] 오늘자 D-1 유니버스가 없어 신규 주문을 중단합니다.")
 
             if not is_entry_window(now):
@@ -438,6 +472,7 @@ def run_trading_loop():
                             fill_price = 0
                         if filled_qty <= 0:
                             trading_halted = True
+                            risk_reasons.append(f"{name} 매수 체결 미확인")
                             print(f"[{now_str}] [CRITICAL] 매수 체결 미확인: {name}; 장부 미반영 및 신규주문 중단")
                             break
                         positions[name] = {
@@ -470,20 +505,37 @@ def run_trading_loop():
                 if new_buys:
                     save_json(POSITIONS_FILE, positions)
                     save_json(TRADES_FILE, trades)
-                    git_commit_and_push(f"매수 저격 체결: {', '.join(new_buys)}")
+                    if git_ok and not git_commit_and_push(f"매수 저격 체결: {', '.join(new_buys)}"):
+                        trading_halted = True
+                        risk_reasons.append("매수 체결 내역 GitHub push 실패")
                     
             print(f"[{now_str}] 감시 완료. 현재 보유 종목: {list(positions.keys())}")
-            update_health_status(status="running", detail=f"정규 감시 중 (보유: {len(positions)}개)")
+            status, detail = build_operational_status(
+                trading_halted, risk_reasons, len(positions)
+            )
+            update_health_status(status=status, detail=detail)
+
+            # 정상↔위험 상태가 바뀌면 30분 주기를 기다리지 않고 즉시 피클AI에 공개한다.
+            current_state = (status, detail)
+            if git_ok and current_state != last_published_state:
+                if sync_health_to_status_branch(detail=detail):
+                    last_published_state = current_state
+                    last_health_sync_time = time.time()
             
             # 30분(1800초)마다 status 브랜치에 가벼운 단일 커밋 심장박동 동기화
             if git_ok and (time.time() - last_health_sync_time >= 1800):
-                sync_health_to_status_branch(detail=f"정규 감시 중 (보유: {len(positions)}개)")
-                last_health_sync_time = time.time()
+                if sync_health_to_status_branch(detail=detail):
+                    last_health_sync_time = time.time()
                 
             time.sleep(POLL_INTERVAL_SECONDS)
             
         except Exception as e:
             print(f"[ERROR] 루프 실행 중 예외 발생: {e}")
+            error_detail = f"루프 예외: {type(e).__name__}: {e}"
+            update_health_status(status="error", detail=error_detail)
+            if git_ok and sync_health_to_status_branch(detail=error_detail):
+                last_published_state = ("error", error_detail)
+                last_health_sync_time = time.time()
             time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":

@@ -5,7 +5,10 @@ import unittest
 from unittest.mock import patch
 
 import config
-from bot import is_entry_window, market_session_progress, save_json, trading_days_held
+from bot import (
+    build_operational_status, git_commit_and_push, is_entry_window,
+    market_session_progress, save_json, trading_days_held,
+)
 from kiwoom_api import KiwoomRestAPI
 from screener import get_dynamic_universe
 
@@ -22,6 +25,19 @@ class FakeResponse:
 
 
 class SafetyTests(unittest.TestCase):
+    def test_operational_status_preserves_risk_reason(self):
+        status, detail = build_operational_status(
+            True, ["계좌 조회 실패", "계좌 조회 실패", "체결 미확인"], 1
+        )
+        self.assertEqual(status, "halted")
+        self.assertEqual(detail, "계좌 조회 실패; 체결 미확인")
+
+    @patch("bot.subprocess.run")
+    def test_trade_push_failure_is_reported(self, run):
+        import subprocess
+        run.side_effect = subprocess.CalledProcessError(1, ["git", "push"])
+        self.assertFalse(git_commit_and_push("test"))
+
     def test_entry_window_avoids_open_and_late_session(self):
         import datetime
         self.assertFalse(is_entry_window(datetime.datetime(2026, 11, 13, 9, 14)))
