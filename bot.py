@@ -21,8 +21,7 @@ from config import (
 )
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
-from screener import get_dynamic_universe
-from market_status import get_live_market_status
+from kiwoom_realtime import KiwoomRealtimeFeed
 
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 POSITIONS_FILE = os.path.join(BASE_DIR, "positions.json")
@@ -30,6 +29,7 @@ HEALTH_FILE = os.path.join(BASE_DIR, "health.json")
 UNIVERSE_FILE = os.path.join(BASE_DIR, "universe.json")
 RISK_FILE = os.path.join(BASE_DIR, "risk_state.json")
 LOCK_FILE = os.path.join(BASE_DIR, ".quant_sniper.lock")
+CURRENT_MARKET_OPEN = False
 
 def acquire_instance_lock():
     lock_handle = open(LOCK_FILE, "w", encoding="utf-8")
@@ -49,7 +49,7 @@ def update_health_status(status="healthy", detail=""):
         "status": status,
         "detail": detail,
         "pid": os.getpid(),
-        "is_market_open": is_market_open()
+        "is_market_open": CURRENT_MARKET_OPEN
     }
     save_json(HEALTH_FILE, health_data)
 
@@ -143,6 +143,51 @@ def confirm_persistent_signals(signals, confirmations, required=3):
     ]
     return confirmed, confirmations
 
+def update_position_stop(pos, current_price):
+    """현재가로 진입 후 고점을 갱신하고, 절대로 낮아지지 않는 청산선을 계산한다."""
+    buy_price = float(pos["buy_price"])
+    stop_loss_pct = float(pos.get("stop_loss_pct", STOP_LOSS_PCT))
+    highest_price = max(float(pos.get("highest_price", buy_price)), float(current_price))
+    pos["highest_price"] = highest_price
+    stop_price = buy_price * (1 - stop_loss_pct)
+
+    if highest_price >= buy_price * (1 + TAKE_PROFIT_PCT):
+        gap = float(pos.get("trailing_gap_pct", max(0.02, min(0.04, stop_loss_pct / 1.5))))
+        pos["trailing_active"] = True
+        stop_price = max(float(pos.get("trailing_stop_price", 0)), highest_price * (1 - gap))
+        pos["trailing_stop_price"] = stop_price
+        reason = "고점 추적 트레일링 스탑"
+    elif highest_price >= buy_price * (1 + TRAILING_STOP_TRIGGER):
+        stop_price = max(float(pos.get("trailing_stop_price", 0)),
+                         buy_price * (1 + TRAILING_STOP_LOCK))
+        pos["trailing_stop_price"] = stop_price
+        reason = "수익 보호 스탑"
+    else:
+        reason = f"동적 손절 (-{stop_loss_pct*100:.1f}% ATR 보정)"
+    return stop_price, reason
+
+def get_kiwoom_candles(api, realtime, cache, code, now, count=70):
+    """일봉은 일 1회 REST로 받고 당일 봉만 키움 실시간 체결로 갱신한다."""
+    date_key = now.strftime("%Y%m%d")
+    cached = cache.get(code)
+    if not cached or cached["date"] != date_key:
+        candles = api.get_daily_candles(code, count)
+        if not candles:
+            return []
+        cache[code] = {"date": date_key, "candles": candles}
+    candles = [dict(item) for item in cache[code]["candles"]]
+    quote = realtime.quote(code)
+    if quote:
+        live_candle = {
+            "date": date_key, "open": quote["open"], "high": quote["high"],
+            "low": quote["low"], "close": quote["price"], "vol": quote["volume"],
+        }
+        if candles and candles[-1].get("date") == date_key:
+            candles[-1].update(live_candle)
+        else:
+            candles.append(live_candle)
+    return candles[-count:]
+
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
     if not AUTO_GIT_PUSH:
@@ -178,7 +223,7 @@ def git_commit_and_push(commit_msg):
         print(f"[GIT ERR] 체결 내역 push 실패: {e}")
         return False
 
-def is_market_open(now=None, live_status=None):
+def is_market_open(now=None, live_status=False):
     """시간과 당일 실시간 상태가 모두 확인된 경우에만 장이 열린 것으로 본다."""
     now = now or datetime.datetime.now()
     if now.weekday() >= 5:
@@ -187,8 +232,6 @@ def is_market_open(now=None, live_status=None):
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if not market_open <= now <= market_close:
         return False
-    if live_status is None:
-        live_status = get_live_market_status(now)
     return bool(live_status)
 
 def is_entry_window(now=None):
@@ -207,6 +250,7 @@ def market_session_progress(now=None):
     return max(0.0, min(1.0, (now - market_open).total_seconds() / total))
 
 def run_trading_loop():
+    global CURRENT_MARKET_OPEN
     print("=" * 60)
     print("🎯 키움증권 퀀트 스나이퍼 봇 가동 시작 (동적 스크리닝 & ATR 손익비 엔진)")
     print(f"   [비용 설정] 거래세: {TRANSACTION_TAX_PCT*100:.2f}% | 수수료: {BROKER_COMMISSION_PCT*100:.3f}%×2 | 슬리피지: {SLIPPAGE_ESTIMATE_PCT*100:.2f}%×2")
@@ -222,6 +266,8 @@ def run_trading_loop():
         sync_health_to_status_branch(detail="봇 최초 가동 시작")
     
     api = KiwoomRestAPI()
+    realtime = KiwoomRealtimeFeed(api.get_token)
+    realtime.start()
     last_screened_date = None
     last_health_sync_time = time.time()
     active_universe = DEFAULT_UNIVERSE
@@ -230,6 +276,7 @@ def run_trading_loop():
     trading_halted = False
     last_published_state = ("running", "봇 최초 가동 시작")
     signal_confirmations = {}
+    daily_candle_cache = {}
     
     while True:
         try:
@@ -243,12 +290,22 @@ def run_trading_loop():
             if universe_cache.get("date") == today_str and universe_cache.get("symbols"):
                 active_universe = universe_cache["symbols"]
                 last_screened_date = today_str
+            realtime.set_symbols(
+                list(active_universe.values()) + [MARKET_PROXY_CODE]
+                + [p.get("code") for p in load_json(POSITIONS_FILE, {}).values()]
+            )
+            proxy_quote = realtime.quote(MARKET_PROXY_CODE)
+            CURRENT_MARKET_OPEN = is_market_open(
+                now, bool(proxy_quote and proxy_quote.get("market_type") == "2")
+            )
 
-            # 08:30~08:59에만 조회해야 네이버 누적 거래대금이 전일 확정치다.
+            # 장전에는 키움 전일 확정 순위를 미리 캐시한다.
             screening_window = now.weekday() < 5 and now.hour == 8 and now.minute >= 30
             if DYNAMIC_SCREENING and last_screened_date != today_str and screening_window:
                 print(f"[{now_str}] 🔍 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 가동...")
-                screened = get_dynamic_universe(SCREENER_TOP_N)
+                screened = api.get_previous_day_universe(
+                    SCREENER_TOP_N, MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW
+                )
                 if screened:
                     active_universe = screened
                     last_screened_date = today_str
@@ -270,7 +327,7 @@ def run_trading_loop():
             intraday_bootstrap = (
                 DYNAMIC_SCREENING
                 and last_screened_date != today_str
-                and is_market_open(now)
+                and CURRENT_MARKET_OPEN
                 and is_entry_window(now)
             )
             if intraday_bootstrap:
@@ -292,7 +349,7 @@ def run_trading_loop():
                     print(f"[{now_str}] [RISK] 장중 유니버스 복구 실패: 신규 주문 중단")
                     
             # 장 운영 시간 확인
-            if not is_market_open():
+            if not CURRENT_MARKET_OPEN:
                 print(f"[{now_str}] 정규장 운영 시간 외입니다. 대기 중...")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -347,54 +404,47 @@ def run_trading_loop():
             # 1. 캔들 데이터 조회
             candles_dict = {}
             for name, code in active_universe.items():
-                c = api.get_daily_candles(code, 70)
+                cache_miss = code not in daily_candle_cache
+                c = get_kiwoom_candles(api, realtime, daily_candle_cache, code, now)
                 if c:
                     candles_dict[name] = c
-                time.sleep(API_REQUEST_DELAY) # Rate limit 방어
+                if cache_miss:
+                    time.sleep(API_REQUEST_DELAY)
 
             # 신규 후보와 무관하게 모든 보유 종목을 반드시 감시한다.
             for name, pos in positions.items():
                 if name in candles_dict:
                     continue
-                c = api.get_daily_candles(pos["code"], 70)
+                cache_miss = pos["code"] not in daily_candle_cache
+                c = get_kiwoom_candles(
+                    api, realtime, daily_candle_cache, pos["code"], now
+                )
                 if c:
                     candles_dict[name] = c
-                time.sleep(API_REQUEST_DELAY)
+                if cache_miss:
+                    time.sleep(API_REQUEST_DELAY)
                 
             # 2. 보유 포지션 감시 및 청산 체크 (동적 손절, 트레일링 스탑, 익절)
             closed_positions = []
             for name, pos in list(positions.items()):
                 if name not in candles_dict:
                     continue
-                c = candles_dict[name][-1]
+                quote = realtime.quote(pos["code"])
+                if not quote:
+                    risk_reasons.append(f"{name} 실시간 시세 없음")
+                    print(f"[{now_str}] [RISK] {name} 실시간 시세가 없어 청산 판단을 보류합니다.")
+                    continue
                 trading_days_held(pos, today_str)
-                buy_p = pos["buy_price"]
-                curr_p = c["close"]
-                high_p = c["high"]
-                low_p = c["low"]
-                
-                # 종목별 맞춤 손절/익절선 (ATR 기반 동적 산출값, 없을 시 기본값 폴백)
-                pos_stop_pct = pos.get("stop_loss_pct", STOP_LOSS_PCT)
-                pos_tp_pct = pos.get("take_profit_pct", TAKE_PROFIT_PCT)
-                
-                # 트레일링 스탑 발동 여부 (+4%)
-                if high_p >= buy_p * (1 + TRAILING_STOP_TRIGGER):
-                    pos["trailing_active"] = True
-                    
+                buy_p = float(pos["buy_price"])
+                curr_p = quote["price"]
                 exit_price = None
                 exit_reason = None
-                
-                # 손절선 계산
-                stop_price = buy_p * (1 - pos_stop_pct)
-                if pos.get("trailing_active", False):
-                    stop_price = buy_p * (1 + TRAILING_STOP_LOCK) # +1% 수익 잠금
-                    
-                if low_p <= stop_price:
+                stop_price, stop_reason = update_position_stop(
+                    pos, quote.get("high_water", curr_p)
+                )
+                if curr_p <= stop_price:
                     exit_price = stop_price
-                    exit_reason = "트레일링 스탑 (+1.0% 익절 잠금)" if pos.get("trailing_active") else f"동적 손절 (-{pos_stop_pct*100:.1f}% ATR 보정)"
-                elif high_p >= buy_p * (1 + pos_tp_pct):
-                    exit_price = buy_p * (1 + pos_tp_pct)
-                    exit_reason = f"목표 익절 달성 (+{pos_tp_pct*100:.1f}%)"
+                    exit_reason = stop_reason
                 elif pos.get("days_held", 0) >= MAX_HOLD_DAYS:
                     exit_price = curr_p
                     exit_reason = f"타임스탑 (최대 보유 {MAX_HOLD_DAYS}일 경과)"
@@ -475,7 +525,9 @@ def run_trading_loop():
                 print(f"[{now_str}] [ENTRY] 신규 진입 허용 시간({ENTRY_START_TIME}~{ENTRY_END_TIME}) 외")
 
             if not trading_halted and is_entry_window(now) and len(positions) < MAX_POSITIONS:
-                market_candles = api.get_daily_candles(MARKET_PROXY_CODE, 70)
+                market_candles = get_kiwoom_candles(
+                    api, realtime, daily_candle_cache, MARKET_PROXY_CODE, now
+                )
                 signals = evaluate_signals(
                     candles_dict, market_candles, market_session_progress(now)
                 )
@@ -484,6 +536,15 @@ def run_trading_loop():
                 signals, signal_confirmations = confirm_persistent_signals(
                     signals, signal_confirmations, required=3
                 )
+                # 주문 가격도 키움 실시간 체결가로 통일한다. 오래된 시세는 후보에서 제외한다.
+                live_signals = []
+                for sig in signals:
+                    quote = realtime.quote(active_universe.get(sig["name"], ""))
+                    if quote:
+                        sig = dict(sig)
+                        sig["entry_price"] = quote["price"]
+                        live_signals.append(sig)
+                signals = live_signals
                 cash = api.get_cash_balance()
                 alloc_cap = (cash + sum(p["shares"] * p["buy_price"] for p in positions.values())) * MAX_ALLOC_PER_STOCK
                 
@@ -536,8 +597,12 @@ def run_trading_loop():
                             "entry_date": today_str,
                             "last_held_date": today_str,
                             "trailing_active": False,
+                            "highest_price": fill_price,
+                            "trailing_gap_pct": max(0.02, min(0.04,
+                                sig.get("atr", fill_price * 0.03) / max(fill_price, 1))),
                             "strategy": sig["strategy"]
                         }
+                        realtime.reset_high_water(code, fill_price)
                         cash -= filled_qty * fill_price
                         trade_record = {
                             "timestamp": now_str,

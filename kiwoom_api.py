@@ -13,7 +13,7 @@ def _number(value, default=0.0):
 class KiwoomRestAPI:
     """
     키움증권 최신 공식 REST API 클라이언트
-    - 의존성 제로: 파이썬 표준 라이브러리(urllib, json)만 사용
+    - REST 구간은 파이썬 표준 라이브러리(urllib, json) 사용
     - 지원 환경: Linux, macOS, Windows 완벽 호환
     - 엔드포인트:
       * 토큰 발급: POST /oauth2/token (au10001)
@@ -22,9 +22,9 @@ class KiwoomRestAPI:
     """
     def __init__(self, app_key=None, app_secret=None, account_no=None):
         from config import LIVE_TRADING_ENABLED
-        self.app_key = (app_key or os.getenv("KIWOOM_APP_KEY", "")).strip()
-        self.app_secret = (app_secret or os.getenv("KIWOOM_APP_SECRET", "")).strip()
-        self.account_no = (account_no or os.getenv("KIWOOM_ACCOUNT_NO", "")).strip()
+        self.app_key = (os.getenv("KIWOOM_APP_KEY", "") if app_key is None else app_key).strip()
+        self.app_secret = (os.getenv("KIWOOM_APP_SECRET", "") if app_secret is None else app_secret).strip()
+        self.account_no = (os.getenv("KIWOOM_ACCOUNT_NO", "") if account_no is None else account_no).strip()
         self.live_trading_enabled = LIVE_TRADING_ENABLED
         self.base_url = "https://api.kiwoom.com"
         self.token = None
@@ -243,29 +243,26 @@ class KiwoomRestAPI:
             return {"ok": False, "error": str(exc)}
 
     def get_daily_candles(self, code, count=30):
-        """종목 일봉 캔들 데이터 조회 (네이버 금융 공용 엔드포인트 - API 호출 한도 절약)"""
-        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                txt = r.read().decode("euc-kr", errors="ignore")
-            import re
-            items = re.findall(r"<item data=\"(.*?)\"", txt)
-            candles = []
-            for item in items:
-                p = item.split("|")
-                candles.append({
-                    "date": p[0],
-                    "open": float(p[1]),
-                    "high": float(p[2]),
-                    "low": float(p[3]),
-                    "close": float(p[4]),
-                    "vol": float(p[5])
-                })
-            return candles
-        except Exception as e:
-            print(f"[ERR] {code} 캔들 조회 실패: {e}")
+        """키움 ka10081 일봉 조회. 최신순 응답을 과거→현재 순으로 변환한다."""
+        data = self._post_domestic(
+            "/api/dostk/chart", "ka10081",
+            {"stk_cd": str(code)[-6:], "base_dt": time.strftime("%Y%m%d"),
+             "upd_stkpc_tp": "1"},
+        )
+        if data.get("return_code") != 0:
+            print(f"[ERR] {code} 키움 일봉 조회 실패: {data.get('return_msg')}")
             return []
+        candles = []
+        for item in reversed(data.get("stk_dt_pole_chart_qry", [])[:count]):
+            candles.append({
+                "date": str(item.get("dt", "")),
+                "open": abs(_number(item.get("open_pric"))),
+                "high": abs(_number(item.get("high_pric"))),
+                "low": abs(_number(item.get("low_pric"))),
+                "close": abs(_number(item.get("cur_prc"))),
+                "vol": abs(_number(item.get("trde_qty"))),
+            })
+        return candles
 
     def send_buy_order(self, code, name, qty, price=0, trade_type="3"):
         """

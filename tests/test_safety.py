@@ -8,10 +8,9 @@ import config
 from bot import (
     build_operational_status, confirm_persistent_signals, git_commit_and_push, is_entry_window,
     is_market_open, market_session_progress, save_json, trading_days_held,
+    update_position_stop,
 )
-from market_status import get_live_market_status
 from kiwoom_api import KiwoomRestAPI
-from screener import get_dynamic_universe
 
 
 class FakeResponse:
@@ -64,20 +63,6 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(is_market_open(datetime.datetime(2026, 11, 13, 10, 0), False))
         self.assertFalse(is_market_open(datetime.datetime(2026, 11, 14, 10, 0), True))
         self.assertFalse(is_market_open(datetime.datetime(2026, 11, 13, 8, 59), True))
-
-    @patch("market_status.urllib.request.urlopen")
-    def test_live_market_status_requires_today_and_all_open_flags(self, urlopen):
-        import datetime
-        urlopen.return_value = FakeResponse({
-            "localTradedAt": "2026-11-13T10:31:17+09:00",
-            "marketStatus": "OPEN", "marketStatusDetailType": "open",
-            "marketSessionType": "regularMarket", "tradableStatus": "tradable",
-            "tradeStopType": {"name": "TRADING"},
-        })
-        now = datetime.datetime(2026, 11, 13, 10, 32)
-        self.assertTrue(get_live_market_status(now))
-        now = datetime.datetime(2026, 11, 16, 10, 32)
-        self.assertFalse(get_live_market_status(now))
 
     def test_live_mode_requires_explicit_enable(self):
         with patch.object(config, "LIVE_TRADING_ENABLED", False):
@@ -169,18 +154,33 @@ class SafetyTests(unittest.TestCase):
         )
         self.assertEqual(universe, {"후보주": "000001"})
 
-    @patch("urllib.request.urlopen")
-    def test_screener_excludes_etfs(self, urlopen):
-        urlopen.return_value = FakeResponse({"stocks": [
-            {"stockName": "개별주", "itemCode": "000001", "stockEndType": "stock",
-             "closePriceRaw": "10000", "accumulatedTradingValueRaw": "100",
-             "marketValueRaw": "2000000000000"},
-            {"stockName": "KODEX 레버리지", "itemCode": "122630", "stockEndType": "etf",
-             "closePriceRaw": "10000", "accumulatedTradingValueRaw": "999",
-             "marketValueRaw": "2000000000000"},
-        ]})
-        universe = get_dynamic_universe(20)
-        self.assertEqual(universe, {"개별주": "000001"})
+    def test_kiwoom_daily_candles_are_returned_oldest_first(self):
+        with patch.object(config, "LIVE_TRADING_ENABLED", True):
+            api = KiwoomRestAPI("key", "secret", "account")
+        api._post_domestic = unittest.mock.Mock(return_value={
+            "return_code": 0,
+            "stk_dt_pole_chart_qry": [
+                {"dt": "20261113", "open_pric": "100", "high_pric": "110",
+                 "low_pric": "90", "cur_prc": "105", "trde_qty": "200"},
+                {"dt": "20261112", "open_pric": "95", "high_pric": "101",
+                 "low_pric": "94", "cur_prc": "100", "trde_qty": "150"},
+            ],
+        })
+        candles = api.get_daily_candles("000001", 2)
+        self.assertEqual([c["date"] for c in candles], ["20261112", "20261113"])
+        self.assertEqual(candles[-1]["close"], 105)
+
+    def test_high_water_stop_ratchets_and_never_moves_down(self):
+        pos = {"buy_price": 10000, "stop_loss_pct": 0.03,
+               "trailing_gap_pct": 0.02, "highest_price": 10000}
+        stop, reason = update_position_stop(pos, 10400)
+        self.assertEqual(stop, 10100)
+        self.assertEqual(reason, "수익 보호 스탑")
+        stop, reason = update_position_stop(pos, 11000)
+        self.assertEqual(stop, 10780)
+        self.assertTrue(pos["trailing_active"])
+        stop_after_pullback, _ = update_position_stop(pos, 10800)
+        self.assertEqual(stop_after_pullback, stop)
 
 
 if __name__ == "__main__":

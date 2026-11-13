@@ -56,13 +56,13 @@ ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 1.5      # 변동성(ATR) 기반 동적 손절 배수
 MIN_STOP_LOSS_PCT = 0.025      # 최소 손절선 2.5% (과매도 바닥권 일중 흔들림 노이즈 방어)
 MAX_STOP_LOSS_PCT = 0.040      # 최대 손절선 4.0% (과도한 손실 캡)
-MIN_RISK_REWARD_RATIO = 2.0    # 최소 손익비 1:2 (목표 익절폭 = 손절폭 × 2.0)
+MIN_RISK_REWARD_RATIO = 2.0    # 진입 신호의 기준 보상폭 산출용(청산은 +8% 이후 추적)
 
 # 청산 및 리스크 관리 기본값
 STOP_LOSS_PCT = 0.030          # 기본 손절 기준선 (-3.0%)
 TRAILING_STOP_TRIGGER = 0.040  # +4.0% 수익 시 트레일링 스탑 발동
 TRAILING_STOP_LOCK = 0.010     # 발동 후 손절선을 매수가 +1.0%로 상향
-TAKE_PROFIT_PCT = 0.080        # 기본 목표 익절 (+8.0%)
+TAKE_PROFIT_PCT = 0.080        # 고점 추적 트레일링 활성화 기준 (+8.0%)
 MAX_HOLD_DAYS = 7              # 최대 보유일 (7거래일 경과 시 타임스탑)
 
 # 💡 거래비용 및 슬리피지 보수적 반영 규칙

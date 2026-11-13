@@ -66,7 +66,7 @@ def evaluate_signals(candles_dict, market_candles=None, volume_progress=1.0):
     
     💡 퀀트 피드백 반영:
     1. 고정 -2% 손절 대신 ATR 변동성 기반 동적 손절폭(2.5%~4.0%) 산출
-    2. 최소 손익비 1:2 원칙에 따라 목표 익절폭을 동적 연동
+    2. 진입 시 손절폭과 기준 보상폭을 기록하고 실제 청산은 봇의 고점 추적으로 수행
     """
     candidates = []
     if not is_favorable_market(market_candles):

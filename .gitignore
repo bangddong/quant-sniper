@@ -4,6 +4,7 @@ __pycache__/
 *.log
 universe.json
 risk_state.json
+health.json
 .quant_sniper.lock
 *.tmp
 venv/
