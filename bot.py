@@ -224,10 +224,8 @@ def run_trading_loop():
                 last_screened_date = today_str
 
             # 08:30~08:59에만 조회해야 네이버 누적 거래대금이 전일 확정치다.
-            # 단, 오늘자 universe.json 캐시가 전혀 없는 첫 기동 시에는 즉시 초기 부트스트랩을 허용한다.
             screening_window = now.hour == 8 and now.minute >= 30
-            needs_bootstrap = (not active_universe or last_screened_date != today_str) and (universe_cache.get("date") != today_str)
-            if DYNAMIC_SCREENING and last_screened_date != today_str and (screening_window or needs_bootstrap):
+            if DYNAMIC_SCREENING and last_screened_date != today_str and screening_window:
                 print(f"[{now_str}] 🔍 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 가동...")
                 screened = get_dynamic_universe(SCREENER_TOP_N)
                 if screened:
