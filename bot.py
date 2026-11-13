@@ -21,7 +21,7 @@ from config import (
 from strategy import evaluate_signals
 from kiwoom_api import KiwoomRestAPI
 from screener import get_dynamic_universe
-from krx_calendar import is_krx_trading_day
+from market_status import get_live_market_status
 
 TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
 POSITIONS_FILE = os.path.join(BASE_DIR, "positions.json")
@@ -163,14 +163,18 @@ def git_commit_and_push(commit_msg):
         print(f"[GIT ERR] 체결 내역 push 실패: {e}")
         return False
 
-def is_market_open(now=None):
-    """KRX 거래일의 정규장 개장 여부 체크 (09:00 ~ 15:30)."""
+def is_market_open(now=None, live_status=None):
+    """시간과 당일 실시간 상태가 모두 확인된 경우에만 장이 열린 것으로 본다."""
     now = now or datetime.datetime.now()
-    if not is_krx_trading_day(now):
+    if now.weekday() >= 5:
         return False
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    if not market_open <= now <= market_close:
+        return False
+    if live_status is None:
+        live_status = get_live_market_status(now)
+    return bool(live_status)
 
 def is_entry_window(now=None):
     now = now or datetime.datetime.now()
@@ -225,9 +229,7 @@ def run_trading_loop():
                 last_screened_date = today_str
 
             # 08:30~08:59에만 조회해야 네이버 누적 거래대금이 전일 확정치다.
-            screening_window = (
-                is_krx_trading_day(now) and now.hour == 8 and now.minute >= 30
-            )
+            screening_window = now.weekday() < 5 and now.hour == 8 and now.minute >= 30
             if DYNAMIC_SCREENING and last_screened_date != today_str and screening_window:
                 print(f"[{now_str}] 🔍 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 가동...")
                 screened = get_dynamic_universe(SCREENER_TOP_N)
