@@ -218,3 +218,7 @@ quant_sniper.service   Linux systemd 배포 예시
 trades.json            누적 체결 장부
 positions.json         현재 로컬 포지션 장부
 ```
+
+## 라이선스
+
+이 프로젝트는 [MIT License](LICENSE)로 배포됩니다.
