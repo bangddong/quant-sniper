@@ -880,7 +880,7 @@ def run_trading_loop():
                 event_type = "ERROR" if status == "error" else "RISK" if status == "halted" else "SYSTEM"
                 record_dashboard_event(event_type, reason=detail)
                 dashboard_dirty = True
-                dashboard_critical = status in {"error", "halted"}
+                dashboard_critical = True
                 if sync_health_to_status_branch(detail=detail):
                     last_published_state = current_state
                     last_health_sync_time = time.time()
