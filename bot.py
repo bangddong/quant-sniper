@@ -514,6 +514,7 @@ def run_trading_loop():
     dashboard_dirty = True
     dashboard_critical = False
     last_dashboard_push_time = 0
+    dashboard_started_at = time.time()
     try:
         running_commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], cwd=BASE_DIR,
@@ -618,7 +619,14 @@ def run_trading_loop():
             # 장 운영 시간 확인
             if not CURRENT_MARKET_OPEN:
                 print(f"[{now_str}] 정규장 운영 시간 외입니다. 대기 중...")
-                if dashboard_dirty or time.time() - last_dashboard_push_time >= 1800:
+                realtime_connected, _ = realtime.is_healthy()
+                startup_wait_done = time.time() - dashboard_started_at >= 60
+                should_publish = (
+                    (dashboard_dirty and (realtime_connected or startup_wait_done))
+                    or (last_dashboard_push_time > 0
+                        and time.time() - last_dashboard_push_time >= 1800)
+                )
+                if should_publish:
                     if sync_dashboard_to_branch(
                         "running", "정규장 운영 시간 외",
                         load_json(POSITIONS_FILE, {}), realtime, dashboard_context,
