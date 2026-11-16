@@ -45,6 +45,8 @@ class SafetyTests(unittest.TestCase):
         class Feed:
             def quote(self, code):
                 return {"price": 10300}
+            def is_healthy(self):
+                return True, ""
         markdown = render_dashboard(
             "running", "정규 감시 중",
             {"후보주": {"code": "000001", "shares": 2, "buy_price": 10000,

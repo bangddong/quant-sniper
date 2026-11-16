@@ -148,15 +148,23 @@ def record_dashboard_event(event_type, name="", code="", reason="", **details):
 def _md(value):
     return str(value if value is not None else "-").replace("|", "\\|").replace("\n", " ")
 
-def render_dashboard(status, detail, positions, realtime, events, now=None):
+def render_dashboard(status, detail, positions, realtime, events, now=None, context=None):
     """GitHub에서 바로 읽을 수 있는 운영 대시보드 Markdown을 생성한다."""
     now = now or datetime.datetime.now()
+    context = context or {}
     seven_day_events = update_dashboard_events(events, {
         "type": "_render_marker", "timestamp": now.isoformat(timespec="seconds")
     }, now)[:-1]
     counts = {kind: sum(int(e.get("count", 1)) for e in seven_day_events
                         if e.get("type") == kind)
               for kind in ("BUY", "SELL", "SKIP", "RISK", "ERROR")}
+    sells = [e for e in seven_day_events if e.get("type") == "SELL"]
+    returns = [float(e["net_return_pct"]) for e in sells if e.get("net_return_pct") is not None]
+    wins = sum(1 for value in returns if value > 0)
+    win_rate = (wins / len(returns) * 100) if returns else None
+    avg_return = (sum(returns) / len(returns)) if returns else None
+    realtime_ok, realtime_error = realtime.is_healthy()
+    commit_hash = context.get("commit_hash", "-")
     lines = [
         "# Quant Sniper Dashboard", "",
         f"> 마지막 갱신: **{now.strftime('%Y-%m-%d %H:%M:%S')} KST**", "",
@@ -164,9 +172,53 @@ def render_dashboard(status, detail, positions, realtime, events, now=None):
         "| 상태 | 장 운영 | 상세 | 보유 종목 |",
         "|---|---:|---|---:|",
         f"| {_md(status)} | {'OPEN' if CURRENT_MARKET_OPEN else 'CLOSED'} | {_md(detail)} | {len(positions)} |",
-        "", "## 보유 포지션", "",
-        "| 종목 | 코드 | 수량 | 매수가 | 현재가 | 평가수익률 | 최고가 | 보호선 | 트레일링 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "", "## 시스템 신선도", "",
+        "| 키움 WebSocket | 마지막 실시간 시세 | 마지막 계좌 조회 | 마지막 정상 루프 | 실행 커밋 |",
+        "|---|---|---|---|---|",
+        f"| {'정상' if realtime_ok else '연결 대기'} | {_md(context.get('last_quote_at', '-'))} "
+        f"| {_md(context.get('last_account_sync', '-'))} | {_md(context.get('last_loop_at', '-'))} "
+        f"| `{_md(commit_hash)}` |",
+    ]
+    if not realtime_ok and realtime_error:
+        lines += ["", f"> WebSocket 상태: {_md(realtime_error)}"]
+
+    lines += [
+        "", "## 오늘의 감시 및 신호", "",
+        "| 유니버스 기준일 | 데이터 출처 | 감시 종목 | 원신호 | 연속 확인 중 | 확정 신호 |",
+        "|---|---|---:|---:|---:|---:|",
+        f"| {_md(context.get('universe_date', '-'))} | {_md(context.get('universe_source', '-'))} "
+        f"| {int(context.get('universe_count', 0))} | {int(context.get('raw_signal_count', 0))} "
+        f"| {int(context.get('confirming_signal_count', 0))} | {int(context.get('confirmed_signal_count', 0))} |",
+        "",
+        f"감시 종목: {_md(', '.join(context.get('universe_names', [])) or '-')}",
+        "", "### 신호 확인 단계", "",
+        "| 종목 | 전략 | 연속 확인 |",
+        "|---|---|---:|",
+    ]
+    signal_progress = context.get("signal_progress", [])
+    if signal_progress:
+        for item in signal_progress:
+            lines.append(
+                f"| {_md(item.get('name'))} | {_md(item.get('strategy'))} "
+                f"| {int(item.get('count', 0))}/3 |"
+            )
+    else:
+        lines.append("| 현재 진행 중인 신호 없음 | - | - |")
+
+    drawdown = context.get("account_drawdown_pct")
+    daily_return = context.get("daily_return_pct")
+    lines += [
+        "", "## 위험 관리 현황", "",
+        "| 신규 매수 | 계좌 고점 대비 낙폭 | 오늘 수익률 | 주문 배율 | 거래당 위험 | 종목당 한도 | 남은 슬롯 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+        f"| {'가능' if context.get('entry_allowed', False) else '중단'} "
+        f"| {f'{drawdown:.2f}%' if drawdown is not None else '-'} "
+        f"| {f'{daily_return:+.2f}%' if daily_return is not None else '-'} "
+        f"| {float(context.get('entry_size_multiplier', 1.0))*100:.0f}% "
+        f"| 0.7% | 20% | {max(0, MAX_POSITIONS-len(positions))} |",
+        "", "## 보유 포지션 및 청산 계획", "",
+        "| 종목 | 수량 | 매수가 | 현재가 | 수익률 | 최초 손절 | 현재 보호선 | 최고가 대비 | 타임스탑 | 추적 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     if positions:
         for name, pos in positions.items():
@@ -175,24 +227,31 @@ def render_dashboard(status, detail, positions, realtime, events, now=None):
             buy = float(pos.get("buy_price", 0))
             return_pct = ((current - buy) / buy * 100) if current and buy else None
             return_text = f"{return_pct:+.2f}%" if return_pct is not None else "-"
+            stop_loss_pct = float(pos.get("stop_loss_pct", STOP_LOSS_PCT))
+            initial_stop = buy * (1 - stop_loss_pct)
+            current_stop = float(pos.get("trailing_stop_price", initial_stop))
+            highest = float(pos.get("highest_price", buy))
+            off_high = ((current - highest) / highest * 100) if current and highest else None
+            remaining_days = max(0, MAX_HOLD_DAYS - int(pos.get("days_held", 0)))
             lines.append(
-                f"| {_md(name)} | {_md(pos.get('code'))} | {int(pos.get('shares', 0))} "
-                f"| {buy:,.0f} | {current:,.0f} | "
-                f"{return_text}"
-            )
-            lines[-1] += (
-                f" | {float(pos.get('highest_price', buy)):,.0f}"
-                f" | {float(pos.get('trailing_stop_price', buy * (1-float(pos.get('stop_loss_pct', STOP_LOSS_PCT))))):,.0f}"
-                f" | {'ON' if pos.get('trailing_active') else 'OFF'} |"
+                f"| {_md(name)} | {int(pos.get('shares', 0))} | {buy:,.0f} | {current:,.0f} "
+                f"| {return_text} | {initial_stop:,.0f} | {current_stop:,.0f} "
+                f"| {f'{off_high:+.2f}%' if off_high is not None else '-'} "
+                f"| {remaining_days}일 | {'ON' if pos.get('trailing_active') else 'OFF'} |"
             )
     else:
-        lines.append("| 보유 종목 없음 | - | - | - | - | - | - | - | - |")
+        lines.append("| 보유 종목 없음 | - | - | - | - | - | - | - | - | - |")
 
     lines += [
         "", "## 최근 7일 요약", "",
         "| 매수 | 매도 | 스킵 | 위험 | 오류 |",
         "|---:|---:|---:|---:|---:|",
         f"| {counts['BUY']} | {counts['SELL']} | {counts['SKIP']} | {counts['RISK']} | {counts['ERROR']} |",
+        "", "### 최근 7일 청산 성과", "",
+        "| 청산 거래 | 승률 | 평균 순수익률 |",
+        "|---:|---:|---:|",
+        f"| {len(returns)} | {f'{win_rate:.1f}%' if win_rate is not None else '-'} "
+        f"| {f'{avg_return:+.2f}%' if avg_return is not None else '-'} |",
         "", "## 최근 7일 이벤트", "",
         "| 시각 | 유형 | 종목 | 수량 | 가격 | 사유 | 반복 |",
         "|---|---|---|---:|---:|---|---:|",
@@ -210,12 +269,14 @@ def render_dashboard(status, detail, positions, realtime, events, now=None):
     lines += ["", "> 인증정보와 민감한 계좌정보는 기록하지 않습니다.", ""]
     return "\n".join(lines)
 
-def sync_dashboard_to_branch(status, detail, positions, realtime):
+def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
     """대시보드 두 파일만 부모 없는 단일 커밋으로 origin/dashboard에 교체한다."""
     if not AUTO_GIT_PUSH:
         return False
     events = load_json(DASHBOARD_EVENTS_FILE, [])
-    dashboard = render_dashboard(status, detail, positions, realtime, events)
+    dashboard = render_dashboard(
+        status, detail, positions, realtime, events, context=context
+    )
     temp_path = f"{DASHBOARD_FILE}.tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         handle.write(dashboard)
@@ -453,6 +514,17 @@ def run_trading_loop():
     dashboard_dirty = True
     dashboard_critical = False
     last_dashboard_push_time = 0
+    try:
+        running_commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=BASE_DIR,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        running_commit = "unknown"
+    dashboard_context = {
+        "commit_hash": running_commit,
+        "entry_size_multiplier": 1.0,
+    }
     record_dashboard_event("SYSTEM", reason="봇 프로세스 시작")
     
     while True:
@@ -461,17 +533,35 @@ def run_trading_loop():
             today_str = now.strftime("%Y-%m-%d")
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             risk_reasons = []
+            dashboard_context.update({
+                "raw_signal_count": 0,
+                "confirming_signal_count": 0,
+                "confirmed_signal_count": 0,
+                "signal_progress": [],
+            })
             
             # 매일 아침 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 갱신 (Lookahead 방지)
             universe_cache = load_json(UNIVERSE_FILE, {})
             if universe_cache.get("date") == today_str and universe_cache.get("symbols"):
                 active_universe = universe_cache["symbols"]
                 last_screened_date = today_str
+            dashboard_context.update({
+                "universe_date": universe_cache.get("date", "-"),
+                "universe_source": universe_cache.get(
+                    "source", "kiwoom_previous_day" if universe_cache.get("symbols") else "-"
+                ),
+                "universe_count": len(active_universe),
+                "universe_names": list(active_universe.keys()),
+            })
             realtime.set_symbols(
                 list(active_universe.values()) + [MARKET_PROXY_CODE]
                 + [p.get("code") for p in load_json(POSITIONS_FILE, {}).values()]
             )
             proxy_quote = realtime.quote(MARKET_PROXY_CODE)
+            if proxy_quote:
+                dashboard_context["last_quote_at"] = datetime.datetime.fromtimestamp(
+                    proxy_quote.get("received_at", time.time())
+                ).strftime("%Y-%m-%d %H:%M:%S")
             CURRENT_MARKET_OPEN = is_market_open(
                 now, bool(proxy_quote and proxy_quote.get("market_type") == "2")
             )
@@ -531,7 +621,7 @@ def run_trading_loop():
                 if dashboard_dirty or time.time() - last_dashboard_push_time >= 1800:
                     if sync_dashboard_to_branch(
                         "running", "정규장 운영 시간 외",
-                        load_json(POSITIONS_FILE, {}), realtime,
+                        load_json(POSITIONS_FILE, {}), realtime, dashboard_context,
                     ):
                         dashboard_dirty = False
                         last_dashboard_push_time = time.time()
@@ -568,6 +658,9 @@ def run_trading_loop():
                     }
                     save_json(RISK_FILE, risk_state)
 
+            if account.get("ok"):
+                dashboard_context["last_account_sync"] = now_str
+
             if account.get("ok") and opening_assets:
                 current_assets = account.get("total_assets", opening_assets)
                 peak_assets, account_drawdown, entry_size_multiplier, drawdown_halted = (
@@ -589,6 +682,11 @@ def run_trading_loop():
                     )
                 save_json(RISK_FILE, risk_state)
                 daily_return = (current_assets - opening_assets) / opening_assets
+                dashboard_context.update({
+                    "account_drawdown_pct": account_drawdown * 100,
+                    "daily_return_pct": daily_return * 100,
+                    "entry_size_multiplier": entry_size_multiplier,
+                })
                 if daily_return <= -DAILY_KILL_SWITCH_PCT:
                     trading_halted = True
                     save_json(RISK_FILE, {
@@ -711,6 +809,7 @@ def run_trading_loop():
                     record_dashboard_event(
                         "SELL", name, pos["code"], exit_reason,
                         shares=pos["shares"], price=round(actual_exit_price, 2),
+                        net_return_pct=round(net_ret_pct, 2),
                     )
                     dashboard_dirty = True
                     dashboard_critical = True
@@ -745,11 +844,26 @@ def run_trading_loop():
                 signals = evaluate_signals(
                     candles_dict, market_candles, market_session_progress(now)
                 )
+                raw_signals = list(signals)
                 # 재기동 직후의 일시적/이미 끝난 신호 추격을 막는다. 동일 전략 신호가
                 # 30초 간격으로 3회 연속 유지될 때만 신규 주문 후보로 인정한다.
                 signals, signal_confirmations = confirm_persistent_signals(
                     signals, signal_confirmations, required=3
                 )
+                dashboard_context.update({
+                    "raw_signal_count": len(raw_signals),
+                    "confirming_signal_count": sum(
+                        1 for count in signal_confirmations.values() if count < 3
+                    ),
+                    "confirmed_signal_count": len(signals),
+                    "signal_progress": [
+                        {"name": sig["name"], "strategy": sig["strategy"],
+                         "count": signal_confirmations.get(
+                             (sig["name"], sig["strategy"]), 0
+                         )}
+                        for sig in raw_signals
+                    ],
+                })
                 # 주문 가격도 키움 실시간 체결가로 통일한다. 오래된 시세는 후보에서 제외한다.
                 live_signals = []
                 for sig in signals:
@@ -872,6 +986,13 @@ def run_trading_loop():
             status, detail = build_operational_status(
                 trading_halted, risk_reasons, len(positions)
             )
+            dashboard_context.update({
+                "last_loop_at": now_str,
+                "entry_allowed": (
+                    not trading_halted and is_entry_window(now)
+                    and len(positions) < MAX_POSITIONS
+                ),
+            })
             update_health_status(status=status, detail=detail)
 
             # 정상↔위험 상태가 바뀌면 30분 주기를 기다리지 않고 즉시 피클AI에 공개한다.
@@ -893,7 +1014,9 @@ def run_trading_loop():
             dashboard_due = time.time() - last_dashboard_push_time >= 300
             if git_ok and (dashboard_critical or (dashboard_dirty and dashboard_due)
                            or (positions and dashboard_due)):
-                if sync_dashboard_to_branch(status, detail, positions, realtime):
+                if sync_dashboard_to_branch(
+                    status, detail, positions, realtime, dashboard_context
+                ):
                     dashboard_dirty = False
                     dashboard_critical = False
                     last_dashboard_push_time = time.time()
@@ -906,7 +1029,8 @@ def run_trading_loop():
             update_health_status(status="error", detail=error_detail)
             record_dashboard_event("ERROR", reason=error_detail)
             sync_dashboard_to_branch(
-                "error", error_detail, load_json(POSITIONS_FILE, {}), realtime
+                "error", error_detail, load_json(POSITIONS_FILE, {}), realtime,
+                dashboard_context,
             )
             last_dashboard_push_time = time.time()
             dashboard_dirty = False
