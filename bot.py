@@ -31,6 +31,7 @@ UNIVERSE_FILE = os.path.join(BASE_DIR, "universe.json")
 RISK_FILE = os.path.join(BASE_DIR, "risk_state.json")
 DASHBOARD_FILE = os.path.join(BASE_DIR, "DASHBOARD.md")
 DASHBOARD_EVENTS_FILE = os.path.join(BASE_DIR, "dashboard_events.json")
+DASHBOARD_STATE_FILE = os.path.join(BASE_DIR, "dashboard_state.json")
 LOCK_FILE = os.path.join(BASE_DIR, ".quant_sniper.lock")
 CURRENT_MARKET_OPEN = False
 
@@ -55,40 +56,6 @@ def update_health_status(status="healthy", detail=""):
         "is_market_open": CURRENT_MARKET_OPEN
     }
     save_json(HEALTH_FILE, health_data)
-
-def sync_health_to_status_branch(detail="정규 감시 중"):
-    """
-    main 브랜치를 전혀 건드리지 않고 status 브랜치에 health.json 단일 커밋 강제 푸시
-    - 🛡️ 잔디/메인 커밋 히스토리 오염 0% (메인과 완전 분리)
-    - 🛡️ status 브랜치에도 항상 커밋 딱 1개(0.1KB)만 덮어써져 용량 증가 0%
-    - 🛡️ 깃허브 무료 플랜 완전 최적화
-    """
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
-    health_path = os.path.join(repo_dir, "health.json")
-    if not os.path.exists(health_path):
-        return False
-    try:
-        # 1. blob 생성
-        blob_res = subprocess.run(["git", "hash-object", "-w", "health.json"], cwd=repo_dir, capture_output=True, text=True, check=True)
-        blob_sha = blob_res.stdout.strip()
-        
-        # 2. tree 생성
-        tree_input = f"100644 blob {blob_sha}\thealth.json\n"
-        tree_res = subprocess.run(["git", "mktree"], cwd=repo_dir, input=tree_input, capture_output=True, text=True, check=True)
-        tree_sha = tree_res.stdout.strip()
-        
-        # 3. 부모 없는 단일 커밋 생성 (히스토리 누적 방지)
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        commit_res = subprocess.run(["git", "commit-tree", tree_sha, "-m", f"heartbeat: {now_str} ({detail})"], cwd=repo_dir, capture_output=True, text=True, check=True)
-        commit_sha = commit_res.stdout.strip()
-        
-        # 4. remote status 브랜치로 강제 푸시
-        subprocess.run(["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/status"], cwd=repo_dir, capture_output=True, text=True, check=True)
-        print(f"[HEALTH] 🌐 status 브랜치 심장박동 동기화 완료: {detail}")
-        return True
-    except Exception as e:
-        print(f"[HEALTH WARN] status 브랜치 동기화 실패: {e}")
-        return False
 
 def load_json(filepath, default):
     if os.path.exists(filepath):
@@ -303,12 +270,54 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
     return "\n".join(lines)
 
 def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
-    """대시보드 두 파일만 부모 없는 단일 커밋으로 origin/dashboard에 교체한다."""
+    """대시보드 파일만 부모 없는 단일 커밋으로 origin/dashboard에 교체한다."""
     if not AUTO_GIT_PUSH:
         return False
     events = load_json(DASHBOARD_EVENTS_FILE, [])
     render_context = dict(context or {})
     render_context["all_trades"] = load_json(TRADES_FILE, [])
+    now = datetime.datetime.now()
+    realtime_ok, realtime_error = realtime.is_healthy()
+    state_positions = []
+    for name, pos in positions.items():
+        quote = realtime.quote(pos.get("code", ""))
+        current_price = float(quote.get("price", 0)) if quote else None
+        buy_price = float(pos.get("buy_price", 0))
+        state_positions.append({
+            "name": name,
+            "code": pos.get("code"),
+            "shares": int(pos.get("shares", 0)),
+            "buy_price": buy_price,
+            "current_price": current_price,
+            "return_pct": round((current_price - buy_price) / buy_price * 100, 2)
+            if current_price and buy_price else None,
+            "trailing_active": bool(pos.get("trailing_active", False)),
+            "days_held": int(pos.get("days_held", 0)),
+        })
+    dashboard_state = {
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "detail": detail,
+        "is_market_open": CURRENT_MARKET_OPEN,
+        "position_count": len(positions),
+        "positions": state_positions,
+        "websocket_connected": realtime_ok,
+        "websocket_error": realtime_error,
+        "last_quote_at": render_context.get("last_quote_at"),
+        "last_account_sync": render_context.get("last_account_sync"),
+        "last_loop_at": render_context.get("last_loop_at"),
+        "running_commit": render_context.get("commit_hash"),
+        "entry_allowed": bool(render_context.get("entry_allowed", False)),
+        "account_drawdown_pct": render_context.get("account_drawdown_pct"),
+        "daily_return_pct": render_context.get("daily_return_pct"),
+        "entry_size_multiplier": render_context.get("entry_size_multiplier", 1.0),
+        "universe_date": render_context.get("universe_date"),
+        "universe_count": render_context.get("universe_count", 0),
+        "raw_signal_count": render_context.get("raw_signal_count", 0),
+        "confirming_signal_count": render_context.get("confirming_signal_count", 0),
+        "confirmed_signal_count": render_context.get("confirmed_signal_count", 0),
+    }
+    save_json(DASHBOARD_STATE_FILE, dashboard_state)
     dashboard = render_dashboard(
         status, detail, positions, realtime, events, context=render_context
     )
@@ -327,9 +336,14 @@ def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
             ["git", "hash-object", "-w", "dashboard_events.json"], cwd=BASE_DIR,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
+        state_blob = subprocess.run(
+            ["git", "hash-object", "-w", "dashboard_state.json"], cwd=BASE_DIR,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
         tree_input = (
             f"100644 blob {dashboard_blob}\tREADME.md\n"
             f"100644 blob {events_blob}\tdashboard_events.json\n"
+            f"100644 blob {state_blob}\tdashboard_state.json\n"
         )
         tree = subprocess.run(
             ["git", "mktree"], cwd=BASE_DIR, input=tree_input,
@@ -527,16 +541,13 @@ def run_trading_loop():
     # 깃 푸시 권한 사전 점검
     git_ok = check_git_permission()
     
-    # 가동 헬스체크 신호 기록 및 status 브랜치 초기 핑 동기화
+    # 가동 헬스체크 신호 기록. 원격 상태는 dashboard 브랜치로 통합한다.
     update_health_status(status="running", detail="봇 최초 가동 시작")
-    if git_ok:
-        sync_health_to_status_branch(detail="봇 최초 가동 시작")
     
     api = KiwoomRestAPI()
     realtime = KiwoomRealtimeFeed(api.get_token)
     realtime.start()
     last_screened_date = None
-    last_health_sync_time = time.time()
     active_universe = DEFAULT_UNIVERSE
     risk_date = None
     opening_assets = None
@@ -621,9 +632,9 @@ def run_trading_loop():
                     trading_halted = True
                     alert_detail = "D-1 스크리닝 실패: 오늘 신규 주문 중단"
                     update_health_status("halted", alert_detail)
-                    if git_ok and sync_health_to_status_branch(alert_detail):
-                        last_published_state = ("halted", alert_detail)
-                        last_health_sync_time = time.time()
+                    record_dashboard_event("RISK", reason=alert_detail)
+                    dashboard_dirty = True
+                    dashboard_critical = True
                     print(f"[{now_str}] [WARN] D-1 스크리닝 실패: 오늘 신규매수를 차단합니다.")
 
             # 장중 최초 기동 시에도 키움의 '전일' 확정 순위로만 오늘 유니버스를 복구한다.
@@ -1045,18 +1056,13 @@ def run_trading_loop():
                 record_dashboard_event(event_type, reason=detail)
                 dashboard_dirty = True
                 dashboard_critical = True
-                if sync_health_to_status_branch(detail=detail):
-                    last_published_state = current_state
-                    last_health_sync_time = time.time()
-            
-            # 30분(1800초)마다 status 브랜치에 가벼운 단일 커밋 심장박동 동기화
-            if git_ok and (time.time() - last_health_sync_time >= 1800):
-                if sync_health_to_status_branch(detail=detail):
-                    last_health_sync_time = time.time()
+                last_published_state = current_state
 
             dashboard_due = time.time() - last_dashboard_push_time >= 300
+            dashboard_heartbeat_due = time.time() - last_dashboard_push_time >= 1800
             if git_ok and (dashboard_critical or (dashboard_dirty and dashboard_due)
-                           or (positions and dashboard_due)):
+                           or (positions and dashboard_due)
+                           or dashboard_heartbeat_due):
                 if sync_dashboard_to_branch(
                     status, detail, positions, realtime, dashboard_context
                 ):
@@ -1078,9 +1084,7 @@ def run_trading_loop():
             last_dashboard_push_time = time.time()
             dashboard_dirty = False
             dashboard_critical = False
-            if git_ok and sync_health_to_status_branch(detail=error_detail):
-                last_published_state = ("error", error_detail)
-                last_health_sync_time = time.time()
+            last_published_state = ("error", error_detail)
             time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ universe.json
 risk_state.json
 health.json
 dashboard_events.json
+dashboard_state.json
 DASHBOARD.md
 .quant_sniper.lock
 *.tmp
