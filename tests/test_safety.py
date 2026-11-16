@@ -55,6 +55,9 @@ class SafetyTests(unittest.TestCase):
         )
         self.assertIn("후보주", markdown)
         self.assertIn("+3.00%", markdown)
+        self.assertIn("실시간 현재 상태 — 기간 제한 없음", markdown)
+        self.assertIn("최근 7일 활동", markdown)
+        self.assertIn("전체 누적 성과 — 전체 거래 이력", markdown)
         self.assertNotIn("계좌번호", markdown)
 
     def test_position_size_obeys_allocation_and_trade_risk(self):

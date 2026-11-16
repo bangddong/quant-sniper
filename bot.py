@@ -163,16 +163,37 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
     wins = sum(1 for value in returns if value > 0)
     win_rate = (wins / len(returns) * 100) if returns else None
     avg_return = (sum(returns) / len(returns)) if returns else None
+    all_sells = [trade for trade in context.get("all_trades", [])
+                 if trade.get("type") == "SELL"]
+    all_returns = [float(trade["net_return_pct"]) for trade in all_sells
+                   if trade.get("net_return_pct") is not None]
+    all_wins = [value for value in all_returns if value > 0]
+    all_losses = [value for value in all_returns if value <= 0]
+    all_win_rate = (len(all_wins) / len(all_returns) * 100) if all_returns else None
+    average_win = (sum(all_wins) / len(all_wins)) if all_wins else None
+    average_loss = (sum(all_losses) / len(all_losses)) if all_losses else None
+    total_net_profit = sum(float(trade.get("net_profit_krw", 0)) for trade in all_sells)
+    total_cost = sum(float(trade.get("cost_fee_krw", 0)) for trade in all_sells)
+    gross_win = sum(float(trade.get("net_profit_krw", 0)) for trade in all_sells
+                    if float(trade.get("net_profit_krw", 0)) > 0)
+    gross_loss = abs(sum(float(trade.get("net_profit_krw", 0)) for trade in all_sells
+                         if float(trade.get("net_profit_krw", 0)) < 0))
+    profit_factor = (gross_win / gross_loss) if gross_loss else None
+    max_loss_streak = 0
+    loss_streak = 0
+    for value in all_returns:
+        loss_streak = loss_streak + 1 if value <= 0 else 0
+        max_loss_streak = max(max_loss_streak, loss_streak)
     realtime_ok, realtime_error = realtime.is_healthy()
     commit_hash = context.get("commit_hash", "-")
     lines = [
         "# Quant Sniper Dashboard", "",
         f"> 마지막 갱신: **{now.strftime('%Y-%m-%d %H:%M:%S')} KST**", "",
-        "## 현재 상태", "",
+        "## 1. 실시간 현재 상태 — 기간 제한 없음", "",
         "| 상태 | 장 운영 | 상세 | 보유 종목 |",
         "|---|---:|---|---:|",
         f"| {_md(status)} | {'OPEN' if CURRENT_MARKET_OPEN else 'CLOSED'} | {_md(detail)} | {len(positions)} |",
-        "", "## 시스템 신선도", "",
+        "", "### 시스템 신선도", "",
         "| 키움 WebSocket | 마지막 실시간 시세 | 마지막 계좌 조회 | 마지막 정상 루프 | 실행 커밋 |",
         "|---|---|---|---|---|",
         f"| {'정상' if realtime_ok else '연결 대기'} | {_md(context.get('last_quote_at', '-'))} "
@@ -183,7 +204,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         lines += ["", f"> WebSocket 상태: {_md(realtime_error)}"]
 
     lines += [
-        "", "## 오늘의 감시 및 신호", "",
+        "", "### 오늘의 감시 및 신호", "",
         "| 유니버스 기준일 | 데이터 출처 | 감시 종목 | 원신호 | 연속 확인 중 | 확정 신호 |",
         "|---|---|---:|---:|---:|---:|",
         f"| {_md(context.get('universe_date', '-'))} | {_md(context.get('universe_source', '-'))} "
@@ -191,7 +212,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         f"| {int(context.get('confirming_signal_count', 0))} | {int(context.get('confirmed_signal_count', 0))} |",
         "",
         f"감시 종목: {_md(', '.join(context.get('universe_names', [])) or '-')}",
-        "", "### 신호 확인 단계", "",
+        "", "#### 신호 확인 단계", "",
         "| 종목 | 전략 | 연속 확인 |",
         "|---|---|---:|",
     ]
@@ -208,7 +229,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
     drawdown = context.get("account_drawdown_pct")
     daily_return = context.get("daily_return_pct")
     lines += [
-        "", "## 위험 관리 현황", "",
+        "", "### 위험 관리 현황", "",
         "| 신규 매수 | 계좌 고점 대비 낙폭 | 오늘 수익률 | 주문 배율 | 거래당 위험 | 종목당 한도 | 남은 슬롯 |",
         "|---|---:|---:|---:|---:|---:|---:|",
         f"| {'가능' if context.get('entry_allowed', False) else '중단'} "
@@ -216,7 +237,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         f"| {f'{daily_return:+.2f}%' if daily_return is not None else '-'} "
         f"| {float(context.get('entry_size_multiplier', 1.0))*100:.0f}% "
         f"| 0.7% | 20% | {max(0, MAX_POSITIONS-len(positions))} |",
-        "", "## 보유 포지션 및 청산 계획", "",
+        "", "### 현재 보유 포지션 및 청산 계획 — 전체", "",
         "| 종목 | 수량 | 매수가 | 현재가 | 수익률 | 최초 손절 | 현재 보호선 | 최고가 대비 | 타임스탑 | 추적 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
@@ -243,7 +264,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         lines.append("| 보유 종목 없음 | - | - | - | - | - | - | - | - | - |")
 
     lines += [
-        "", "## 최근 7일 요약", "",
+        "", "## 2. 최근 7일 활동", "",
         "| 매수 | 매도 | 스킵 | 위험 | 오류 |",
         "|---:|---:|---:|---:|---:|",
         f"| {counts['BUY']} | {counts['SELL']} | {counts['SKIP']} | {counts['RISK']} | {counts['ERROR']} |",
@@ -252,7 +273,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         "|---:|---:|---:|",
         f"| {len(returns)} | {f'{win_rate:.1f}%' if win_rate is not None else '-'} "
         f"| {f'{avg_return:+.2f}%' if avg_return is not None else '-'} |",
-        "", "## 최근 7일 이벤트", "",
+        "", "### 최근 7일 이벤트", "",
         "| 시각 | 유형 | 종목 | 수량 | 가격 | 사유 | 반복 |",
         "|---|---|---|---:|---:|---|---:|",
     ]
@@ -266,6 +287,18 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         )
     if not visible:
         lines.append("| - | - | 기록 없음 | - | - | - | - |")
+    lines += [
+        "", "## 3. 전체 누적 성과 — 전체 거래 이력", "",
+        "| 청산 거래 | 승률 | 누적 순손익 | 평균 이익률 | 평균 손실률 | Profit Factor | 최대 연속 손실 | 누적 비용 |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| {len(all_returns)} "
+        f"| {f'{all_win_rate:.1f}%' if all_win_rate is not None else '-'} "
+        f"| {total_net_profit:+,.0f}원 "
+        f"| {f'{average_win:+.2f}%' if average_win is not None else '-'} "
+        f"| {f'{average_loss:+.2f}%' if average_loss is not None else '-'} "
+        f"| {f'{profit_factor:.2f}' if profit_factor is not None else '-'} "
+        f"| {max_loss_streak}회 | {total_cost:,.0f}원 |",
+    ]
     lines += ["", "> 인증정보와 민감한 계좌정보는 기록하지 않습니다.", ""]
     return "\n".join(lines)
 
@@ -274,8 +307,10 @@ def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
     if not AUTO_GIT_PUSH:
         return False
     events = load_json(DASHBOARD_EVENTS_FILE, [])
+    render_context = dict(context or {})
+    render_context["all_trades"] = load_json(TRADES_FILE, [])
     dashboard = render_dashboard(
-        status, detail, positions, realtime, events, context=context
+        status, detail, positions, realtime, events, context=render_context
     )
     temp_path = f"{DASHBOARD_FILE}.tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
@@ -293,7 +328,7 @@ def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         tree_input = (
-            f"100644 blob {dashboard_blob}\tDASHBOARD.md\n"
+            f"100644 blob {dashboard_blob}\tREADME.md\n"
             f"100644 blob {events_blob}\tdashboard_events.json\n"
         )
         tree = subprocess.run(
