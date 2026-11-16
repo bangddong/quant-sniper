@@ -9,7 +9,7 @@ from bot import (
     account_drawdown_controls, calculate_entry_shares,
     build_operational_status, confirm_persistent_signals, git_commit_and_push, is_entry_window,
     is_market_open, market_session_progress, save_json, trading_days_held,
-    update_position_stop,
+    update_dashboard_events, update_position_stop, render_dashboard,
 )
 from kiwoom_api import KiwoomRestAPI
 
@@ -26,6 +26,35 @@ class FakeResponse:
 
 
 class SafetyTests(unittest.TestCase):
+    def test_dashboard_keeps_seven_days_and_deduplicates_skips(self):
+        import datetime
+        now = datetime.datetime(2026, 11, 16, 10, 0)
+        events = [{
+            "timestamp": "2026-11-08T09:00:00", "type": "BUY", "code": "000001"
+        }, {
+            "timestamp": "2026-11-16T09:00:00", "type": "SKIP", "code": "000002",
+            "reason": "위험 한도", "count": 1,
+        }]
+        updated = update_dashboard_events(events, {
+            "type": "SKIP", "code": "000002", "reason": "위험 한도"
+        }, now)
+        self.assertEqual(len(updated), 1)
+        self.assertEqual(updated[0]["count"], 2)
+
+    def test_dashboard_renders_position_without_sensitive_account_data(self):
+        class Feed:
+            def quote(self, code):
+                return {"price": 10300}
+        markdown = render_dashboard(
+            "running", "정규 감시 중",
+            {"후보주": {"code": "000001", "shares": 2, "buy_price": 10000,
+                      "highest_price": 10500, "stop_loss_pct": 0.03}},
+            Feed(), [],
+        )
+        self.assertIn("후보주", markdown)
+        self.assertIn("+3.00%", markdown)
+        self.assertNotIn("계좌번호", markdown)
+
     def test_position_size_obeys_allocation_and_trade_risk(self):
         # 30만원, 2만원 주식, 3% 손절: 비중 한도는 3주, 위험 한도도 3주다.
         self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03), 3)

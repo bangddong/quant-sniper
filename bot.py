@@ -29,6 +29,8 @@ POSITIONS_FILE = os.path.join(BASE_DIR, "positions.json")
 HEALTH_FILE = os.path.join(BASE_DIR, "health.json")
 UNIVERSE_FILE = os.path.join(BASE_DIR, "universe.json")
 RISK_FILE = os.path.join(BASE_DIR, "risk_state.json")
+DASHBOARD_FILE = os.path.join(BASE_DIR, "DASHBOARD.md")
+DASHBOARD_EVENTS_FILE = os.path.join(BASE_DIR, "dashboard_events.json")
 LOCK_FILE = os.path.join(BASE_DIR, ".quant_sniper.lock")
 CURRENT_MARKET_OPEN = False
 
@@ -104,6 +106,152 @@ def save_json(filepath, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp_path, filepath)
+
+def update_dashboard_events(events, event, now=None, retention_days=7):
+    """최근 7일 이벤트만 유지하고 반복 스킵은 한 항목의 횟수로 합친다."""
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(days=retention_days)
+    retained = []
+    for item in events:
+        try:
+            timestamp = datetime.datetime.fromisoformat(item.get("timestamp", ""))
+        except (TypeError, ValueError):
+            continue
+        if timestamp >= cutoff:
+            retained.append(dict(item))
+
+    event = dict(event)
+    event.setdefault("timestamp", now.isoformat(timespec="seconds"))
+    dedupe_key = (event.get("type"), event.get("code"), event.get("reason"))
+    if event.get("type") == "SKIP":
+        for item in reversed(retained):
+            item_key = (item.get("type"), item.get("code"), item.get("reason"))
+            if item_key == dedupe_key:
+                item["timestamp"] = event["timestamp"]
+                item["count"] = int(item.get("count", 1)) + 1
+                return retained[-500:]
+    event.setdefault("count", 1)
+    retained.append(event)
+    return retained[-500:]
+
+def record_dashboard_event(event_type, name="", code="", reason="", **details):
+    event = {
+        "type": event_type, "name": name, "code": code,
+        "reason": reason, **details,
+    }
+    events = update_dashboard_events(
+        load_json(DASHBOARD_EVENTS_FILE, []), event
+    )
+    save_json(DASHBOARD_EVENTS_FILE, events)
+    return events
+
+def _md(value):
+    return str(value if value is not None else "-").replace("|", "\\|").replace("\n", " ")
+
+def render_dashboard(status, detail, positions, realtime, events, now=None):
+    """GitHub에서 바로 읽을 수 있는 운영 대시보드 Markdown을 생성한다."""
+    now = now or datetime.datetime.now()
+    seven_day_events = update_dashboard_events(events, {
+        "type": "_render_marker", "timestamp": now.isoformat(timespec="seconds")
+    }, now)[:-1]
+    counts = {kind: sum(int(e.get("count", 1)) for e in seven_day_events
+                        if e.get("type") == kind)
+              for kind in ("BUY", "SELL", "SKIP", "RISK", "ERROR")}
+    lines = [
+        "# Quant Sniper Dashboard", "",
+        f"> 마지막 갱신: **{now.strftime('%Y-%m-%d %H:%M:%S')} KST**", "",
+        "## 현재 상태", "",
+        "| 상태 | 장 운영 | 상세 | 보유 종목 |",
+        "|---|---:|---|---:|",
+        f"| {_md(status)} | {'OPEN' if CURRENT_MARKET_OPEN else 'CLOSED'} | {_md(detail)} | {len(positions)} |",
+        "", "## 보유 포지션", "",
+        "| 종목 | 코드 | 수량 | 매수가 | 현재가 | 평가수익률 | 최고가 | 보호선 | 트레일링 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    if positions:
+        for name, pos in positions.items():
+            quote = realtime.quote(pos.get("code", ""))
+            current = float(quote.get("price", 0)) if quote else 0
+            buy = float(pos.get("buy_price", 0))
+            return_pct = ((current - buy) / buy * 100) if current and buy else None
+            return_text = f"{return_pct:+.2f}%" if return_pct is not None else "-"
+            lines.append(
+                f"| {_md(name)} | {_md(pos.get('code'))} | {int(pos.get('shares', 0))} "
+                f"| {buy:,.0f} | {current:,.0f} | "
+                f"{return_text}"
+            )
+            lines[-1] += (
+                f" | {float(pos.get('highest_price', buy)):,.0f}"
+                f" | {float(pos.get('trailing_stop_price', buy * (1-float(pos.get('stop_loss_pct', STOP_LOSS_PCT))))):,.0f}"
+                f" | {'ON' if pos.get('trailing_active') else 'OFF'} |"
+            )
+    else:
+        lines.append("| 보유 종목 없음 | - | - | - | - | - | - | - | - |")
+
+    lines += [
+        "", "## 최근 7일 요약", "",
+        "| 매수 | 매도 | 스킵 | 위험 | 오류 |",
+        "|---:|---:|---:|---:|---:|",
+        f"| {counts['BUY']} | {counts['SELL']} | {counts['SKIP']} | {counts['RISK']} | {counts['ERROR']} |",
+        "", "## 최근 7일 이벤트", "",
+        "| 시각 | 유형 | 종목 | 수량 | 가격 | 사유 | 반복 |",
+        "|---|---|---|---:|---:|---|---:|",
+    ]
+    visible = [e for e in seven_day_events if not str(e.get("type", "")).startswith("_")]
+    for event in reversed(visible[-100:]):
+        lines.append(
+            f"| {_md(event.get('timestamp', '')).replace('T', ' ')} | {_md(event.get('type'))} "
+            f"| {_md(event.get('name') or event.get('code') or '-')} "
+            f"| {_md(event.get('shares', '-'))} | {_md(event.get('price', '-'))} "
+            f"| {_md(event.get('reason', '-'))} | {int(event.get('count', 1))} |"
+        )
+    if not visible:
+        lines.append("| - | - | 기록 없음 | - | - | - | - |")
+    lines += ["", "> 인증정보와 민감한 계좌정보는 기록하지 않습니다.", ""]
+    return "\n".join(lines)
+
+def sync_dashboard_to_branch(status, detail, positions, realtime):
+    """대시보드 두 파일만 부모 없는 단일 커밋으로 origin/dashboard에 교체한다."""
+    if not AUTO_GIT_PUSH:
+        return False
+    events = load_json(DASHBOARD_EVENTS_FILE, [])
+    dashboard = render_dashboard(status, detail, positions, realtime, events)
+    temp_path = f"{DASHBOARD_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        handle.write(dashboard)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, DASHBOARD_FILE)
+    try:
+        dashboard_blob = subprocess.run(
+            ["git", "hash-object", "-w", "DASHBOARD.md"], cwd=BASE_DIR,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        events_blob = subprocess.run(
+            ["git", "hash-object", "-w", "dashboard_events.json"], cwd=BASE_DIR,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        tree_input = (
+            f"100644 blob {dashboard_blob}\tDASHBOARD.md\n"
+            f"100644 blob {events_blob}\tdashboard_events.json\n"
+        )
+        tree = subprocess.run(
+            ["git", "mktree"], cwd=BASE_DIR, input=tree_input,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "commit-tree", tree, "-m", "dashboard: rolling 7-day snapshot"],
+            cwd=BASE_DIR, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "-f", "origin", f"{commit}:refs/heads/dashboard"],
+            cwd=BASE_DIR, capture_output=True, text=True, check=True,
+        )
+        print("[DASHBOARD] origin/dashboard 갱신 완료")
+        return True
+    except Exception as exc:
+        print(f"[DASHBOARD WARN] 갱신 실패: {exc}")
+        return False
 
 def confirm_order_fill(api, order_id, code, expected_qty,
                        timeout=ORDER_CONFIRM_TIMEOUT_SECONDS):
@@ -302,6 +450,10 @@ def run_trading_loop():
     daily_candle_cache = {}
     peak_assets = None
     entry_size_multiplier = 1.0
+    dashboard_dirty = True
+    dashboard_critical = False
+    last_dashboard_push_time = 0
+    record_dashboard_event("SYSTEM", reason="봇 프로세스 시작")
     
     while True:
         try:
@@ -376,6 +528,13 @@ def run_trading_loop():
             # 장 운영 시간 확인
             if not CURRENT_MARKET_OPEN:
                 print(f"[{now_str}] 정규장 운영 시간 외입니다. 대기 중...")
+                if dashboard_dirty or time.time() - last_dashboard_push_time >= 1800:
+                    if sync_dashboard_to_branch(
+                        "running", "정규장 운영 시간 외",
+                        load_json(POSITIONS_FILE, {}), realtime,
+                    ):
+                        dashboard_dirty = False
+                        last_dashboard_push_time = time.time()
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
                 
@@ -549,6 +708,12 @@ def run_trading_loop():
                         "reason": exit_reason
                     }
                     trades.append(trade_record)
+                    record_dashboard_event(
+                        "SELL", name, pos["code"], exit_reason,
+                        shares=pos["shares"], price=round(actual_exit_price, 2),
+                    )
+                    dashboard_dirty = True
+                    dashboard_critical = True
                     closed_positions.append(name)
                     
             for name in closed_positions:
@@ -593,6 +758,12 @@ def run_trading_loop():
                         sig = dict(sig)
                         sig["entry_price"] = quote["price"]
                         live_signals.append(sig)
+                    else:
+                        record_dashboard_event(
+                            "SKIP", sig["name"], active_universe.get(sig["name"], ""),
+                            "키움 실시간 시세 없음",
+                        )
+                        dashboard_dirty = True
                 signals = live_signals
                 cash = api.get_cash_balance()
                 total_assets = float(account.get("total_assets") or (
@@ -603,9 +774,18 @@ def run_trading_loop():
                 for sig in signals:
                     name = sig["name"]
                     if name in positions:
+                        record_dashboard_event(
+                            "SKIP", name, active_universe.get(name, ""), "이미 보유 중"
+                        )
+                        dashboard_dirty = True
                         continue
                     if len(positions) >= MAX_POSITIONS:
-                        break
+                        record_dashboard_event(
+                            "SKIP", name, active_universe.get(name, ""),
+                            "최대 보유 종목 수 도달",
+                        )
+                        dashboard_dirty = True
+                        continue
                     code = active_universe[name]
                     entry_p = sig["entry_price"]
                     stop_loss_pct = float(sig.get("stop_loss_pct", STOP_LOSS_PCT))
@@ -615,6 +795,10 @@ def run_trading_loop():
                     )
                     if shares < 1:
                         print(f"[{now_str}] [SKIP] {name}: 1주가 투자/위험 한도를 초과")
+                        record_dashboard_event(
+                            "SKIP", name, code, "1주가 투자/위험 한도를 초과"
+                        )
+                        dashboard_dirty = True
                         continue
                         
                     invest = shares * entry_p
@@ -669,6 +853,12 @@ def run_trading_loop():
                             "strategy": sig["strategy"]
                         }
                         trades.append(trade_record)
+                        record_dashboard_event(
+                            "BUY", name, code, sig["strategy"],
+                            shares=filled_qty, price=round(fill_price, 2),
+                        )
+                        dashboard_dirty = True
+                        dashboard_critical = True
                         new_buys.append(name)
                         
                 if new_buys:
@@ -687,6 +877,10 @@ def run_trading_loop():
             # 정상↔위험 상태가 바뀌면 30분 주기를 기다리지 않고 즉시 피클AI에 공개한다.
             current_state = (status, detail)
             if git_ok and current_state != last_published_state:
+                event_type = "ERROR" if status == "error" else "RISK" if status == "halted" else "SYSTEM"
+                record_dashboard_event(event_type, reason=detail)
+                dashboard_dirty = True
+                dashboard_critical = status in {"error", "halted"}
                 if sync_health_to_status_branch(detail=detail):
                     last_published_state = current_state
                     last_health_sync_time = time.time()
@@ -695,6 +889,14 @@ def run_trading_loop():
             if git_ok and (time.time() - last_health_sync_time >= 1800):
                 if sync_health_to_status_branch(detail=detail):
                     last_health_sync_time = time.time()
+
+            dashboard_due = time.time() - last_dashboard_push_time >= 300
+            if git_ok and (dashboard_critical or (dashboard_dirty and dashboard_due)
+                           or (positions and dashboard_due)):
+                if sync_dashboard_to_branch(status, detail, positions, realtime):
+                    dashboard_dirty = False
+                    dashboard_critical = False
+                    last_dashboard_push_time = time.time()
                 
             time.sleep(POLL_INTERVAL_SECONDS)
             
@@ -702,6 +904,13 @@ def run_trading_loop():
             print(f"[ERROR] 루프 실행 중 예외 발생: {e}")
             error_detail = f"루프 예외: {type(e).__name__}: {e}"
             update_health_status(status="error", detail=error_detail)
+            record_dashboard_event("ERROR", reason=error_detail)
+            sync_dashboard_to_branch(
+                "error", error_detail, load_json(POSITIONS_FILE, {}), realtime
+            )
+            last_dashboard_push_time = time.time()
+            dashboard_dirty = False
+            dashboard_critical = False
             if git_ok and sync_health_to_status_branch(detail=error_detail):
                 last_published_state = ("error", error_detail)
                 last_health_sync_time = time.time()
