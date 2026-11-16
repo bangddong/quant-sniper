@@ -174,6 +174,10 @@ sudo systemctl status quant_sniper
 
 공개 운영 대시보드는 [`dashboard` 브랜치](https://github.com/rundevelrun/quant-sniper/tree/dashboard)에서 확인할 수 있습니다.
 
+### 운영자의 모니터링 방식
+
+필자는 외부 AI 도구인 **‘피클’**을 통해 `dashboard` 브랜치를 30분마다 감시하고, 상태 변화가 확인되면 봇의 실행 상태·보유 포지션·매수 및 매도·스킵 사유·위험 이벤트를 보고받습니다. 이는 이 저장소에 포함된 필수 기능이나 공식 연동이 아니라, 공개된 대시보드 데이터를 활용하는 개인 운영 방식입니다.
+
 - 현재 봇·시장·WebSocket 상태
 - 오늘의 감시 유니버스와 신호 확인 단계
 - 현재 보유 포지션 전체와 청산 계획
