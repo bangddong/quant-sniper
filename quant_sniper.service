@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=niphyang
-WorkingDirectory=/home/niphyang/quant-sniper
-ExecStart=/usr/bin/python3 /home/niphyang/quant-sniper/bot.py
+User=quant-sniper
+WorkingDirectory=/opt/quant-sniper
+ExecStart=/opt/quant-sniper/venv/bin/python /opt/quant-sniper/bot.py
 Restart=always
 RestartSec=10
 

@@ -6,18 +6,14 @@
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 cd "$DIR"
 
-# 1. Git 푸시 권한 사전 검증
-echo "🔍 [1/3] 깃허브 푸시 권한 확인 중..."
-if git push --dry-run origin main > /dev/null 2>&1; then
-    echo "✅ 깃허브 푸시 권한 정상 확인 (피클 비서 실시간 체결 보고 준비 완료)"
-else
-    echo "⚠️ [주의] 깃허브 푸시 권한이 확인되지 않았습니다!"
-    echo "   체결 시 비서에게 알림을 전송하려면 깃 푸시 인증이 필요합니다."
-    echo "   👉 해결 방법: 터미널에서 'gh auth login' 또는 SSH Key 등록"
-    echo ""
-    read -p "그래도 로컬 실행을 계속 진행하시겠습니까? (y/N): " choice
-    if [ "$choice" != "y" ] && [ "$choice" != "Y" ]; then
-        echo "가동을 중단합니다."
+# 1. 원격 장부·대시보드를 활성화한 경우에만 Git 푸시 권한 검증
+if grep -Eq '^[[:space:]]*AUTO_GIT_PUSH[[:space:]]*=[[:space:]]*true[[:space:]]*$' .env 2>/dev/null; then
+    echo "🔍 GitHub 자동 동기화 권한 확인 중..."
+    if git push --dry-run origin main > /dev/null 2>&1; then
+        echo "✅ GitHub 푸시 권한 정상"
+    else
+        echo "⚠️ AUTO_GIT_PUSH=true지만 GitHub 푸시 권한을 확인하지 못했습니다."
+        echo "   gh auth login 또는 SSH Key 설정 후 다시 실행하십시오."
         exit 1
     fi
 fi
