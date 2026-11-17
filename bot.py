@@ -177,8 +177,17 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         f"| {_md(context.get('universe_date', '-'))} | {_md(context.get('universe_source', '-'))} "
         f"| {int(context.get('universe_count', 0))} | {int(context.get('raw_signal_count', 0))} "
         f"| {int(context.get('confirming_signal_count', 0))} | {int(context.get('confirmed_signal_count', 0))} |",
-        "",
-        f"감시 종목: {_md(', '.join(context.get('universe_names', [])) or '-')}",
+        "", "#### 감시 종목 전체", "",
+        "| 종목 | 코드 |",
+        "|---|---:|",
+    ]
+    universe_symbols = context.get("universe_symbols", [])
+    if universe_symbols:
+        for item in universe_symbols:
+            lines.append(f"| {_md(item.get('name'))} | `{_md(item.get('code'))}` |")
+    else:
+        lines.append("| - | - |")
+    lines += [
         "", "#### 신호 확인 단계", "",
         "| 종목 | 전략 | 연속 확인 |",
         "|---|---|---:|",
@@ -312,7 +321,9 @@ def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
         "daily_return_pct": render_context.get("daily_return_pct"),
         "entry_size_multiplier": render_context.get("entry_size_multiplier", 1.0),
         "universe_date": render_context.get("universe_date"),
+        "universe_source": render_context.get("universe_source"),
         "universe_count": render_context.get("universe_count", 0),
+        "universe_symbols": render_context.get("universe_symbols", []),
         "raw_signal_count": render_context.get("raw_signal_count", 0),
         "confirming_signal_count": render_context.get("confirming_signal_count", 0),
         "confirmed_signal_count": render_context.get("confirmed_signal_count", 0),
@@ -599,6 +610,10 @@ def run_trading_loop():
                 ),
                 "universe_count": len(active_universe),
                 "universe_names": list(active_universe.keys()),
+                "universe_symbols": [
+                    {"name": name, "code": code}
+                    for name, code in active_universe.items()
+                ],
             })
             realtime.set_symbols(
                 list(active_universe.values()) + [MARKET_PROXY_CODE]

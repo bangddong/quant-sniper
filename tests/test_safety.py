@@ -60,6 +60,23 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("전체 누적 성과 — 전체 거래 이력", markdown)
         self.assertNotIn("계좌번호", markdown)
 
+    def test_dashboard_lists_monitored_symbols_with_codes(self):
+        class Feed:
+            def quote(self, code):
+                return None
+            def is_healthy(self):
+                return True, ""
+        markdown = render_dashboard(
+            "running", "정규 감시 중", {}, Feed(), [],
+            context={"universe_symbols": [
+                {"name": "후보주", "code": "000001"},
+                {"name": "감시주", "code": "000002"},
+            ]},
+        )
+        self.assertIn("감시 종목 전체", markdown)
+        self.assertIn("| 후보주 | `000001` |", markdown)
+        self.assertIn("| 감시주 | `000002` |", markdown)
+
     def test_position_size_obeys_allocation_and_trade_risk(self):
         # 30만원, 2만원 주식, 3% 손절: 30% 비중 한도는 4주, 위험 한도는 3주다.
         self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03), 3)
