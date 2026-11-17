@@ -64,13 +64,16 @@ def _dec(value: float) -> Decimal:
 
 class Engine:
     def __init__(self, exchange: Exchange, feed: Feed, store: StateStore, metrics: Metrics,
-                 settings: Settings, sleep: Callable[[float], None] = time.sleep):
+                 settings: Settings, sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic):
         self.exchange = exchange
         self.feed = feed
         self.store = store
         self.metrics = metrics
         self.settings = settings
         self.sleep = sleep
+        self.monotonic = monotonic                         # 주문 확인 기한·전송 시각(루프 안에서 흐른 시간)
+        self._loop_mono = monotonic()                      # 이번 루프가 시작한 단조 시각
         # 저장되는 상태 (startup에서 불러온다)
         self.halts = HaltBoard()
         self.positions: dict[str, dict] = {}
@@ -141,6 +144,7 @@ class Engine:
     # ---- 루프 ---------------------------------------------------------------------
     def run_once(self, now: datetime) -> LoopReport:
         self._now = now
+        self._loop_mono = self.monotonic()
         self._loop_events = []
         self._loop_failed = False
         self.entries.begin_loop()
@@ -208,6 +212,10 @@ class Engine:
         except Exception as exc:
             self._event("ERROR", f"{type(exc).__name__}: {exc}")
             return False
+
+    def elapsed_now(self, now: datetime) -> datetime:
+        """루프 시각 now + 이번 루프에서 흐른 단조 시간: 루프가 오래 걸려도 실제에 가까운 지금 시각."""
+        return now + timedelta(seconds=max(0.0, self.monotonic() - self._loop_mono))
 
     # ---- 이후 작업이 채우는 자리 -----------------------------------------------------
     def _resolve_intents(self, now: datetime) -> None:

@@ -79,7 +79,7 @@ def make_engine(prices: dict[str, float] | None = None, balances: dict[str, floa
         feed.set_quote(symbol, price, day=today.isoformat())
     store = StateStore(state_dir)
     engine = Engine(ex, feed, store, Metrics(), make_settings(state_dir, starting_capital),
-                    sleep=lambda _s: None)
+                    sleep=lambda _s: None, monotonic=lambda: 0.0)   # 시간이 흐르지 않는 가짜 단조 시계
     if owned:
         if test is not None:
             test.addCleanup(shutil.rmtree, state_dir, True)
@@ -103,7 +103,7 @@ def add_position(engine: Engine, exchange: FakeExchange, symbol: str, qty: float
 def restart_engine(engine: Engine, now: datetime, sleep=None) -> Engine:
     """같은 상태 폴더·거래소·피드로 새 엔진을 만들어 startup까지 한다(프로세스 재시작 흉내)."""
     fresh = Engine(engine.exchange, engine.feed, StateStore(engine.store.state_dir), Metrics(),
-                   engine.settings, sleep=sleep or (lambda _s: None))
+                   engine.settings, sleep=sleep or (lambda _s: None), monotonic=engine.monotonic)
     fresh.startup(now)
     return fresh
 

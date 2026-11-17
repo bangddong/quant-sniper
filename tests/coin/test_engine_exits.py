@@ -768,5 +768,73 @@ class ThirdAssetFeeTests(unittest.TestCase):
         self.assertEqual(calls(ex, "market_sell"), [])
 
 
+class FakeClock:
+    """가짜 단조 시계: sleep이 시간을 흘려보낸다."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class ConfirmDeadlineTests(unittest.TestCase):
+    """주문 확인은 시도 횟수가 아니라 단조 시계 기한으로 끝난다 (F6)."""
+
+    def build(self):
+        clock = FakeClock()
+        patcher = mock.patch.object(config, "PROTECTIVE_STOPS_ENABLED", False)   # 수량이 잠기지 않게
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        eng, ex, feed, store = make_engine(test=self)
+        eng.sleep, eng.monotonic = clock.sleep, clock.monotonic
+        eng.startup(T0)
+        add_position(eng, ex, SYM, 1.0, 100.0)
+        ex.set_price(SYM, 100.0)
+        feed.set_quote(SYM, 100.0)
+        eng.run_once(T0)                                      # 규칙·보호 주문
+        return eng, ex, feed, store, clock
+
+    def test_slow_order_lookups_stop_at_deadline_and_keep_intent(self):
+        eng, ex, feed, store, clock = self.build()
+        real = ex.get_order
+
+        def slow_hidden(symbol, client_id):                  # 한 번에 10초 걸리고 아직 안 보인다
+            clock.t += 10
+            ex.hide_order_for(1)
+            return real(symbol, client_id)
+        ex.get_order = slow_hidden
+        start, n = clock.t, len(calls(ex, "get_order"))
+        out = eng.executor.execute_market(SYM, "SELL", 0.5, "exit", "test", T0 + 30 * SEC, ref_price=100.0)
+        self.assertEqual(out.status, "unconfirmed")
+        self.assertLessEqual(clock.t - start, config.ORDER_CONFIRM_TIMEOUT_SECONDS + 10)
+        self.assertEqual(len(calls(ex, "get_order")) - n, 2)  # 0초, 11초에 조회하고 21초에 멈춘다
+        self.assertIn(out.client_id, store.load("intents", {}))
+        self.assertTrue(eng.halts.is_set(ORDER_UNCONFIRMED))
+
+    def test_transient_send_failure_polls_at_most_five_seconds(self):
+        eng, ex, feed, store, clock = self.build()
+        ex.fail_next("market_sell", TRANSIENT)                # 주문은 거래소에 없다(결과 불명)
+        start, n = clock.t, len(calls(ex, "get_order"))
+        out = eng.executor.execute_market(SYM, "SELL", 0.5, "exit", "test", T0 + 30 * SEC, ref_price=100.0)
+        self.assertEqual(out.status, "unconfirmed")
+        self.assertLessEqual(clock.t - start, config.ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS)
+        self.assertLessEqual(len(calls(ex, "get_order")) - n, config.ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS)
+        self.assertIn(out.client_id, store.load("intents", {}))
+
+    def test_intent_created_at_is_the_actual_send_time(self):
+        eng, ex, feed, store, clock = self.build()
+        now = T0 + 30 * SEC
+        eng.run_once(now)                                     # 루프 시작 시각(단조)을 정한다
+        clock.t += 50                                         # 같은 루프 안에서 50초가 흘렀다
+        ex.hide_order_for(100)
+        out = eng.executor.execute_market(SYM, "SELL", 0.5, "exit", "test", now, ref_price=100.0)
+        created = store.load("intents", {})[out.client_id]["created_at"]
+        self.assertEqual(created, (now + 50 * SEC).isoformat())
+
+
 if __name__ == "__main__":
     unittest.main()

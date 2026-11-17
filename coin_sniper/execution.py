@@ -21,7 +21,8 @@ from decimal import Decimal
 
 from coin_sniper import config
 from coin_sniper.config import (
-    INTENT_NOT_FOUND_GRACE_SECONDS, MAX_HOLD_HOURS, ORDER_CONFIRM_TIMEOUT_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
+    INTENT_NOT_FOUND_GRACE_SECONDS, MAX_HOLD_HOURS, ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS,
+    ORDER_CONFIRM_TIMEOUT_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
     STOP_LIMIT_OFFSET_PCT, STOP_REPLACE_MIN_MOVE_PCT,
 )
 from coin_sniper.halts import LOOP_ERROR, MAINTENANCE, ORDER_UNCONFIRMED, PROTECTIVE_CANCEL
@@ -69,25 +70,36 @@ class Executor:
         체결은 확인된 것만 장부에 반영된다(매도는 _sell_journal, 매수는 _buy_journal)."""
         e = self.e
         cid = new_client_id(e.settings.mode, kind)
-        add_intent(e.intents, cid, symbol, side, qty, kind, reason, now)
+        # 의도의 created_at은 실제로 보내는 시각: 루프가 오래 걸려도 "없음" 유예(60초)가 줄지 않는다
+        add_intent(e.intents, cid, symbol, side, qty, kind, reason, e.elapsed_now(now))
         e.intents[cid].update(ref_price=ref_price, extra=dict(extra or {}))
         e.store.save("intents", e.intents)                 # 보내기 전에 저장(write-ahead)
         e.metrics.record_order("sent", now)
         send = e._call("market_buy" if side == "BUY" else "market_sell", symbol, qty, cid)
+        limit = float(ORDER_CONFIRM_TIMEOUT_SECONDS)
         if not send.ok and send.kind == "transient":       # 실패한 그 시점에 건다(다음 계좌 조회 성공 때 해제)
             e._set_halt(MAINTENANCE, f"거래소 주문 실패(일시 오류): {symbol} {_SIDE_KO[side]} ({send.error})")
+            limit = min(limit, float(ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS))   # 거래소가 아프다: 짧게 보고 넘긴다
         rejected = not send.ok and send.kind == "permanent"
-        state = self._confirm(symbol, cid, rejected)       # 보낸 결과와 상관없이 항상 조회로 확인
+        state = self._confirm(symbol, cid, rejected, limit)   # 보낸 결과와 상관없이 항상 조회로 확인
         return self._settle(cid, state, send, now)
 
-    def _confirm(self, symbol: str, cid: str, accept_absent: bool) -> OrderState | None:
-        """is_final이 될 때까지 1초 간격으로 조회한다. "없음"은 명시적 거절 뒤에만 바로 받아들이고,
-        그 밖에는 조회 지연일 수 있으므로 계속 조회한다. 끝까지 없으면 마지막 "없음" 상태를 돌려준다."""
+    def _confirm(self, symbol: str, cid: str, accept_absent: bool, limit: float) -> OrderState | None:
+        """is_final이 될 때까지 1초 간격으로 조회한다. 확인 전체가 단조 시계로 limit초를 넘기면 멈춘다
+        (조회 하나가 HTTP 기한까지 걸려도 루프가 길게 막히지 않는다). 시도 횟수도 limit회를 넘지 않는다.
+        "없음"은 명시적 거절 뒤에만 바로 받아들이고, 그 밖에는 조회 지연일 수 있으므로 계속 조회한다.
+        끝까지 없으면 마지막 "없음" 상태를 돌려준다(기한 초과면 None일 수 있다: 모름)."""
+        e = self.e
+        deadline = e.monotonic() + limit
         last = None
-        for attempt in range(max(1, int(ORDER_CONFIRM_TIMEOUT_SECONDS))):
+        for attempt in range(max(1, int(limit))):
             if attempt:
-                self.e.sleep(1)
-            res = self.e._call("get_order", symbol, cid)
+                if e.monotonic() >= deadline:
+                    break
+                e.sleep(1)
+                if e.monotonic() >= deadline:
+                    break
+            res = e._call("get_order", symbol, cid)
             if not res.ok:
                 continue
             if res.value.exists and res.value.is_final:
