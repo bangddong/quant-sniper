@@ -707,10 +707,23 @@ def run_trading_loop():
                     active_universe = screened
                     universe_metadata = api.last_universe_metadata
                     last_screened_date = today_str
+                    universe_source = "kiwoom_ka10031_query_type_2_previous_day_value"
                     save_json(UNIVERSE_FILE, {
                         "date": today_str, "symbols": screened,
                         "metadata": universe_metadata,
-                        "source": "kiwoom_ka10031_query_type_2_previous_day_value",
+                        "source": universe_source,
+                    })
+                    dashboard_context.update({
+                        "universe_date": today_str,
+                        "universe_source": universe_source,
+                        "universe_count": len(screened),
+                        "universe_symbols": [
+                            {"name": name, "code": code,
+                             "sector": universe_metadata.get(name, {}).get(
+                                 "sector", "미분류"
+                             )}
+                            for name, code in screened.items()
+                        ],
                     })
                     print(f"[{now_str}] ✅ 오늘자 감시 유니버스 {len(active_universe)}종목 갱신 완료:")
                     print("   ", ", ".join(list(active_universe.keys())[:10]), "...")
@@ -741,10 +754,23 @@ def run_trading_loop():
                     active_universe = screened
                     universe_metadata = api.last_universe_metadata
                     last_screened_date = today_str
+                    universe_source = "kiwoom_ka10031_query_type_2_previous_day_value"
                     save_json(UNIVERSE_FILE, {
                         "date": today_str, "symbols": screened,
                         "metadata": universe_metadata,
-                        "source": "kiwoom_ka10031_query_type_2_previous_day_value",
+                        "source": universe_source,
+                    })
+                    dashboard_context.update({
+                        "universe_date": today_str,
+                        "universe_source": universe_source,
+                        "universe_count": len(screened),
+                        "universe_symbols": [
+                            {"name": name, "code": code,
+                             "sector": universe_metadata.get(name, {}).get(
+                                 "sector", "미분류"
+                             )}
+                            for name, code in screened.items()
+                        ],
                     })
                     print(f"[{now_str}] ✅ 장중 유니버스 {len(screened)}종목 복구 완료")
                 else:
