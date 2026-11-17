@@ -541,7 +541,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertNotIn(UNIVERSE, codes(r2))
         self.assertTrue(r2.entry_allowed)
 
-    def test_cold_start_rules_fetch_is_throttled_and_recon_fails_closed(self):
+    def test_cold_start_rules_fetch_with_positions_retries_each_loop_and_recon_fails_closed(self):
         eng, ex, feed, store, entries = self.restart_with_todays_universe(
             positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)}, balances={"USDT": 10000.0, "SOL": 0.9995})
         ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 503"), times=10)
@@ -549,8 +549,43 @@ class EngineStateTests(unittest.TestCase):
             r = eng.run_once(T0 + 30 * i * SEC)
             self.assertIn(RECON_MISMATCH, codes(r))         # 수량 단위를 모르면 오차를 허용하지 않는다
             self.assertIn(UNIVERSE, codes(r))
-        self.assertEqual(calls_named(ex, "symbol_rules"), 1)
+        self.assertEqual(calls_named(ex, "symbol_rules"), 5)   # 보유 중: 루프마다 한 번(같은 루프 안에서는 한 번)
         self.assertEqual(entries, [])
+
+    # ---- final fix F1: 재시작 직후 청산이 규칙·시세 없이 눈멀지 않는다 -----------------------
+    def test_restart_with_position_retries_rules_every_loop_and_exits_next_loop(self):
+        pos = dict(position("SOLUSDT", 1.0, 100), stop_price=95.0)
+        eng, ex, feed, store, entries = self.restart_with_todays_universe(
+            positions={"SOLUSDT": pos}, balances={"USDT": 10000.0, "SOL": 1.0})
+        ex.set_price("SOLUSDT", 90.0)
+        feed.set_quote("SOLUSDT", 90.0)                      # 처음부터 손절선 아래
+        ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 503"))
+        eng.run_once(T0)
+        self.assertEqual(calls_named(ex, "market_sell"), 0)  # 규칙 없음: 보류
+        eng.run_once(T0 + 30 * SEC)                          # 600초가 아니라 다음 루프에 다시 받는다
+        self.assertEqual(calls_named(ex, "market_sell"), 1)
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_rules_fetch_without_positions_stays_throttled(self):
+        eng, ex, feed, store, entries = self.restart_with_todays_universe()
+        ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 503"), times=10)
+        for i in range(5):
+            eng.run_once(T0 + 30 * i * SEC)
+        self.assertEqual(calls_named(ex, "symbol_rules"), 1)
+
+    def test_startup_subscribes_held_symbols_proxy_and_todays_universe(self):
+        eng, ex, feed, store = make_engine(test=self)
+        store.save("positions", {"LINKUSDT": position("LINKUSDT", 1.0, 15)})
+        store.save("universe", {"date": "2026-11-17", "symbols": ["ETHUSDT", "SOLUSDT"]})
+        eng.startup(T0)
+        self.assertEqual(sorted(feed.symbols), ["BTCUSDT", "ETHUSDT", "LINKUSDT", "SOLUSDT"])
+
+    def test_startup_ignores_yesterdays_universe_for_subscription(self):
+        eng, ex, feed, store = make_engine(test=self)
+        store.save("positions", {"LINKUSDT": position("LINKUSDT", 1.0, 15)})
+        store.save("universe", {"date": "2026-11-16", "symbols": ["ETHUSDT"]})
+        eng.startup(T0)
+        self.assertEqual(sorted(feed.symbols), ["BTCUSDT", "LINKUSDT"])
 
     def test_entries_not_called_without_rules_even_without_halts(self):
         eng, ex, feed, store = self.build()

@@ -125,6 +125,7 @@ class Engine:
                 "segment_start": now.isoformat(), "last_loop_at": None,
             }
         self.feed.start()
+        self._subscribe(now)                               # 첫 루프의 청산이 시세 없이 눈멀지 않게
         self.metrics.record_restart(now)
         last = self.risk_state.get("last_loop_at")
         if last:
@@ -262,13 +263,17 @@ class Engine:
             self._refresh_universe(now, today)
 
     def _ensure_rules(self, now: datetime) -> bool:
-        """전체 선정 밖에서 symbol_rules()를 부르는 유일한 곳. 재시도 간격을 지키고 예외를 삼킨다
-        (호출 한도는 _call대로 올린다). 실패하면 self.rules는 그대로 두고 False."""
+        """전체 선정 밖에서 symbol_rules()를 부르는 유일한 곳. 예외를 삼킨다(호출 한도는 _call대로 올린다).
+        실패하면 self.rules는 그대로 두고 False. 재시도 간격: 보유 포지션이 있으면 루프마다 한 번
+        (규칙 없이는 청산 주문을 못 낸다), 없으면 UNIVERSE_RETRY_SECONDS."""
         if self.rules:
             return True
         tried = self._rules_tried_at
-        if tried is not None and (now - tried).total_seconds() < UNIVERSE_RETRY_SECONDS:
-            return False
+        if tried is not None:
+            if tried == now:                               # 같은 루프 안에서는 한 번만
+                return False
+            if not self.positions and (now - tried).total_seconds() < UNIVERSE_RETRY_SECONDS:
+                return False
         self._rules_tried_at = now
         try:
             res = self._call("symbol_rules")
@@ -372,15 +377,18 @@ class Engine:
             if free + locked > 0 and asset != QUOTE_ASSET and asset not in managed)
 
     # ---- 6단계: 캔들과 평가액 기록 ------------------------------------------------------
-    def _prepare_candles(self, now: datetime) -> None:
-        today = _day(now)
+    def _subscribe(self, now: datetime) -> None:
+        """시세 구독: 보유 종목 + 시장 프록시 + 오늘 감시 종목. 바뀔 때만 피드에 알린다."""
         wanted = set(self.positions) | {MARKET_PROXY_SYMBOL}
-        if self.universe.get("date") == today:
+        if self.universe.get("date") == _day(now):
             wanted |= set(self.universe.get("symbols", []))
         ordered = sorted(wanted)
         if ordered != self._feed_symbols:
             self.feed.set_symbols(ordered)
             self._feed_symbols = ordered
+
+    def _prepare_candles(self, now: datetime) -> None:
+        self._subscribe(now)
         row = self.risk_state.get("pending_equity_row")
         if not row:
             return
