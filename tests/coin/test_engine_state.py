@@ -11,7 +11,7 @@ from coin_sniper.halts import (
 from coin_sniper.metrics import Metrics
 from coin_sniper.models import ApiResult
 
-from helpers import make_engine, position, trending_candles, utc
+from helpers import DEFAULT_PRICES, make_engine, position, trending_candles, utc
 
 T0 = utc(2026, 11, 17, 12)
 SEC = timedelta(seconds=1)
@@ -448,6 +448,92 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(eng.candles("SOLUSDT", T0), rest)
         feed.set_quote("SOLUSDT", 123, day="2026-11-16")
         self.assertEqual(eng.candles("SOLUSDT", T0), rest)
+
+    # ---- fix round 2: 종목 규칙 미확보 시 진입 차단 ---------------------------------------
+    def restart_with_todays_universe(self, positions=None, balances=None):
+        eng, ex, feed, store = make_engine(test=self, balances=balances)
+        store.save("universe", {"date": "2026-11-17", "symbols": sorted(DEFAULT_PRICES)})
+        store.save("risk_state", {"starting_capital": 1000.0, "realized_pnl": 0.0, "peak_equity": 1000.0,
+                                  "day": "2026-11-17", "day_open_equity": 1000.0,
+                                  "segment_start": T0.isoformat(), "last_loop_at": T0.isoformat(),
+                                  "last_equity": 1000.0})
+        if positions is not None:
+            store.save("positions", positions)
+        eng.startup(T0)
+        entries = []
+        eng._manage_entries = lambda now: entries.append(now)
+        return eng, ex, feed, store, entries
+
+    def test_rules_raising_on_restart_blocks_entries_until_loaded(self):
+        eng, ex, feed, store, entries = self.restart_with_todays_universe()
+
+        def boom():
+            raise ConnectionResetError("reset")
+        ex.symbol_rules = boom
+        r1 = eng.run_once(T0)
+        self.assertIn(UNIVERSE, codes(r1))
+        self.assertIn("규칙", r1.halts[0]["detail"])
+        r2 = eng.run_once(T0 + 30 * SEC)                     # 재시도 간격 안
+        self.assertIn(UNIVERSE, codes(r2))
+        self.assertFalse(r2.entry_allowed)
+        self.assertEqual(entries, [])
+        del ex.symbol_rules
+        r3 = eng.run_once(T0 + config.UNIVERSE_RETRY_SECONDS * SEC)
+        self.assertNotIn(UNIVERSE, codes(r3))
+        self.assertTrue(r3.entry_allowed)
+        self.assertEqual(len(entries), 1)
+
+    def test_rules_rate_limited_on_restart_blocks_entries_after_wait(self):
+        eng, ex, feed, store, entries = self.restart_with_todays_universe()
+        ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 429", retry_after=60))
+        r1 = eng.run_once(T0)
+        self.assertIn(RATE_LIMIT, codes(r1))
+        r2 = eng.run_once(T0 + 60 * SEC)                     # 대기는 끝났지만 규칙은 아직 없다
+        self.assertNotIn(RATE_LIMIT, codes(r2))
+        self.assertIn(UNIVERSE, codes(r2))
+        self.assertFalse(r2.entry_allowed)
+        self.assertEqual(entries, [])
+        r3 = eng.run_once(T0 + config.UNIVERSE_RETRY_SECONDS * SEC)
+        self.assertNotIn(UNIVERSE, codes(r3))
+        self.assertTrue(r3.entry_allowed)
+        self.assertEqual(len(entries), 1)
+
+    def test_universe_halt_clears_when_reconcile_loads_rules(self):
+        eng, ex, feed, store, entries = self.restart_with_todays_universe(
+            positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)}, balances={"USDT": 10000.0, "SOL": 1.0})
+        ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 503"))
+        r1 = eng.run_once(T0)
+        self.assertIn(UNIVERSE, codes(r1))
+        r2 = eng.run_once(T0 + config.UNIVERSE_RETRY_SECONDS * SEC)   # 대조 단계가 규칙을 받는다
+        self.assertIn("SOLUSDT", eng.rules)
+        self.assertNotIn(UNIVERSE, codes(r2))
+        self.assertTrue(r2.entry_allowed)
+
+    def test_cold_start_rules_fetch_is_throttled_and_recon_fails_closed(self):
+        eng, ex, feed, store, entries = self.restart_with_todays_universe(
+            positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)}, balances={"USDT": 10000.0, "SOL": 0.9995})
+        ex.fail_next("symbol_rules", ApiResult(False, kind="transient", error="HTTP 503"), times=10)
+        for i in range(5):
+            r = eng.run_once(T0 + 30 * i * SEC)
+            self.assertIn(RECON_MISMATCH, codes(r))         # 수량 단위를 모르면 오차를 허용하지 않는다
+            self.assertIn(UNIVERSE, codes(r))
+        self.assertEqual(calls_named(ex, "symbol_rules"), 1)
+        self.assertEqual(entries, [])
+
+    def test_entries_not_called_without_rules_even_without_halts(self):
+        eng, ex, feed, store = self.build()
+        entries = []
+        eng._manage_entries = lambda now: entries.append(now)
+        eng.run_once(T0)
+        self.assertEqual(len(entries), 1)
+        eng._refresh_universe_if_due = lambda now: None
+        eng._derive_universe_halt = lambda now: None
+        eng.rules = {}
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertEqual(r.halts, [])
+        self.assertFalse(r.entry_allowed)
+        self.assertFalse(eng.snapshot(T0 + 30 * SEC)["entry_allowed"])
+        self.assertEqual(len(entries), 1)
 
     def test_state_survives_restart(self):
         eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},

@@ -88,6 +88,8 @@ class Engine:
         self._candles_day: str | None = None
         self._feed_symbols: list[str] | None = None
         self._universe_tried_at: datetime | None = None   # 마지막 선정 시도(재시도 간격 기준)
+        self._rules_tried_at: datetime | None = None      # 마지막 규칙만 받기 시도
+        self._universe_detail = ""                         # 마지막 선정 실패 사유
         self._loop_failed = False
         self._prev_loop_at: datetime | None = None
         self._now: datetime | None = None
@@ -153,12 +155,17 @@ class Engine:
             ("candles", self._prepare_candles, (now,)),            # 6 캔들 + 평가액 기록
             ("equity", self._evaluate_equity, ()),                 # 7
         )
+        limited = False
         for name, fn, args in steps:
             if not self._run_step(name, fn, *args):
-                return                                     # 호출 한도: 남은 단계는 거래소를 부르지 않는다
+                limited = True                             # 호출 한도: 남은 단계는 거래소를 부르지 않는다
+                break
+        self._run_step("universe_halt", self._derive_universe_halt, now)   # 거래소 호출 없음: 항상
+        if limited:
+            return
         if not self._loop_failed:
             self._clear_halt(LOOP_ERROR)
-        if not self.halts.active():
+        if self.entry_allowed(now):
             self._run_step("entries", self._manage_entries, now)   # 8 (Task 12)
 
     def _run_step(self, name: str, fn: Callable, *args) -> bool:
@@ -227,20 +234,48 @@ class Engine:
     # ---- 6단계: 감시 종목 -----------------------------------------------------------
     def _refresh_universe_if_due(self, now: datetime) -> None:
         today = _day(now)
-        tried = self._universe_tried_at
-        if (tried is not None and _day(tried) == today
-                and (now - tried).total_seconds() < UNIVERSE_RETRY_SECONDS):
+        if self.universe.get("date") == today and self.universe.get("symbols"):
+            self._ensure_rules(now)                        # 재시작: 오늘 목록은 있고 규칙만 없을 수 있다
             return
-        if self.universe.get("date") != today or not self.universe.get("symbols"):
+        tried = self._universe_tried_at
+        if (tried is None or _day(tried) != today
+                or (now - tried).total_seconds() >= UNIVERSE_RETRY_SECONDS):
             self._refresh_universe(now, today)
-        elif not self.rules:                               # 재시작: 오늘 목록은 있고 규칙만 없다
-            self._universe_tried_at = now
+
+    def _ensure_rules(self, now: datetime) -> bool:
+        """전체 선정 밖에서 symbol_rules()를 부르는 유일한 곳. 재시도 간격을 지키고 예외를 삼킨다
+        (호출 한도는 _call대로 올린다). 실패하면 self.rules는 그대로 두고 False."""
+        if self.rules:
+            return True
+        tried = self._rules_tried_at
+        if tried is not None and (now - tried).total_seconds() < UNIVERSE_RETRY_SECONDS:
+            return False
+        self._rules_tried_at = now
+        try:
             res = self._call("symbol_rules")
-            if res.ok:
-                self.rules = dict(res.value)
-                self._clear_halt(UNIVERSE)
-            else:
-                self._set_halt(UNIVERSE, f"종목 규칙 조회 실패: {res.error}")
+            if not res.ok:
+                return False
+            self.rules = dict(res.value)
+        except _RateLimited:
+            raise
+        except Exception as exc:
+            self._event("ERROR", f"rules: {type(exc).__name__}: {exc}")
+            return False
+        return True
+
+    def _derive_universe_halt(self, now: datetime) -> None:
+        """UNIVERSE는 상태에서 매 루프 다시 정한다: 오늘 목록이 있고 규칙이 있을 때만 해제."""
+        today = _day(now)
+        if self.universe.get("date") != today:
+            reason = f"감시 종목 날짜 {self.universe.get('date')} ≠ 오늘 {today}"
+        elif not self.universe.get("symbols"):
+            reason = f"오늘 감시 종목 없음: {self._universe_detail or '선정 전'}"
+        elif not self.rules:
+            reason = "종목 규칙 미확보"
+        else:
+            self._clear_halt(UNIVERSE)
+            return
+        self._set_halt(UNIVERSE, reason)
 
     def _refresh_universe(self, now: datetime, today: str) -> None:
         self._universe_tried_at = now
@@ -251,13 +286,13 @@ class Engine:
             raise
         if len(symbols) >= UNIVERSE_MIN_COUNT:
             self.universe = {"date": today, "symbols": symbols}
-            self._clear_halt(UNIVERSE)
+            self._universe_detail = ""
         else:
             self._universe_failed(today, detail)
 
     def _universe_failed(self, today: str, detail: str) -> None:
         self.universe = {"date": today, "symbols": []}     # 이전 목록으로 대체하지 않는다
-        self._set_halt(UNIVERSE, detail)
+        self._universe_detail = detail                     # 중단 자체는 _derive_universe_halt가 건다
 
     def _select_universe(self, today: str) -> tuple[list[str], str]:
         res = self._call("symbol_rules")
@@ -296,10 +331,8 @@ class Engine:
     def _reconcile(self) -> None:
         if self.balances is None:                          # 모르면 판정하지 않는다(기존 상태 유지)
             return
-        if self.positions and not self.rules:              # 냉시작: 허용 오차(수량 단위)를 알아야 한다
-            res = self._call("symbol_rules")
-            if res.ok:
-                self.rules = dict(res.value)
+        if self.positions:                                 # 냉시작: 허용 오차(수량 단위)를 알아야 한다
+            self._ensure_rules(self._now)                  # 실패하면 오차 0(fail-closed)
         short = []
         for symbol, pos in self.positions.items():
             rule = self.rules.get(symbol)
@@ -453,6 +486,7 @@ class Engine:
     def entry_allowed(self, now: datetime) -> bool:
         return (not self.halts.active()
                 and self.universe.get("date") == _day(now) and bool(self.universe.get("symbols"))
+                and bool(self.rules)
                 and not in_entry_blackout(now)
                 and len(self.positions) < MAX_POSITIONS)
 
