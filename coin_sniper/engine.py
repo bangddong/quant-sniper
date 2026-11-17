@@ -2,7 +2,7 @@
 
 원칙: 확인하지 못한 것은 "모름"이다. 모르면 신규 주문을 하지 않는다(fail-closed).
 시각은 항상 now 인자(UTC, timezone-aware)로 받는다. 하루 경계는 UTC 0시.
-청산(Task 11)과 진입(Task 12)은 _resolve_intents / _manage_exits / _manage_entries 자리에 끼워 넣는다.
+청산·보호 주문·의도 복구는 execution.Executor(Task 11)에 있고, 진입(Task 12)은 _manage_entries 자리에 넣는다.
 각 단계는 따로 예외를 잡는다: 한 단계가 실패해도 다음 단계(특히 청산)는 실행되고 LOOP_ERROR가 진입을 막는다.
 """
 from __future__ import annotations
@@ -21,9 +21,10 @@ from coin_sniper.config import (
     UNIVERSE_RETRY_SECONDS, Settings,
 )
 from coin_sniper.exchange.base import Exchange, Feed
+from coin_sniper.execution import Executor
 from coin_sniper.halts import (
-    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, RATE_LIMIT, RECON_MISMATCH,
-    UNIVERSE,
+    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, MAINTENANCE, RATE_LIMIT,
+    RECON_MISMATCH, UNIVERSE,
     HaltBoard,
 )
 from coin_sniper.ledger import StateStore, record_event
@@ -94,6 +95,7 @@ class Engine:
         self._prev_loop_at: datetime | None = None
         self._now: datetime | None = None
         self._loop_events: list[dict] = []
+        self.executor = Executor(self, passthrough=(_RateLimited,))   # 주문 절차(매수는 Task 12가 쓴다)
 
     # ---- 시작 ---------------------------------------------------------------------
     def startup(self, now: datetime) -> None:
@@ -190,11 +192,13 @@ class Engine:
 
     # ---- 이후 작업이 채우는 자리 -----------------------------------------------------
     def _resolve_intents(self, now: datetime) -> None:
-        """1단계: 진행 중 주문 의도 해소 (Task 11)."""
+        """1단계: 진행 중 주문 의도 해소."""
+        self.executor.resolve_intents(now)
 
     def _manage_exits(self, now: datetime) -> None:
-        """5단계: 청산과 보호 주문 관리 (Task 11). 앞 단계가 실패해도 불린다:
+        """5단계: 청산과 보호 주문 관리. 앞 단계가 실패해도 불린다:
         self.balances·equity·캔들이 없을 수 있다. positions, rules(마지막 성공값), feed만 믿는다."""
+        self.executor.manage_exits(now)
 
     def _manage_entries(self, now: datetime) -> None:
         """8단계: 진입 (Task 12)."""
@@ -319,6 +323,7 @@ class Engine:
         if res.ok:
             self.balances = dict(res.value)
             self._clear_halt(ACCOUNT_FETCH)
+            self._clear_halt(MAINTENANCE)                  # 계좌 조회가 되면 점검은 끝난 것으로 본다
         elif res.kind != "fatal":
             self._set_halt(ACCOUNT_FETCH, f"계좌 조회 실패: {res.error}")
 
@@ -458,9 +463,9 @@ class Engine:
             self.halts.clear(code)
             self._event("SYSTEM", f"중단 해제: {code}")
 
-    def _event(self, kind: str, reason: str, symbol: str = "") -> None:
+    def _event(self, kind: str, reason: str, symbol: str = "", **fields) -> None:
         event = {"type": kind, "symbol": symbol, "reason": reason,
-                 "timestamp": self._now.isoformat(timespec="seconds")}
+                 "timestamp": self._now.isoformat(timespec="seconds"), **fields}
         self.events = record_event(self.events, event, self._now)
         self._loop_events.append(event)
 

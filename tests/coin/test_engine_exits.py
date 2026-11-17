@@ -1,0 +1,479 @@
+import unittest
+from datetime import timedelta
+from unittest import mock
+
+from coin_sniper import config
+from coin_sniper.halts import DAILY_LOSS, MAINTENANCE, ORDER_UNCONFIRMED, PROTECTIVE_CANCEL
+from coin_sniper.ledger import add_intent
+from coin_sniper.models import ApiResult, OrderState, SymbolRules
+from coin_sniper.risk import account_value
+
+from helpers import DEFAULT_PRICES, add_position, make_engine, position, restart_engine, utc
+
+T0 = utc(2026, 11, 17, 12)
+SEC = timedelta(seconds=1)
+HOUR = timedelta(hours=1)
+SYM = "SOLUSDT"
+TRANSIENT = ApiResult(False, kind="transient", error="HTTP 503")
+
+
+class Crash(BaseException):
+    """프로세스가 죽는 것을 흉내 낸다(엔진의 except Exception에 잡히지 않는다)."""
+
+
+def codes(report) -> set[str]:
+    return {h["code"] for h in report.halts}
+
+
+def names(ex) -> list[str]:
+    return [n for n, _ in ex.calls]
+
+
+def calls(ex, name: str) -> list[dict]:
+    return [p for n, p in ex.calls if n == name]
+
+
+class EngineExitTests(unittest.TestCase):
+    def build(self, price=100.0, qty=1.0, buy=100.0, symbol=SYM, rule_overrides=None, **fields):
+        eng, ex, feed, store = make_engine(test=self, rule_overrides=rule_overrides)
+        eng.startup(T0)
+        add_position(eng, ex, symbol, qty, buy, **fields)
+        self.price(ex, feed, price, symbol)
+        return eng, ex, feed, store
+
+    @staticmethod
+    def price(ex, feed, value, symbol=SYM):
+        ex.set_price(symbol, value)
+        feed.set_quote(symbol, value)
+
+    @staticmethod
+    def trades(store) -> list[dict]:
+        return store.load("trades", [])
+
+    # ---- 봇 청산 -------------------------------------------------------------------
+    def test_stop_hit_sells_at_market_and_records_net_pnl(self):
+        eng, ex, feed, store = self.build(price=92.0, stop_loss_pct=0.07, stop_price=93.0)
+        r = eng.run_once(T0)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual((t["type"], t["symbol"], t["reason"]), ("SELL", SYM, "동적 손절"))
+        self.assertAlmostEqual(t["qty"], 1.0)
+        self.assertAlmostEqual(t["price"], 92.0)
+        self.assertAlmostEqual(t["quote_qty"], 92.0)
+        self.assertAlmostEqual(t["fees"]["USDT"], 0.092)
+        self.assertAlmostEqual(t["entry_price"], 100.0)
+        self.assertAlmostEqual(t["gross_pnl"], -8.0)
+        self.assertAlmostEqual(t["net_pnl"], 92.0 - 0.092 - 100.0)
+        self.assertAlmostEqual(t["net_return_pct"], (92.0 - 0.092 - 100.0) / 100.0 * 100)
+        self.assertAlmostEqual(t["slippage_pct"], 0.0)
+        self.assertTrue(t["counted"])
+        self.assertEqual(t["dust_writeoff"], 0)
+        self.assertEqual(t["strategy"], "vbo")
+        self.assertEqual(t["time"], T0.isoformat())
+        self.assertTrue(t["client_id"].startswith("cs-d-ex-"))
+        self.assertAlmostEqual(store.load("risk_state", {})["realized_pnl"], t["net_pnl"])
+        self.assertEqual(store.load("positions", {}), {})
+        self.assertEqual(store.load("intents", {}), {})
+        sells = [e for e in r.events if e["type"] == "SELL"]
+        self.assertEqual(len(sells), 1)
+        self.assertAlmostEqual(sells[0]["net_return_pct"], t["net_return_pct"])
+        self.assertEqual(sells[0]["symbol"], SYM)
+
+    def test_bot_exit_cancels_protective_order_before_selling(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(prot["state"], "open")
+        self.price(ex, feed, 92.0)
+        eng.run_once(T0 + 30 * SEC)
+        seq = names(ex)
+        self.assertIn("cancel_order", seq)
+        self.assertLess(seq.index("cancel_order"), seq.index("market_sell"))
+        self.assertEqual(calls(ex, "cancel_order")[0]["client_id"], prot["client_id"])
+        self.assertEqual(len(self.trades(store)), 1)
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_protective_cancel_failure_blocks_sell_and_sets_halt(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        self.price(ex, feed, 92.0)
+        ex.fail_next("cancel_order", TRANSIENT)
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertEqual(calls(ex, "market_sell"), [])
+        self.assertIn(PROTECTIVE_CANCEL, codes(r))
+        self.assertIn(SYM, [h for h in r.halts if h["code"] == PROTECTIVE_CANCEL][0]["detail"])
+        self.assertIn(SYM, store.load("positions", {}))
+        self.assertEqual(self.trades(store), [])
+        r2 = eng.run_once(T0 + 60 * SEC)
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+        self.assertNotIn(PROTECTIVE_CANCEL, codes(r2))
+        self.assertEqual(len(self.trades(store)), 1)
+
+    def test_time_stop_exits_after_168_hours(self):
+        entry = T0 - 168 * HOUR + 60 * SEC
+        eng, ex, feed, store = self.build(entry_time=entry.isoformat())
+        eng.run_once(T0)                                   # 167시간 59분: 유지
+        self.assertEqual(calls(ex, "market_sell"), [])
+        eng.run_once(T0 + 60 * SEC)                         # 168시간: 청산
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["reason"], "타임스탑 (168시간 경과)")
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_position_older_than_168h_exits_on_first_loop_after_restart(self):
+        eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": 1.0})
+        pos = position(SYM, 1.0, 100.0)
+        pos["entry_time"] = (T0 - 240 * HOUR).isoformat()
+        store.save("positions", {SYM: pos})
+        eng.startup(T0)
+        eng.run_once(T0)
+        trades = self.trades(store)
+        self.assertEqual([t["reason"] for t in trades], ["타임스탑 (168시간 경과)"])
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_protect_then_trail_stop_levels_are_persisted(self):
+        eng, ex, feed, store = self.build()
+        self.price(ex, feed, 107.0)
+        eng.run_once(T0)
+        pos = store.load("positions", {})[SYM]
+        self.assertAlmostEqual(pos["stop_price"], 101.5)
+        self.assertAlmostEqual(pos["highest_price"], 107.0)
+        self.assertFalse(pos["trailing_active"])
+        self.price(ex, feed, 113.0)
+        eng.run_once(T0 + 30 * SEC)
+        pos = store.load("positions", {})[SYM]
+        self.assertAlmostEqual(pos["stop_price"], 113.0 * 0.95)
+        self.assertTrue(pos["trailing_active"])
+        self.price(ex, feed, 110.0)
+        eng.run_once(T0 + 60 * SEC)
+        pos = store.load("positions", {})[SYM]
+        self.assertAlmostEqual(pos["stop_price"], 113.0 * 0.95)       # 내려가지 않는다
+        self.assertAlmostEqual(pos["highest_price"], 113.0)
+        self.assertEqual(calls(ex, "market_sell"), [])
+
+    def test_protective_order_replaced_only_after_min_move(self):
+        eng, ex, feed, store = self.build(stop_loss_pct=0.07, stop_price=93.0)
+        eng.run_once(T0)
+        first = store.load("positions", {})[SYM]["protective"]
+        self.assertAlmostEqual(first["stop_price"], 93.0)
+        eng.positions[SYM]["stop_price"] = 93.3              # 0.5% 미만 상승
+        eng.run_once(T0 + 30 * SEC)
+        self.assertEqual(len(calls(ex, "place_stop")), 1)
+        self.assertEqual(calls(ex, "cancel_order"), [])
+        self.assertEqual(store.load("positions", {})[SYM]["protective"]["client_id"], first["client_id"])
+        self.price(ex, feed, 107.0)                         # 보호선 101.5
+        eng.run_once(T0 + 60 * SEC)
+        self.assertEqual([p["client_id"] for p in calls(ex, "cancel_order")], [first["client_id"]])
+        places = calls(ex, "place_stop")
+        self.assertEqual(len(places), 2)
+        self.assertAlmostEqual(places[1]["stop_price"], 101.5)
+        seq = names(ex)
+        self.assertLess(seq.index("cancel_order"), len(seq) - 1 - seq[::-1].index("place_stop"))
+        now = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual((now["state"], now["client_id"]), ("open", places[1]["client_id"]))
+
+    def test_protective_prices_and_qty_are_floored_to_tick_and_step(self):
+        sol = SymbolRules(symbol=SYM, base="SOL", quote="USDT", trading=True,
+                          step_size=0.001, tick_size=0.01, min_notional=5.0)
+        eng, ex, feed, store = self.build(qty=1.0005, stop_loss_pct=0.069813, stop_price=93.0187,
+                                          rule_overrides={SYM: sol})
+        eng.run_once(T0)
+        place = calls(ex, "place_stop")[0]
+        self.assertEqual(place["stop_price"], 93.01)
+        self.assertEqual(place["limit_price"], 92.07)       # floor(93.01 × 0.99 = 92.0799)
+        self.assertEqual(place["qty"], 1.0)
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual((prot["stop_price"], prot["limit_price"], prot["qty"]), (93.01, 92.07, 1.0))
+
+    # ---- 거래소 손절 -----------------------------------------------------------------
+    def test_exchange_stop_filled_first_is_recorded_as_sell(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        cid = store.load("positions", {})[SYM]["protective"]["client_id"]
+        self.price(ex, feed, 94.0)
+        ex.trigger_stops()
+        eng.run_once(T0 + 30 * SEC)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual((t["reason"], t["client_id"]), ("거래소 손절", cid))
+        self.assertAlmostEqual(t["price"], 94.05)
+        self.assertIsNone(t["slippage_pct"])
+        self.assertAlmostEqual(t["net_pnl"], 94.05 * 0.999 - 100.0)
+        self.assertEqual(store.load("positions", {}), {})
+        self.assertEqual(calls(ex, "market_sell"), [])
+
+    def test_exchange_stop_filled_during_bot_exit_is_recorded_once(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        cid = store.load("positions", {})[SYM]["protective"]["client_id"]
+        self.price(ex, feed, 92.0)
+        stale = OrderState(client_id=cid, symbol=SYM, side="SELL", status="NEW")
+        ex.fail_next("get_order", ApiResult(True, value=stale))   # 확인 시점엔 아직 걸려 있었다
+        ex.trigger_stops()                                  # 취소 직전에 거래소가 체결
+        eng.run_once(T0 + 30 * SEC)
+        trades = self.trades(store)
+        self.assertEqual([t["reason"] for t in trades], ["거래소 손절"])
+        self.assertEqual(calls(ex, "market_sell"), [])
+        self.assertFalse(eng.halts.is_set(PROTECTIVE_CANCEL))
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_missing_protective_order_is_replaced_with_risk_event(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        cid = store.load("positions", {})[SYM]["protective"]["client_id"]
+        ex.cancel_order(SYM, cid)                            # 잔고 잠금 해제
+        del ex._orders[cid]                                  # 거래소가 모르는 주문
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertIn(("RISK", SYM, "보호 주문 없음: 재등록"),
+                      [(e["type"], e["symbol"], e["reason"]) for e in r.events])
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(prot["state"], "open")
+        self.assertNotEqual(prot["client_id"], cid)
+        self.assertEqual(len(calls(ex, "place_stop")), 2)
+
+    def test_canceled_protective_order_is_replaced_with_risk_event(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        cid = store.load("positions", {})[SYM]["protective"]["client_id"]
+        ex.cancel_order(SYM, cid)                            # 사람이 거래소에서 취소
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertIn("보호 주문 없음: 재등록", [e["reason"] for e in r.events if e["type"] == "RISK"])
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(prot["state"], "open")
+        self.assertNotEqual(prot["client_id"], cid)
+        self.assertEqual(self.trades(store), [])
+
+    def test_pending_protective_resolved_after_dropped_place_response(self):
+        eng, ex, feed, store = self.build()
+        ex.drop_response_next("place_stop")                  # 주문은 걸렸는데 응답이 사라짐
+        eng.run_once(T0)
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(prot["state"], "pending")
+        eng.run_once(T0 + 30 * SEC)
+        again = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual((again["state"], again["client_id"]), ("open", prot["client_id"]))
+        self.assertEqual(len(calls(ex, "place_stop")), 1)
+
+    def test_pending_protective_never_placed_is_replaced(self):
+        eng, ex, feed, store = self.build()
+        ex.fail_next("place_stop", TRANSIENT)                # 주문이 거래소에 닿지 않음
+        eng.run_once(T0)
+        prot = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(prot["state"], "pending")
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertIn("보호 주문 없음: 재등록", [e["reason"] for e in r.events])
+        again = store.load("positions", {})[SYM]["protective"]
+        self.assertEqual(again["state"], "open")
+        self.assertNotEqual(again["client_id"], prot["client_id"])
+
+    def test_protective_stops_disabled_never_calls_place_stop(self):
+        with mock.patch.object(config, "PROTECTIVE_STOPS_ENABLED", False):
+            eng, ex, feed, store = self.build()
+            eng.run_once(T0)
+            self.assertIsNone(store.load("positions", {})[SYM]["protective"])
+            self.price(ex, feed, 92.0)
+            eng.run_once(T0 + 30 * SEC)
+        self.assertEqual(calls(ex, "place_stop"), [])
+        self.assertEqual(calls(ex, "cancel_order"), [])
+        self.assertEqual(len(self.trades(store)), 1)
+
+    # ---- 부분 체결과 잔량 --------------------------------------------------------------
+    def test_partial_sell_keeps_remainder_and_retries(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        ex.set_fill_ratio(0.4)
+        eng.run_once(T0)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        self.assertAlmostEqual(trades[0]["qty"], 0.4)
+        self.assertAlmostEqual(trades[0]["net_pnl"], 0.4 * 92 * 0.999 - 40.0)
+        pos = store.load("positions", {})[SYM]
+        self.assertAlmostEqual(pos["qty"], 0.6)
+        self.assertAlmostEqual(pos["cost"], 60.0)
+        self.assertEqual(eng.metrics.summary(T0, 1)["orders_partial"], 1)
+        eng.run_once(T0 + 30 * SEC)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 2)
+        self.assertAlmostEqual(trades[1]["qty"], 0.6)
+        self.assertEqual(store.load("positions", {}), {})
+        total = sum(t["net_pnl"] for t in trades)
+        self.assertAlmostEqual(store.load("risk_state", {})["realized_pnl"], total)
+
+    def test_remainder_below_min_notional_becomes_dust(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        cash_before, _ = account_value(eng.risk_state, eng.positions, {SYM: 92.0})
+        usdt_before = ex.balances().value["USDT"][0]
+        ex.set_fill_ratio(0.95)                              # 남은 0.05 × 92 = 4.6 < 5
+        r = eng.run_once(T0)
+        self.assertEqual(store.load("positions", {}), {})
+        dust = store.load("dust", [])
+        self.assertEqual(len(dust), 1)
+        self.assertEqual((dust[0]["symbol"], dust[0]["time"]), (SYM, T0.isoformat()))
+        self.assertAlmostEqual(dust[0]["qty"], 0.05)
+        t = self.trades(store)[0]
+        self.assertAlmostEqual(t["dust_writeoff"], 5.0)
+        self.assertAlmostEqual(t["net_pnl"], 0.95 * 92 * 0.999 - 100.0)
+        # 가상 현금은 실제로 들어온 돈만큼만 늘어난다(잔량 원가는 손실로 처리)
+        proceeds = ex.balances().value["USDT"][0] - usdt_before
+        self.assertAlmostEqual(r.cash, cash_before + proceeds)
+        self.assertAlmostEqual(store.load("risk_state", {})["realized_pnl"], t["net_pnl"])
+
+    # ---- 확인되지 않은 주문과 의도 복구 ---------------------------------------------------
+    def test_unconfirmed_sell_keeps_position_and_sets_halt(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        sleeps: list[float] = []
+        eng.sleep = sleeps.append
+        ex.fail_next("get_order", TRANSIENT, times=config.ORDER_CONFIRM_TIMEOUT_SECONDS)
+        r = eng.run_once(T0)
+        self.assertIn(ORDER_UNCONFIRMED, codes(r))
+        self.assertFalse(r.entry_allowed)
+        self.assertAlmostEqual(store.load("positions", {})[SYM]["qty"], 1.0)
+        self.assertEqual(len(store.load("intents", {})), 1)
+        self.assertEqual(self.trades(store), [])
+        self.assertEqual(len(calls(ex, "get_order")), config.ORDER_CONFIRM_TIMEOUT_SECONDS)
+        self.assertEqual(sleeps.count(1), config.ORDER_CONFIRM_TIMEOUT_SECONDS - 1)
+        self.assertEqual(eng.metrics.summary(T0, 1)["orders_unconfirmed"], 1)
+        r2 = eng.run_once(T0 + 30 * SEC)                    # 다음 루프에 조회 성공 → 반영
+        self.assertNotIn(ORDER_UNCONFIRMED, codes(r2))
+        self.assertEqual(len(self.trades(store)), 1)
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertEqual(len(calls(ex, "market_sell")), 1)  # 다시 보내지 않는다
+
+    def test_no_new_sell_while_previous_sell_is_unconfirmed(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        ex.fail_next("get_order", TRANSIENT, times=config.ORDER_CONFIRM_TIMEOUT_SECONDS + 1)
+        eng.run_once(T0)
+        r = eng.run_once(T0 + 30 * SEC)                     # 1단계 조회도 실패: 결과를 여전히 모른다
+        self.assertIn(ORDER_UNCONFIRMED, codes(r))
+        self.assertEqual(len(calls(ex, "market_sell")), 1)  # 손절 조건이어도 다시 팔지 않는다
+        self.assertEqual(len(store.load("intents", {})), 1)
+
+    def test_pending_intent_resolved_after_crash(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        ex.drop_response_next("market_sell")                 # 체결은 됐는데 응답이 사라짐
+        ex.fail_next("get_order", TRANSIENT)
+
+        def die(_s):
+            raise Crash()
+        eng.sleep = die                                      # 확인 중에 프로세스가 죽는다
+        with self.assertRaises(Crash):
+            eng.run_once(T0)
+        self.assertEqual(len(store.load("intents", {})), 1)  # 보내기 전에 저장됐다
+        eng2 = restart_engine(eng, T0 + 30 * SEC)
+        eng2.run_once(T0 + 30 * SEC)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["reason"], "동적 손절")
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertEqual(store.load("positions", {}), {})
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+
+    def test_fill_applied_once_when_crash_before_intent_removed(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        real_save = store.save
+
+        def save(name, data):
+            if name == "risk_state":                         # 체결 기록·포지션 저장 뒤, 의도 삭제 전
+                raise Crash()
+            real_save(name, data)
+        store.save = save
+        with self.assertRaises(Crash):
+            eng.run_once(T0)
+        store.save = real_save
+        self.assertEqual(len(self.trades(store)), 1)
+        self.assertEqual(len(store.load("intents", {})), 1)
+        eng2 = restart_engine(eng, T0 + 30 * SEC)
+        eng2.run_once(T0 + 30 * SEC)
+        trades = self.trades(store)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertEqual(store.load("positions", {}), {})
+        self.assertAlmostEqual(store.load("risk_state", {})["realized_pnl"], trades[0]["net_pnl"])
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+
+    def test_intent_for_order_exchange_never_saw_is_dropped(self):
+        eng, ex, feed, store = make_engine(test=self)
+        intents = add_intent({}, "cs-d-ex-000000000000", SYM, "SELL", 1.0, "exit", "동적 손절", T0)
+        store.save("intents", intents)
+        eng.startup(T0)
+        add_position(eng, ex, SYM, 1.0, 100.0)
+        r = eng.run_once(T0)
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertAlmostEqual(store.load("positions", {})[SYM]["qty"], 1.0)
+        self.assertEqual(self.trades(store), [])
+        self.assertNotIn(ORDER_UNCONFIRMED, codes(r))
+        self.assertNotIn(MAINTENANCE, codes(r))
+        self.assertEqual([e for e in r.events if e["type"] == "RISK"], [])
+
+    # ---- 보류와 중단 ------------------------------------------------------------------
+    def test_exit_skipped_when_quote_missing(self):
+        eng, ex, feed, store = self.build()
+        ex.set_price(SYM, 90.0)
+        feed.set_quote(SYM, 90.0, age=config.QUOTE_MAX_AGE_SECONDS + 1)
+        r = eng.run_once(T0)
+        self.assertEqual(calls(ex, "market_sell"), [])
+        self.assertIn(("RISK", SYM, "실시간 시세 없음: 청산 판단 보류"),
+                      [(e["type"], e["symbol"], e["reason"]) for e in r.events])
+        self.assertIn(SYM, store.load("positions", {}))
+
+    def test_untradable_symbol_rejection_does_not_spam(self):
+        prices = dict(DEFAULT_PRICES, XUSDT=100.0)
+        eng, ex, feed, store = make_engine(prices=prices, test=self)
+        eng.startup(T0)
+        add_position(eng, ex, "XUSDT", 1.0, 100.0)
+        add_position(eng, ex, SYM, 1.0, 100.0)
+        self.price(ex, feed, 90.0, "XUSDT")
+        self.price(ex, feed, 92.0, SYM)
+        ex.set_trading("XUSDT", False)
+        for i in range(5):
+            r = eng.run_once(T0 + 30 * i * SEC)
+            self.assertNotIn(ORDER_UNCONFIRMED, codes(r))
+            self.assertNotIn(MAINTENANCE, codes(r))
+        risk = [e for e in store.load("events", []) if e["type"] == "RISK" and e["symbol"] == "XUSDT"]
+        self.assertEqual(len(risk), 1)
+        self.assertEqual(risk[0]["count"], 5)
+        self.assertTrue(risk[0]["reason"].startswith("매도 거절: "))
+        self.assertIn("XUSDT", store.load("positions", {}))
+        self.assertNotIn(SYM, store.load("positions", {}))    # 다른 종목 청산은 막히지 않는다
+
+    def test_exits_run_even_when_entry_halted(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        eng.halts.set(DAILY_LOSS, "일일 손실 -5.00%", T0)
+        self.price(ex, feed, 92.0)
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertIn(DAILY_LOSS, codes(r))
+        self.assertEqual(len(self.trades(store)), 1)
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_order_refused_during_maintenance_sets_halt_and_retries_later(self):
+        eng, ex, feed, store = self.build(price=92.0)
+        ex.fail_next("market_sell", TRANSIENT)
+        r = eng.run_once(T0)
+        self.assertIn(MAINTENANCE, codes(r))
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertIn(SYM, store.load("positions", {}))
+        self.assertEqual(self.trades(store), [])
+        r2 = eng.run_once(T0 + 30 * SEC)
+        self.assertNotIn(MAINTENANCE, codes(r2))
+        self.assertEqual(len(calls(ex, "market_sell")), 2)
+        self.assertEqual(len(self.trades(store)), 1)
+        self.assertEqual(store.load("positions", {}), {})
+
+    def test_exit_without_symbol_rules_sends_nothing(self):
+        prices = dict(DEFAULT_PRICES)
+        eng, ex, feed, store = make_engine(prices=prices, test=self)
+        eng.startup(T0)
+        add_position(eng, ex, "ZZZUSDT", 1.0, 100.0)         # 거래소 규칙에 없는 종목
+        feed.set_quote("ZZZUSDT", 90.0)
+        r = eng.run_once(T0)
+        self.assertNotIn("ZZZUSDT", eng.rules)
+        self.assertEqual(calls(ex, "market_sell"), [])
+        self.assertEqual(calls(ex, "place_stop"), [])
+        self.assertIn(("RISK", "ZZZUSDT"), [(e["type"], e["symbol"]) for e in r.events])
+        self.assertIn("ZZZUSDT", store.load("positions", {}))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import weakref
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from coin_sniper.config import Settings
@@ -58,6 +59,7 @@ def make_settings(state_dir: Path, starting_capital: float = 1000.0) -> Settings
 def make_engine(prices: dict[str, float] | None = None, balances: dict[str, float] | None = None,
                 starting_capital: float = 1000.0, today: date = TODAY,
                 state_dir: Path | None = None, test: unittest.TestCase | None = None,
+                rule_overrides: dict[str, SymbolRules] | None = None,
                 ) -> tuple[Engine, FakeExchange, FakeFeed, StateStore]:
     """기본값: 7개 통과 종목(BTCUSDT 포함, 일봉 70개), 가격·신선한 시세, USDT 10000.
     startup은 부르지 않는다. 직접 만든 임시 상태 폴더는 test.addCleanup(없으면 엔진 소멸 시)으로 지운다."""
@@ -68,6 +70,7 @@ def make_engine(prices: dict[str, float] | None = None, balances: dict[str, floa
     else:
         owned = False
     rules = {s: rule(s, 0.00001 if s == "BTCUSDT" else 0.001) for s in prices}
+    rules.update(rule_overrides or {})
     ex = FakeExchange(rules, {"USDT": 10000.0} if balances is None else balances)
     feed = FakeFeed()
     for symbol, price in prices.items():
@@ -83,3 +86,23 @@ def make_engine(prices: dict[str, float] | None = None, balances: dict[str, floa
         else:
             weakref.finalize(engine, shutil.rmtree, state_dir, True)
     return engine, ex, feed, store
+
+
+def add_position(engine: Engine, exchange: FakeExchange, symbol: str, qty: float, buy_price: float,
+                 **fields) -> dict:
+    """startup 뒤에 부른다: 장부에 포지션을 넣어 저장하고, 가짜 거래소에 같은 수량의 기초 자산을 넣는다."""
+    pos = position(symbol, qty, buy_price)
+    pos.update(fields)
+    engine.positions[symbol] = pos
+    engine.store.save("positions", engine.positions)
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    exchange._account(base)[0] += Decimal(repr(float(qty)))
+    return pos
+
+
+def restart_engine(engine: Engine, now: datetime, sleep=None) -> Engine:
+    """같은 상태 폴더·거래소·피드로 새 엔진을 만들어 startup까지 한다(프로세스 재시작 흉내)."""
+    fresh = Engine(engine.exchange, engine.feed, StateStore(engine.store.state_dir), Metrics(),
+                   engine.settings, sleep=sleep or (lambda _s: None))
+    fresh.startup(now)
+    return fresh

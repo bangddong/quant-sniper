@@ -21,6 +21,11 @@ def codes(report: LoopReport) -> set[str]:
     return {h["code"] for h in report.halts}
 
 
+def wide_stop_position() -> dict:
+    """60까지 떨어져도 손절되지 않는 포지션(청산이 평가액 시나리오를 바꾸지 않게)."""
+    return dict(position("SOLUSDT", 1.0, 100), stop_loss_pct=0.5, stop_price=50.0)
+
+
 def calls_named(ex, name: str) -> int:
     return sum(1 for n, _ in ex.calls if n == name)
 
@@ -113,7 +118,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(eng.snapshot(T0)["universe"], [])
 
     def test_day_rollover_resets_daily_baseline_and_appends_equity(self):
-        eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
+        eng, ex, feed, store = self.build(positions={"SOLUSDT": wide_stop_position()},
                                           balances={"USDT": 10000.0, "SOL": 1.0})
         feed.set_quote("SOLUSDT", 100)
         eng.run_once(T0)
@@ -191,7 +196,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertTrue(snap["entry_allowed"])
 
     def test_daily_loss_halts_until_next_utc_day(self):
-        eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
+        eng, ex, feed, store = self.build(positions={"SOLUSDT": wide_stop_position()},
                                           balances={"USDT": 10000.0, "SOL": 1.0})
         eng.run_once(T0)
         feed.set_quote("SOLUSDT", 60)
@@ -545,7 +550,7 @@ class EngineStateTests(unittest.TestCase):
         eng2 = Engine(ex, feed, store, Metrics(store.load("metrics", {})), eng.settings,
                       sleep=lambda _s: None)
         eng2.startup(T0 + 60 * SEC)
-        self.assertEqual(eng2.positions, {"SOLUSDT": position("SOLUSDT", 1.0, 100)})
+        self.assertEqual(eng2.positions, eng.positions)      # 고점·손절선·보호 주문까지 그대로
         self.assertEqual(eng2.risk_state["peak_equity"], 1020)
         self.assertTrue(eng2.halts.is_set(FEED_STALE))
         self.assertEqual(eng2.universe["date"], "2026-11-17")
