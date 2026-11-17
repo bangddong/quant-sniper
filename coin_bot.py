@@ -311,11 +311,19 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
         realized -= cost                                  # 사라진 돈: 가상 현금이 늘지 않게 원가를 실현 손익에서 뺀다
     intents = {cid: i for cid, i in intents.items() if cid not in dropped}
     risk_state["realized_pnl"] = realized
-    if removed or reset_capital:
+    history = None
+    if removed or reset_capital:                          # 수익률 새 구간: 이전 기록은 지우지 않고 이전 구간으로 표시한다
+        old_segment = risk_state.get("segment_start")
+        history = store.load("equity_history", [])
+        for row in history:
+            if old_segment and not row.get("segment"):
+                row["segment"] = old_segment
         risk_state["segment_start"] = now.isoformat()
+        risk_state.update(segment_kind="reconcile", segment_base_equity=None)   # 봇이 다음 첫 평가액으로 채운다
     if reset_capital:
         risk_state.update(starting_capital=capital, realized_pnl=0.0, peak_equity=capital,
-                          day_open_equity=None, pending_equity_row=None)
+                          day_open_equity=None, pending_equity_row=None,
+                          segment_kind="capital", segment_base_equity=capital)
     reasons = [f"{MANUAL_REASON}: {', '.join(removed)}"] if removed else [MANUAL_REASON]
     if reset_capital:
         reasons.append("시작 자본 재설정")
@@ -323,6 +331,8 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
                                    "timestamp": now.isoformat(timespec="seconds")}, now)
 
     store.save("trades", trades)
+    if history is not None:
+        store.save("equity_history", history)
     store.save("risk_state", risk_state)
     store.save("positions", positions)
     store.save("intents", intents)

@@ -137,9 +137,14 @@ class Metrics:
         }}
 
 
-def append_equity(history: list[dict], day: str, equity: float, btc_close: float) -> list[dict]:
+def append_equity(history: list[dict], day: str, equity: float, btc_close: float,
+                  segment: str | None = None) -> list[dict]:
+    """segment: 그 줄이 속한 수익률 구간(risk_state.segment_start). 주면 줄에 남긴다."""
     rows = [r for r in history if r["day"] != day]
-    rows.append({"day": day, "equity": equity, "btc": btc_close})
+    row = {"day": day, "equity": equity, "btc": btc_close}
+    if segment is not None:
+        row["segment"] = segment
+    rows.append(row)
     rows.sort(key=lambda r: r["day"])
     return rows
 

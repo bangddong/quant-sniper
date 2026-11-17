@@ -239,6 +239,78 @@ class ReconcileTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(self.snapshot_files(), before)
 
 
+class SegmentTests(unittest.TestCase):
+    """수익률 구간: reconcile/--reset-capital 뒤 기간별·주간 수익률이 이전 구간 줄과 섞이지 않는다 (F3)."""
+    T = utc(2026, 11, 17, 12)
+
+    def engine(self, **kw):
+        from helpers import make_engine
+        eng, ex, feed, store = make_engine(test=self, **kw)
+        eng.startup(self.T)
+        return eng, ex, feed, store
+
+    def reconcile(self, eng, ex, at, reset):
+        with redirect_stdout(io.StringIO()):
+            coin_bot.reconcile(StateStore(eng.store.state_dir), ex, at, reset, starting_capital=1000.0)
+
+    def test_reset_capital_starts_new_segment_without_fake_jump(self):
+        from helpers import restart_engine
+        eng, ex, feed, store = self.engine()
+        eng.risk_state["realized_pnl"] = -150.0
+        eng.equity_history = [{"day": f"2026-11-{d:02d}", "equity": 850.0, "btc": 80000.0} for d in range(1, 17)]
+        eng.run_once(self.T)
+        self.assertEqual(eng.equity, 850.0)
+        self.reconcile(eng, ex, self.T + timedelta(seconds=60), True)
+        eng2 = restart_engine(eng, self.T + timedelta(seconds=90))
+        eng2.run_once(self.T + timedelta(seconds=90))
+        self.assertEqual(eng2.equity, 1000.0)
+        snap = eng2.snapshot(self.T + timedelta(seconds=90))
+        for key in ("1d", "7d", "30d", "all"):
+            self.assertIsNone(snap["returns"][key]["bot"], key)            # 850 → 1000 점프를 보이지 않는다
+        self.assertEqual(snap["weekly_equity"], [])
+        start = snap["returns"]["start"]
+        self.assertEqual((start["kind"], start["bot"]), ("capital", 0.0))
+        self.assertIn("| 시작 자본 대비 (2026-11-17부터) | +0.00% | - |", coin_bot.render_dashboard(snap))
+        self.assertEqual(len(eng2.store.load("equity_history", [])), 16)   # 이전 기록은 지우지 않는다
+        day2 = utc(2026, 11, 18, 0, 20)
+        eng2.run_once(day2)                                                  # 새 구간의 첫 줄
+        snap = eng2.snapshot(day2)
+        self.assertEqual(snap["returns"]["1d"]["base_day"], "2026-11-17")
+        self.assertEqual(snap["returns"]["1d"]["bot"], 0.0)
+
+    def test_reconcile_without_reset_measures_from_segment_start_equity(self):
+        from helpers import add_position, restart_engine
+        eng, ex, feed, store = self.engine()
+        add_position(eng, ex, "ETHUSDT", 0.1, 3000.0)
+        eng.positions["SOLUSDT"] = position("SOLUSDT", 1.0, 100.0)          # 거래소에 없는 포지션
+        eng.store.save("positions", eng.positions)
+        eng.run_once(self.T)
+        self.reconcile(eng, ex, self.T + timedelta(seconds=60), False)
+        rs = eng.store.load("risk_state", {})
+        self.assertEqual((rs["segment_kind"], rs["segment_base_equity"]), ("reconcile", None))
+        eng2 = restart_engine(eng, self.T + timedelta(seconds=90))
+        eng2.run_once(self.T + timedelta(seconds=90))
+        self.assertAlmostEqual(eng2.equity, 900.0)                          # 1000 − SOL 원가 100
+        self.assertAlmostEqual(eng2.risk_state["segment_base_equity"], 900.0)
+        ex.set_price("ETHUSDT", 3300.0)
+        feed.set_quote("ETHUSDT", 3300.0)
+        eng2.run_once(self.T + timedelta(seconds=120))
+        snap = eng2.snapshot(self.T + timedelta(seconds=120))
+        self.assertAlmostEqual(snap["returns"]["start"]["bot"], (930.0 / 900.0 - 1) * 100)
+        self.assertEqual(snap["returns"]["start"]["kind"], "reconcile")
+        self.assertIn("| 구간 시작 대비 (2026-11-17부터) | +3.33% | - |", coin_bot.render_dashboard(snap))
+
+    def test_reconcile_stamps_old_rows_with_previous_segment(self):
+        eng, ex, feed, store = self.engine()
+        first = eng.risk_state["segment_start"]
+        eng.equity_history = [{"day": "2026-11-15", "equity": 990.0, "btc": 1.0}]
+        eng.positions["SOLUSDT"] = position("SOLUSDT", 1.0, 100.0)
+        eng.run_once(self.T)
+        self.reconcile(eng, ex, self.T + timedelta(seconds=60), False)
+        rows = eng.store.load("equity_history", [])
+        self.assertEqual(rows, [{"day": "2026-11-15", "equity": 990.0, "btc": 1.0, "segment": first}])
+
+
 class MainTests(TempStateMixin, unittest.TestCase):
     def call_main(self, argv, env=None, stdin=None):
         def settings_in_tmp(e):

@@ -136,7 +136,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(rs["day"], "2026-11-18")
         self.assertEqual(rs["day_open_equity"], 970)
         self.assertEqual(store.load("equity_history", []),
-                         [{"day": "2026-11-17", "equity": 960, "btc": btc[-2]["close"]}])
+                         [{"day": "2026-11-17", "equity": 960, "btc": btc[-2]["close"], "segment": T0.isoformat()}])
         self.assertNotIn("pending_equity_row", rs)
 
     def test_restart_after_days_offline_rebuilds_day_state(self):
@@ -160,7 +160,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(eng.metrics.summary(T0, None)["restarts"], 1)
         btc_on_day = next(c["close"] for c in trending_candles(70, 72000, 270) if c["date"] == "2026-11-13")
         self.assertEqual(store.load("equity_history", []),
-                         [{"day": "2026-11-13", "equity": 1000.0, "btc": btc_on_day}])   # 날짜로 고른 종가
+                         [{"day": "2026-11-13", "equity": 1000.0, "btc": btc_on_day, "segment": old.isoformat()}])   # 날짜로 고른 종가
         self.assertNotIn("pending_equity_row", rs)
 
     def test_ledger_qty_missing_on_exchange_sets_recon_halt(self):
@@ -435,7 +435,7 @@ class EngineStateTests(unittest.TestCase):
         eng.run_once(day2)                                   # 날짜는 넘어갔지만 기록 전에 실패
         self.assertEqual(store.load("equity_history", []), [])
         self.assertEqual(store.load("risk_state", {})["pending_equity_row"],
-                         {"day": "2026-11-17", "equity": 1000.0})
+                         {"day": "2026-11-17", "equity": 1000.0, "segment": T0.isoformat()})
         btc = trending_candles(70, 50000, 100, today=date(2026, 11, 18))
         ex.set_candles("BTCUSDT", btc)
         eng2 = Engine(ex, feed, store, Metrics(store.load("metrics", {})), eng.settings,
@@ -443,7 +443,7 @@ class EngineStateTests(unittest.TestCase):
         eng2.startup(day2 + 30 * SEC)
         eng2.run_once(day2 + 30 * SEC)
         self.assertEqual(store.load("equity_history", []),
-                         [{"day": "2026-11-17", "equity": 1000.0, "btc": btc[-2]["close"]}])
+                         [{"day": "2026-11-17", "equity": 1000.0, "btc": btc[-2]["close"], "segment": T0.isoformat()}])
         self.assertNotIn("pending_equity_row", store.load("risk_state", {}))
 
     def test_pending_equity_row_older_than_candles_gets_no_btc(self):
@@ -456,7 +456,7 @@ class EngineStateTests(unittest.TestCase):
         eng.startup(T0)
         eng.run_once(T0)
         self.assertEqual(store.load("equity_history", []),
-                         [{"day": "2026-08-01", "equity": 1000.0, "btc": None}])
+                         [{"day": "2026-08-01", "equity": 1000.0, "btc": None, "segment": old.isoformat()}])
 
     def test_pending_equity_row_waits_while_candles_lack_its_day(self):
         eng, ex, feed, store = self.build()

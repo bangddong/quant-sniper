@@ -490,6 +490,40 @@ class EngineSnapshotTests(unittest.TestCase):
         self.assertIsNone(eng.snapshot(T0)["returns"]["start"]["bot"])
         self.assertIsNone(snap["last_quote_at"])
 
+    def test_returns_and_weekly_use_only_current_segment_rows(self):
+        eng, ex, feed, store = make_engine(test=self)
+        eng.startup(T0)
+        eng.run_once(T0)
+        old, cur = "2026-10-01T00:00:00+00:00", "2026-11-09T00:00:00+00:00"
+        eng.risk_state.update(segment_start=cur, segment_kind="reconcile", segment_base_equity=500.0)
+        eng.equity_history = [{"day": "2026-11-01", "equity": 400.0, "btc": 1.0, "segment": old},   # 일요일
+                              {"day": "2026-11-08", "equity": 450.0, "btc": 1.0, "segment": old},   # 일요일
+                              {"day": "2026-11-09", "equity": 900.0, "btc": 1.0, "segment": cur},
+                              {"day": "2026-11-15", "equity": 990.0, "btc": 1.0, "segment": cur},   # 일요일
+                              {"day": "2026-11-16", "equity": 1000.0, "btc": 1.0, "segment": cur}]
+        snap = eng.snapshot(T0)
+        self.assertEqual([w["day"] for w in snap["weekly_equity"]], ["2026-11-15"])
+        self.assertIsNone(snap["weekly_equity"][0]["return_pct"])          # 이전 구간 일요일과 비교하지 않는다
+        self.assertEqual(snap["returns"]["all"]["base_day"], "2026-11-09")
+        self.assertAlmostEqual(snap["returns"]["all"]["bot"], (1000 / 900 - 1) * 100, places=2)
+        self.assertIsNone(snap["returns"]["7d"]["base_day"])                # 이번 구간 줄은 3개뿐
+        start = snap["returns"]["start"]
+        self.assertEqual((start["kind"], start["base_day"]), ("reconcile", "2026-11-09"))
+        self.assertAlmostEqual(start["bot"], (1000 / 500 - 1) * 100)
+        self.assertIn("| 구간 시작 대비 (2026-11-09부터) | +100.00% | - |", render_dashboard(snap))
+
+    def test_rows_without_segment_belong_to_first_segment(self):
+        eng, ex, feed, store = make_engine(test=self)
+        eng.startup(T0)
+        eng.run_once(T0)
+        eng.equity_history = [{"day": "2026-11-15", "equity": 990.0, "btc": 1.0},
+                              {"day": "2026-11-16", "equity": 1000.0, "btc": 1.0}]
+        self.assertEqual(eng.snapshot(T0)["returns"]["all"]["base_day"], "2026-11-15")   # 구간이 안 바뀌었다
+        eng.risk_state["segment_start"] = "2026-11-17T06:00:00+00:00"
+        eng.equity_history = [{"day": "2026-11-15", "equity": 990.0, "btc": 1.0, "segment": T0.isoformat()},
+                              {"day": "2026-11-16", "equity": 1000.0, "btc": 1.0}]
+        self.assertIsNone(eng.snapshot(T0)["returns"]["all"]["base_day"])   # 첫 줄의 구간과 같다: 이전 구간
+
     def test_weekly_equity_sundays_with_week_return(self):
         eng, ex, feed, store = make_engine(test=self)
         eng.startup(T0)

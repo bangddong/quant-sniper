@@ -240,10 +240,12 @@ def _returns_section(s: dict) -> list[str]:
             basis += " · 기록 누락 있음"
         rows.append((f"{label} ({basis})", _pct(r.get("bot")), _pct(r.get("btc"))))
     start = ret.get("start") or {}
-    rows.append((f"시작 자본 대비 ({start.get('base_day') or '-'}부터)", _pct(start.get("bot")), None))
+    start_label = "구간 시작 대비" if start.get("kind") == "reconcile" else "시작 자본 대비"
+    rows.append((f"{start_label} ({start.get('base_day') or '-'}부터)", _pct(start.get("bot")), None))
     st = _stats(s)
     lines = ["", "## 2. 수익률", "", "### 기간별", "", *_table(["기간", "봇", "BTC 보유"], "lrr", rows),
-        "", "> 수익률은 UTC 0시 평가액 기록 기준이며, 봇이 꺼져 있던 날은 기록이 없습니다.",
+        "", "> 수익률은 UTC 0시 평가액 기록 기준이며, 봇이 꺼져 있던 날은 기록이 없습니다. "
+            "수동 정리·시작 자본 재설정 뒤에는 새 구간의 기록만 씁니다.",
         "", "### 누적 성과", "", *_table(
         ["청산", "승률", "평균 이익", "평균 손실", "Profit Factor", "최대 낙폭", "최대 연속 손실", "누적 순손익",
          "누적 수수료", "평균 슬리피지"], "rrrrrrrrrr",

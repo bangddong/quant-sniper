@@ -124,6 +124,10 @@ class Engine:
                 "peak_equity": None, "day": None, "day_open_equity": None,
                 "segment_start": now.isoformat(), "last_loop_at": None,
             }
+        # 수익률 구간: 종류("initial" | "capital" | "reconcile")와 구간 시작 평가액(None이면 첫 평가액으로 채운다).
+        # 이 값이 없는 예전 상태는 처음 구간으로 본다(기준 = 시작 자본).
+        self.risk_state.setdefault("segment_kind", "initial")
+        self.risk_state.setdefault("segment_base_equity", float(self.risk_state.get("starting_capital") or 0.0))
         self.feed.start()
         self._subscribe(now)                               # 첫 루프의 청산이 시세 없이 눈멀지 않게
         self.metrics.record_restart(now)
@@ -245,8 +249,9 @@ class Engine:
         if rs.get("day") and rs.get("last_equity") is not None:
             old = rs.get("pending_equity_row")
             if old:                                        # 아직 못 쓴 줄은 BTC 없이 남긴다
-                self._append_equity_row(old["day"], old["equity"], None)
-            rs["pending_equity_row"] = {"day": rs["day"], "equity": float(rs["last_equity"])}
+                self._append_equity_row(old["day"], old["equity"], None, old.get("segment"))
+            rs["pending_equity_row"] = {"day": rs["day"], "equity": float(rs["last_equity"]),
+                                        "segment": rs.get("segment_start")}   # 그 평가액이 속한 구간
         rs["day"] = today
         rs["day_open_equity"] = None                       # 오늘 첫 평가액으로 7단계에서 정한다
         self._clear_halt(DAILY_LOSS)
@@ -402,12 +407,21 @@ class Engine:
             btc = None                                     # 캔들 창보다 오래된 날: BTC 없이 기록
         else:
             return                                         # 그날 봉이 아직 없다: 다음 루프에 다시
-        self._append_equity_row(row["day"], row["equity"], btc)
+        self._append_equity_row(row["day"], row["equity"], btc, row.get("segment"))
         del self.risk_state["pending_equity_row"]          # 기록이 저장된 뒤에만 지운다
 
-    def _append_equity_row(self, day: str, equity: float, btc: float | None) -> None:
-        self.equity_history = append_equity(self.equity_history, day, equity, btc)
+    def _append_equity_row(self, day: str, equity: float, btc: float | None, segment: str | None) -> None:
+        segment = segment or self.risk_state.get("segment_start")
+        self.equity_history = append_equity(self.equity_history, day, equity, btc, segment)
         self.store.save("equity_history", self.equity_history)
+
+    def _segment_rows(self) -> list[dict]:
+        """지금 수익률 구간(risk_state.segment_start)의 평가액 기록만. segment가 없는 예전 줄은 첫 구간 소속이다:
+        첫 줄의 segment, 첫 줄에도 없으면(구간이 한 번도 안 바뀐 예전 기록) 지금 구간으로 본다."""
+        hist = self.equity_history
+        current = self.risk_state.get("segment_start")
+        default = (hist[0].get("segment") if hist else None) or current
+        return [r for r in hist if (r.get("segment") or default) == current]
 
     def candles(self, symbol: str, now: datetime) -> list[dict] | None:
         """그날의 일봉(REST, 하루 한 번) + 진행 중 봉을 피드 시세로 덮어쓴 사본. 받을 수 없으면 None."""
@@ -460,6 +474,8 @@ class Engine:
             return
         self.cash, self.equity = account_value(rs, self.positions, prices)
         rs["last_equity"] = self.equity
+        if rs.get("segment_base_equity") is None:          # 정리로 구간이 새로 시작됐다: 그 뒤 첫 평가액이 기준
+            rs["segment_base_equity"] = self.equity
         if rs.get("day_open_equity") is None:
             rs["day_open_equity"] = self.equity
         open_equity = float(rs["day_open_equity"])
@@ -616,8 +632,10 @@ class Engine:
 
     def _returns(self, btc_now: float | None) -> dict:
         """period_returns 결과 + 각 기간의 비교 기준일(base_day, period_returns와 같은 행 위치 규칙).
-        지금 평가액이나 BTC 시세를 모르면 그쪽 값은 None. "start"는 시작 자본 대비(봇만, 구간 시작일부터)."""
-        hist = self.equity_history
+        지금 평가액이나 BTC 시세를 모르면 그쪽 값은 None. 기간별은 지금 구간의 기록만 쓴다.
+        "start"는 구간 시작 평가액 대비(봇만, 구간 시작일부터). kind가 "reconcile"이면 「구간 시작 대비」,
+        그 밖("initial"·"capital": 시작 자본으로 시작한 구간)이면 「시작 자본 대비」로 표시한다."""
+        hist = self._segment_rows()
         out = period_returns(hist, self.equity if self.equity is not None else 1.0,
                              btc_now if btc_now is not None else 1.0)
         bases = {"1d": 1, "7d": 7, "30d": 30}
@@ -629,18 +647,21 @@ class Engine:
                 row["bot"] = None
             if btc_now is None:
                 row["btc"] = None
-        capital = float(self.risk_state.get("starting_capital") or 0.0)
-        segment = self.risk_state.get("segment_start")
+        rs = self.risk_state
+        base = rs.get("segment_base_equity")
+        base = float(base) if base is not None else 0.0
+        segment = rs.get("segment_start")
         out["start"] = {
-            "bot": (self.equity / capital - 1) * 100 if self.equity is not None and capital > 0 else None,
+            "bot": (self.equity / base - 1) * 100 if self.equity is not None and base > 0 else None,
             "btc": None,
             "base_day": datetime.fromisoformat(segment).astimezone(timezone.utc).date().isoformat() if segment else None,
+            "kind": rs.get("segment_kind") or "initial",
         }
         return out
 
     def _weekly_equity(self) -> list[dict]:
-        """일요일(UTC) 평가액 최근 12개와 직전 일요일 줄 대비 수익률(%)."""
-        sundays = [r for r in self.equity_history if datetime.fromisoformat(r["day"]).weekday() == 6]
+        """지금 구간의 일요일(UTC) 평가액 최근 12개와 직전 일요일 줄 대비 수익률(%)."""
+        sundays = [r for r in self._segment_rows() if datetime.fromisoformat(r["day"]).weekday() == 6]
         rows = []
         for prev, row in zip([None] + sundays[:-1], sundays):
             base = float(prev["equity"]) if prev else 0.0
