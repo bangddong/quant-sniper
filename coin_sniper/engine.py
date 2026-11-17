@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable
@@ -29,7 +29,7 @@ from coin_sniper.halts import (
     RECON_MISMATCH, UNIVERSE,
     HaltBoard,
 )
-from coin_sniper.ledger import StateStore, record_event
+from coin_sniper.ledger import StateStore, record_event_merged
 from coin_sniper.metrics import Metrics, append_equity, period_returns
 from coin_sniper.models import ApiResult, SymbolRules
 from coin_sniper.risk import account_value, drawdown_controls, position_open_risk, size_entry
@@ -48,6 +48,7 @@ class LoopReport:
     events: list[dict]                     # 이번 루프에서 새로 생긴 이벤트
     raw_signals: int = 0
     confirmed_signals: int = 0
+    new_events: list[dict] = field(default_factory=list)   # events 중 기존 항목에 합쳐지지 않고 새로 생긴 것
 
 
 class _RateLimited(Exception):
@@ -103,6 +104,7 @@ class Engine:
         self._prev_loop_at: datetime | None = None
         self._now: datetime | None = None
         self._loop_events: list[dict] = []
+        self._loop_new_events: list[dict] = []
         self.executor = Executor(self, passthrough=(_RateLimited,))   # 주문 절차(매수·매도 공통)
         self.entries = EntryManager(self)                  # 진입과 신호 연속 확인(메모리)
 
@@ -146,6 +148,7 @@ class Engine:
         self._now = now
         self._loop_mono = self.monotonic()
         self._loop_events = []
+        self._loop_new_events = []
         self._loop_failed = False
         self.entries.begin_loop()
         ok = self._guarded(self._steps, now) and not self._loop_failed
@@ -159,7 +162,7 @@ class Engine:
         return LoopReport(now=now, ok=ok, equity=self.equity, cash=self.cash,
                           entry_allowed=self.entry_allowed(now), halts=self.halts.active(),
                           events=list(self._loop_events), raw_signals=self.entries.raw,
-                          confirmed_signals=self.entries.confirmed)
+                          confirmed_signals=self.entries.confirmed, new_events=list(self._loop_new_events))
 
     def _steps(self, now: datetime) -> None:
         self.balances = None
@@ -514,8 +517,10 @@ class Engine:
     def _event(self, kind: str, reason: str, symbol: str = "", **fields) -> None:
         event = {"type": kind, "symbol": symbol, "reason": reason,
                  "timestamp": self._now.isoformat(timespec="seconds"), **fields}
-        self.events = record_event(self.events, event, self._now)
+        self.events, merged = record_event_merged(self.events, event, self._now)
         self._loop_events.append(event)
+        if not merged:
+            self._loop_new_events.append(event)
 
     def _account_halt_time(self, now: datetime) -> None:
         prev, self._prev_loop_at = self._prev_loop_at, now

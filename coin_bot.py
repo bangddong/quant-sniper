@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 LOCK_NAME = "coin_bot.lock"
 KST = timezone(timedelta(hours=9), "KST")
 COMMIT_TIMEOUT_SECONDS = 10
-CRITICAL_EVENT_TYPES = frozenset({"BUY", "SELL", "RISK", "ERROR"})
+CRITICAL_EVENT_TYPES = frozenset({"BUY", "SELL", "ERROR"})   # RISK는 새로 생긴 것만(합쳐진 반복은 아님)
 MANUAL_REASON = "수동 정리"
 HOLD_BACK_TEXT = "보류: 미결 주문/보호 주문 기록 있음 — 봇을 먼저 실행해 정리되게 하세요"
 
@@ -289,7 +289,8 @@ def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, slee
                 tracker.collect(now.timestamp())
                 changed = prev_codes is not None and codes != prev_codes
                 if report.events or changed:
-                    critical = changed or any(e.get("type") in CRITICAL_EVENT_TYPES for e in report.events)
+                    critical = (changed or any(e.get("type") in CRITICAL_EVENT_TYPES for e in report.events)
+                                or any(e.get("type") == "RISK" for e in report.new_events))
                     tracker.mark(critical=critical)
                 tracker.maybe_submit(engine, settings, now)
             prev_codes = codes

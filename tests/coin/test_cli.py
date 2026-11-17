@@ -641,6 +641,32 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
             tracker.collect(1000.0)
         self.assertTrue(schedule.due(1001.0, False))             # 게시 완료가 그 표시를 지우지 않는다
 
+    def recurring_risk(self):
+        """보유 종목 시세가 계속 없다: 같은 RISK("실시간 시세 없음")가 루프마다 합쳐진다."""
+        self.store.save("positions", {"SOLUSDT": dict(position("SOLUSDT", 1.0, 100.0), stop_loss_pct=0.5,
+                                                      stop_price=50.0)})
+        self.ex._account("SOL")[0] += 1
+        self.feed._quotes.pop("SOLUSDT")
+
+    def test_recurring_risk_event_publishes_once_then_normal_cadence(self):
+        self.recurring_risk()
+        publish = mock.Mock(return_value=True)
+        self.go(auto_push=True, publish_fn=publish, loops=5)
+        self.assertEqual(publish.call_count, 1)                  # 첫 루프(새 RISK·중단 변화)만 즉시
+        self.ticks = [NOW + timedelta(seconds=30 * i) for i in range(1000)]
+        publish = mock.Mock(return_value=True)
+        self.go(auto_push=True, publish_fn=publish, loops=12)
+        self.assertEqual(publish.call_count, 2)                  # 그다음은 보유 중 5분 주기
+
+    def test_new_risk_event_is_critical_but_merged_repeat_is_not(self):
+        self.recurring_risk()
+        schedule = mock.Mock(wraps=PublishSchedule())
+        self.go(auto_push=True, schedule=schedule, loops=3)
+        flags = [c.kwargs.get("critical") for c in schedule.mark_dirty.call_args_list]
+        self.assertTrue(flags[0])
+        self.assertTrue(flags[1:])
+        self.assertFalse(any(flags[1:]))
+
     def test_banner_first_run_shows_env_capital_to_be_stored(self):
         settings = make_settings(self.state_dir, starting_capital=1500.0)
         out = io.StringIO()

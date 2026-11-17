@@ -104,6 +104,11 @@ def _event_key(item: dict) -> tuple:
 
 def record_event(events: list[dict], event: dict, now: datetime) -> list[dict]:
     """최근 EVENT_RETENTION_DAYS일만 유지하고 반복 SKIP/RISK는 한 항목의 횟수로 합친다."""
+    return record_event_merged(events, event, now)[0]
+
+
+def record_event_merged(events: list[dict], event: dict, now: datetime) -> tuple[list[dict], bool]:
+    """record_event와 같고, 이 이벤트가 기존 항목에 합쳐졌는지(True) 새 항목인지(False)도 돌려준다."""
     cutoff = now - timedelta(days=EVENT_RETENTION_DAYS)
     retained = []
     for item in events:
@@ -122,10 +127,10 @@ def record_event(events: list[dict], event: dict, now: datetime) -> list[dict]:
             if _event_key(item) == key and item.get("type") == event["type"]:
                 item["timestamp"] = event["timestamp"]
                 item["count"] = int(item.get("count", 1)) + 1
-                return retained[-_MAX_EVENTS:]
+                return retained[-_MAX_EVENTS:], True
     event.setdefault("count", 1)
     retained.append(event)
-    return retained[-_MAX_EVENTS:]
+    return retained[-_MAX_EVENTS:], False
 
 
 class InstanceLock:
