@@ -508,7 +508,7 @@ def sector_limit_reached(candidate_sector, positions, universe_metadata,
 
 def build_tradeability(active_universe, universe_metadata, candles_dict,
                        total_assets, cash, size_multiplier=1.0):
-    """현재가·ATR·계좌 한도로 1주 이상 주문 가능한 감시 종목을 분류한다."""
+    """현재가·ATR·계좌 한도로 분류하고 현재가가 낮은 순서로 반환한다."""
     results = []
     for name, code in active_universe.items():
         candles = candles_dict.get(name, [])
@@ -537,7 +537,14 @@ def build_tradeability(active_universe, universe_metadata, candles_dict,
             "eligible": shares > 0,
             "reason": reason,
         })
-    return results
+    return sorted(
+        results,
+        key=lambda item: (
+            item.get("price") is None,
+            float(item.get("price") or 0),
+            item.get("name", ""),
+        ),
+    )
 
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""

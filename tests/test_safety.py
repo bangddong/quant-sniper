@@ -113,6 +113,7 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(result[0]["eligible"])
         self.assertEqual(result[0]["max_shares"], 1)
         self.assertFalse(result[1]["eligible"])
+        self.assertEqual([item["name"] for item in result], ["가능주", "고가주"])
 
     def test_equity_drawdown_slows_then_halts_entries(self):
         peak, drawdown, multiplier, halted = account_drawdown_controls(920000, 1000000)
