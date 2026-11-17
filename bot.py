@@ -203,7 +203,7 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         f"| {f'{drawdown:.2f}%' if drawdown is not None else '-'} "
         f"| {f'{daily_return:+.2f}%' if daily_return is not None else '-'} "
         f"| {float(context.get('entry_size_multiplier', 1.0))*100:.0f}% "
-        f"| 0.7% | 20% | {max(0, MAX_POSITIONS-len(positions))} |",
+        f"| 0.7% | {MAX_ALLOC_PER_STOCK*100:.0f}% | {max(0, MAX_POSITIONS-len(positions))} |",
         "", "### 현재 보유 포지션 및 청산 계획 — 전체", "",
         "| 종목 | 수량 | 매수가 | 현재가 | 수익률 | 최초 손절 | 현재 보호선 | 최고가 대비 | 타임스탑 | 추적 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -458,7 +458,7 @@ def account_drawdown_controls(current_assets, peak_assets):
 
 def calculate_entry_shares(total_assets, cash, entry_price, stop_loss_pct,
                            size_multiplier=1.0):
-    """투자금 20%와 거래당 계획 손실 0.7%를 모두 지키는 정수 수량을 산출한다."""
+    """종목당 투자 한도와 거래당 계획 손실 0.7%를 모두 지키는 정수 수량을 산출한다."""
     if min(total_assets, cash, entry_price, stop_loss_pct, size_multiplier) <= 0:
         return 0
     allocation_cap = total_assets * MAX_ALLOC_PER_STOCK * size_multiplier

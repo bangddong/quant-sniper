@@ -61,10 +61,12 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("계좌번호", markdown)
 
     def test_position_size_obeys_allocation_and_trade_risk(self):
-        # 30만원, 2만원 주식, 3% 손절: 비중 한도는 3주, 위험 한도도 3주다.
+        # 30만원, 2만원 주식, 3% 손절: 30% 비중 한도는 4주, 위험 한도는 3주다.
         self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03), 3)
-        # 1주가 20% 비중 한도를 넘으면 강제 1주 주문을 만들지 않는다.
-        self.assertEqual(calculate_entry_shares(300000, 300000, 70000, 0.03), 0)
+        # 7만원 1주는 30% 비중과 거래당 위험 0.7%를 모두 충족한다.
+        self.assertEqual(calculate_entry_shares(300000, 300000, 70000, 0.03), 1)
+        # 1주가 30% 비중 및 위험 한도를 넘으면 강제 1주 주문을 만들지 않는다.
+        self.assertEqual(calculate_entry_shares(300000, 300000, 100000, 0.03), 0)
         # -8% 감속 구간에서는 신규 주문 수량이 절반 수준으로 줄어든다.
         self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03, 0.5), 1)
 
