@@ -120,6 +120,30 @@ def _check_universe(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
     return status, text
 
 
+BUY_LOOKUP_ATTEMPTS = 10          # 매수 결과가 불분명할 때 get_order를 초당 1회씩 다시 보는 횟수
+
+
+def _lookup_order(ex, sleep, client_id: str, attempts: int):
+    """찾았고 최종 상태가 될 때까지 조회한다. 마지막으로 얻은 상태(없으면 None)를 돌려준다."""
+    state = None
+    for i in range(attempts):
+        result = ex.get_order(PROBE_SYMBOL, client_id)
+        if result.ok and result.value.exists:
+            state = result.value
+            if state.is_final:
+                break
+        if i < attempts - 1:
+            sleep(1)
+    return state
+
+
+def _record_buy(ctx, rule, state, estimate_price) -> float:
+    received = state.executed_qty - state.fees.get(rule.base, 0.0)
+    ctx.update(rule=rule, price=state.avg_price or estimate_price, received=received,
+               bought=state.executed_qty, unsold=floor_to_step(received, rule.step_size))
+    return received
+
+
 def _check_buy(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
     rules = _need(ex.symbol_rules(), "symbol_rules")
     rule = rules.get(PROBE_SYMBOL)
@@ -133,19 +157,27 @@ def _check_buy(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
     if qty * price < rule.min_notional:
         qty = floor_to_step(qty + rule.step_size, rule.step_size)
     client_id = f"probe-buy-{_hex12()}"
-    _need(ex.market_buy(PROBE_SYMBOL, qty, client_id), "market_buy")
-    ctx["buy_sent"] = True
-    try:
-        state = _need(ex.get_order(PROBE_SYMBOL, client_id), "get_order")
-    except _Fail as exc:
-        raise _Fail(f"{exc} (매수 주문은 전송됨: {client_id}, 포지션이 남았는지 직접 확인 필요)") from None
-    if not state.exists or state.executed_qty <= 0:
+    ctx["buy_id"] = client_id          # 전송 전에 기억한다: 응답을 잃어도 조회할 수 있어야 한다
+    ctx["rule"] = rule
+    sent = ex.market_buy(PROBE_SYMBOL, qty, client_id)
+    if not sent.ok and sent.kind == "permanent":       # 거래소가 명시적으로 거절: 주문이 없다
+        ctx.pop("buy_id")
+        raise _Fail(f"market_buy 실패 ({sent.kind}): {sent.error}")
+    state = _lookup_order(ex, sleep, client_id, BUY_LOOKUP_ATTEMPTS)
+    if state is None:
+        ctx["buy_unknown"] = True
+        raise _Fail(f"매수 결과를 확인하지 못함 (client id {client_id}, 전송 응답: "
+                    f"{'ok' if sent.ok else sent.error}). 데모 계정에 BTC가 남았을 수 있음")
+    if state.executed_qty <= 0:
+        ctx.pop("buy_id")
         raise _Fail(f"체결되지 않음: 상태 {state.status}, 체결 수량 {state.executed_qty} ({client_id})")
-    received = state.executed_qty - state.fees.get(rule.base, 0.0)
-    ctx.update(rule=rule, price=state.avg_price or price, received=received, bought=state.executed_qty)
-    return "PASS", (f"요청 {qty:.10g} {rule.base}, 체결 {state.executed_qty:.10g}, 평균가 {state.avg_price:.10g}, "
-                    f"수수료 {_fees_text(state.fees)}, 실제 받은 수량 {received:.10g} {rule.base}, "
-                    f"최소 주문 금액 {rule.min_notional:g}, 상태 {state.status}")
+    received = _record_buy(ctx, rule, state, price)
+    text = (f"요청 {qty:.10g} {rule.base}, 체결 {state.executed_qty:.10g}, 평균가 {state.avg_price:.10g}, "
+            f"수수료 {_fees_text(state.fees)}, 실제 받은 수량 {received:.10g} {rule.base}, "
+            f"최소 주문 금액 {rule.min_notional:g}, 상태 {state.status}")
+    if not sent.ok:
+        raise _Fail(f"전송 응답은 실패({sent.kind}: {sent.error})였지만 주문은 체결됨 ({client_id}). {text}")
+    return "PASS", text
 
 
 def _cancel_stop(ex, ctx) -> str:
@@ -167,60 +199,95 @@ def _check_stop(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
     stop = floor_to_tick(price * PROBE_STOP_FACTOR, rule.tick_size)
     limit = floor_to_tick(stop * PROBE_STOP_LIMIT_FACTOR, rule.tick_size)
     client_id = f"probe-stop-{_hex12()}"
-    placed = _need(ex.place_stop(PROBE_SYMBOL, qty, stop, limit, client_id), "place_stop")
-    ctx["stop_id"] = client_id
-    open_now = _need(ex.open_orders(PROBE_SYMBOL), "open_orders")
-    if not any(o.client_id == client_id for o in open_now):
-        raise _Fail("등록은 됐지만 미체결 조회에 보이지 않음")
-    cancelled = _cancel_stop(ex, ctx)
+    ctx["stop_id"] = client_id         # 전송 전에 기억한다
+    try:
+        placed = ex.place_stop(PROBE_SYMBOL, qty, stop, limit, client_id)
+        if not placed.ok and placed.kind == "permanent":
+            ctx["stop_id"] = None      # 명시적 거절: 주문이 없다
+            raise _Fail(f"place_stop 실패 ({placed.kind}): {placed.error}")
+        if not placed.ok:
+            raise _Fail(f"place_stop 결과 불명 ({placed.kind}): {placed.error}")
+        open_now = _need(ex.open_orders(PROBE_SYMBOL), "open_orders")
+        if not any(o.client_id == client_id for o in open_now):
+            raise _Fail("등록은 됐지만 미체결 조회에 보이지 않음")
+        cancelled = _cancel_stop(ex, ctx)
+    except _Fail as exc:
+        if ctx.get("stop_id"):
+            raise _Fail(f"{exc} (손절 주문 {client_id}이 열려 있을 수 있음)") from None
+        raise
     return "PASS", (f"STOP_LOSS_LIMIT 매도 수락 (수량 {qty:.10g}, 발동가 {stop:.10g}, 지정가 {limit:.10g}, "
-                    f"등록 직후 상태 {placed.status}), 미체결 조회에 보임, 취소 {cancelled}, 취소 후 사라짐")
+                    f"등록 직후 상태 {placed.value.status}), 미체결 조회에 보임, 취소 {cancelled}, 취소 후 사라짐")
 
 
 def _check_sell(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
-    if "received" not in ctx:
-        raise _Skip("4번 매수가 성공하지 못해 팔 수량이 없음")
+    if "buy_id" not in ctx:
+        raise _Skip("4번 매수가 주문되지 않아 팔 수량이 없음")
     rule = ctx["rule"]
-    notes = []
+    notes: list[str] = []
+
+    def fail(message: str):
+        raise _Fail(message + (" / " + "; ".join(notes) if notes else ""))
+
     if ctx.get("stop_id"):          # 5번이 중간에 실패해 손절 주문이 남았을 수 있다
         try:
-            notes.append(f"남은 손절 주문 취소 재시도: {_cancel_stop(ex, ctx)}")
+            notes.append(f"남은 손절 주문 {ctx['stop_id']} 취소 재시도: {_cancel_stop(ex, ctx)}")
         except _Fail as exc:
-            notes.append(f"남은 손절 주문 취소 실패: {exc}")
+            notes.append(f"남은 손절 주문 {ctx['stop_id']} 취소 실패: {exc}")
+    if "received" not in ctx:       # 매수 결과 불명: 한 번 더 조회하고, 확인된 수량만 판다
+        result = ex.get_order(PROBE_SYMBOL, ctx["buy_id"])
+        if result.ok and result.value.exists and result.value.executed_qty > 0:
+            _record_buy(ctx, rule, result.value, 0.0)
+            ctx.pop("buy_unknown", None)
+            notes.append(f"매수 {ctx['buy_id']}가 뒤늦게 확인됨")
+        else:
+            bal = ex.balances()
+            seen = f"BTC 잔고 {bal.value.get(rule.base)}" if bal.ok else f"잔고 조회 실패: {bal.error}"
+            fail(f"매수 {ctx['buy_id']}를 확인하지 못해 매도하지 않음 ({seen}). BTC가 남았을 수 있음")
     balances = _need(ex.balances(), "balances")
     free = balances.get(rule.base, (0.0, 0.0))[0]
     qty = floor_to_step(min(ctx["received"], free), rule.step_size)    # 이 확인이 산 수량을 넘기지 않는다
     if qty <= 0:
-        raise _Fail(f"팔 수량이 없음 (받은 수량 {ctx['received']:.10g}, 가용 {free:.10g})")
+        fail(f"팔 수량이 없음 (받은 수량 {ctx['received']:.10g}, 가용 {free:.10g})")
     client_id = f"probe-sell-{_hex12()}"
-    _need(ex.market_sell(PROBE_SYMBOL, qty, client_id), "market_sell")
-    state = _need(ex.get_order(PROBE_SYMBOL, client_id), "get_order")
+    sent = ex.market_sell(PROBE_SYMBOL, qty, client_id)
+    if not sent.ok and sent.kind == "permanent":
+        fail(f"market_sell 실패 ({sent.kind}): {sent.error}")
+    state = _lookup_order(ex, sleep, client_id, BUY_LOOKUP_ATTEMPTS)
+    if state is None:
+        fail(f"매도 결과를 확인하지 못함 (client id {client_id}, 전송 응답: "
+             f"{'ok' if sent.ok else sent.error})")
+    ctx["unsold"] = max(0.0, qty - state.executed_qty)
     text = (f"요청 {qty:.10g}, 체결 {state.executed_qty:.10g}, 수수료 {_fees_text(state.fees)}, "
             f"상태 {state.status}" + (" / " + "; ".join(notes) if notes else ""))
-    if not state.exists or state.status != "FILLED":
-        return "FAIL", text
+    if state.status != "FILLED" or not sent.ok:
+        raise _Fail(text)
     return "PASS", text
+
+
+def _is_valid_quote(quote, today: str) -> bool:
+    return min(quote.open, quote.high, quote.low, quote.price) > 0 and quote.day == today
 
 
 def _check_stream(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
     feed.set_symbols([PROBE_SYMBOL])
     feed.start()
-    quote = None
-    for _ in range(STREAM_WAIT_SECONDS):
+    today = _now_utc(clock).strftime("%Y-%m-%d")
+    last = None
+    for i in range(STREAM_WAIT_SECONDS):
         quote = feed.quote(PROBE_SYMBOL)
         if quote is not None:
-            break
-        sleep(1)
-    if quote is None:
-        connected, error = feed.health()
-        return "FAIL", f"{STREAM_WAIT_SECONDS}초 안에 시세가 오지 않음 (연결 {'됨' if connected else '안 됨'}, {error or '오류 없음'})"
-    today = _now_utc(clock).strftime("%Y-%m-%d")
-    values = (f"시가 {quote.open:.10g}, 고가 {quote.high:.10g}, 저가 {quote.low:.10g}, 현재가 {quote.price:.10g}, "
-              f"거래량 {quote.volume:.10g}, 봉 날짜 {quote.day}")
-    ok = min(quote.open, quote.high, quote.low, quote.price) > 0 and quote.day == today
-    if ok:
-        return "PASS", values
-    return "FAIL", f"{values} (기대 날짜 {today} 또는 값이 0 이하)"
+            last = quote
+            if _is_valid_quote(quote, today):
+                return "PASS", (f"시가 {quote.open:.10g}, 고가 {quote.high:.10g}, 저가 {quote.low:.10g}, "
+                                f"현재가 {quote.price:.10g}, 거래량 {quote.volume:.10g}, 봉 날짜 {quote.day}")
+        if i < STREAM_WAIT_SECONDS - 1:
+            sleep(1)
+    connected, error = feed.health()
+    seen = "시세 없음" if last is None else (
+        f"마지막 시세 시가 {last.open:.10g}, 고가 {last.high:.10g}, 저가 {last.low:.10g}, "
+        f"현재가 {last.price:.10g}, 봉 날짜 {last.day} (기대 {today})")
+    return "FAIL", (f"{STREAM_WAIT_SECONDS}초 안에 유효한 시세가 오지 않음: {seen}; "
+                    f"연결 {'됨' if connected else '안 됨'}, {error or '오류 없음'}")
 
 
 _CHECKS: list[Callable] = [_check_account, _check_balances, _check_universe, _check_buy,
@@ -241,7 +308,22 @@ def run_probe(exchange, feed, sleep: Callable[[float], None], clock: Callable) -
         except Exception as exc:       # noqa: BLE001 — 어떤 예외도 보고서의 FAIL이 된다
             status, observed = "FAIL", f"{type(exc).__name__}: {exc}"
         results.append({"id": number, "title": TITLES[number], "status": status, "observed": observed})
+        if number == 6:
+            results[-1]["followup"] = _followups(ctx)
     return results
+
+
+def _followups(ctx: dict) -> list[str]:
+    """6번이 끝난 시점에 데모 계정에 주문이나 BTC가 남았을 수 있는 경우의 수동 조치."""
+    out = []
+    if ctx.get("stop_id"):
+        out.append(f"손절 주문 {ctx['stop_id']}이 아직 열려 있을 수 있음: 데모 계정에서 직접 취소한다.")
+    if ctx.get("buy_unknown"):
+        out.append(f"매수 주문 {ctx.get('buy_id')}의 결과를 확인하지 못함: 데모 계정에 BTC가 남았을 수 있으니 "
+                   "잔고와 주문 내역을 직접 확인하고 필요하면 직접 매도한다.")
+    elif ctx.get("unsold", 0) > 0:
+        out.append(f"BTC {ctx['unsold']:.10g}가 매도되지 않고 남았을 수 있음: 직접 확인하고 매도한다.")
+    return out
 
 
 # ---- 보고서 ------------------------------------------------------------------------
@@ -260,7 +342,10 @@ def _next_actions(results: list[dict]) -> list[str]:
     if st.get(3) == "FAIL":
         out.append("3번 실패(통과 종목이 기준 미만이거나 조회 실패): 멈추고 사용자에게 보고한다.")
     if st.get(4) != "PASS":
-        out.append("4번 미통과: 5, 6번을 확인하지 못했다. 원인을 해결하고 다시 실행한다.")
+        out.append("4번 미통과: 원인을 해결하고 다시 실행한다."
+                   + (" (5, 6번은 건너뜀)" if st.get(5) == "SKIP" else ""))
+    for r in results:
+        out.extend(r.get("followup", []))
     if st.get(5) == "FAIL":
         out.append("5번 실패: `PROTECTIVE_STOPS_ENABLED = False`로 바꾸고 진행한다.")
     if st.get(6) == "FAIL":

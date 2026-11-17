@@ -125,7 +125,7 @@ class RunProbeTests(unittest.TestCase):
         r = by_id(results)
         self.assertEqual(r[7]["status"], "FAIL")
         self.assertIn("connection refused", r[7]["observed"])
-        self.assertEqual(sleeps.count(1), 10)
+        self.assertEqual(sleeps.count(1), 9)
 
     def test_stream_wrong_day_fails(self):
         ex, feed = make_world()
@@ -153,6 +153,81 @@ class RunProbeTests(unittest.TestCase):
         self.assertEqual(r[5]["status"], "FAIL")
         self.assertEqual(r[6]["status"], "PASS")
         self.assertEqual(ex.open_orders().value, [])
+
+
+class FixRound1Tests(unittest.TestCase):
+    def test_lost_buy_response_still_sold(self):
+        ex, feed = make_world()
+        ex.drop_response_next("market_buy")
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[4]["status"], "FAIL")
+        self.assertEqual(r[5]["status"], "PASS")
+        self.assertEqual(r[6]["status"], "PASS")
+        self.assertLess(ex.balances().value["BTC"][0], 0.00001)
+        self.assertEqual(len(sells(ex)), 1)
+
+    def test_unknown_buy_not_sold_blindly_and_reported(self):
+        ex, feed = make_world()
+        ex.drop_response_next("market_buy")
+        ex.hide_order_for(30)
+        results, sleeps = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[4]["status"], "FAIL")
+        buy_id = [c for c in ex.calls if c[0] == "market_buy"][0][1]["client_id"]
+        self.assertIn(buy_id, r[4]["observed"])
+        self.assertIn("남았을 수", r[4]["observed"])
+        self.assertEqual(sells(ex), [])
+        self.assertEqual(r[6]["status"], "FAIL")
+        text = probe.render_report(results, NOW)
+        self.assertIn(buy_id, text)
+        self.assertEqual(sleeps.count(1), 9)      # 4번 재조회 9회(7번은 첫 조회에서 통과)
+
+    def test_lost_stop_response_cancelled_before_sell(self):
+        ex, feed = make_world()
+        ex.drop_response_next("place_stop")
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[5]["status"], "FAIL")
+        self.assertIn("열려 있을 수", r[5]["observed"])
+        self.assertEqual(r[6]["status"], "PASS")
+        names = [c[0] for c in ex.calls]
+        self.assertLess(names.index("cancel_order"), names.index("market_sell"))
+        self.assertEqual(ex.open_orders().value, [])
+
+    def test_cancel_failing_twice_reports_open_stop(self):
+        ex, feed = make_world()
+        fail = ApiResult(ok=False, kind="transient", error="net")
+        ex.fail_next("cancel_order", fail, times=2)
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[6]["status"], "FAIL")
+        self.assertIn("취소 실패", r[6]["observed"])
+        stop_id = [c for c in ex.calls if c[0] == "place_stop"][0][1]["client_id"]
+        text = probe.render_report(results, NOW)
+        self.assertIn(stop_id, text)
+        self.assertIn("직접 취소", text)
+
+    def test_invalid_then_valid_quote_passes(self):
+        ex, feed = make_world()
+        feed.set_quote("BTCUSDT", 90000.0, day="2026-11-16")
+
+        def sleep(sec):
+            if sec == 1:
+                feed.set_quote("BTCUSDT", 90000.0, volume=1.0, day="2026-11-17")
+        results = probe.run_probe(ex, feed, sleep, lambda: NOW)
+        self.assertEqual(by_id(results)[7]["status"], "PASS")
+
+    def test_never_valid_polls_ten_sleeps_nine(self):
+        ex, feed = make_world()
+        feed.set_quote("BTCUSDT", 90000.0, day="2026-11-16")
+        polls = []
+        orig = feed.quote
+        feed.quote = lambda s, *a: (polls.append(1), orig(s, *a))[1]
+        results, sleeps = run(ex, feed)
+        self.assertEqual(by_id(results)[7]["status"], "FAIL")
+        self.assertEqual(len(polls), 10)
+        self.assertEqual(sleeps.count(1), 9)
 
 
 class RenderTests(unittest.TestCase):
