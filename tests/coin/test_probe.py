@@ -183,6 +183,50 @@ class FixRound1Tests(unittest.TestCase):
         self.assertIn(buy_id, text)
         self.assertEqual(sleeps.count(1), 9)      # 4번 재조회 9회(7번은 첫 조회에서 통과)
 
+    @staticmethod
+    def pending_buy_lookups(ex, times):
+        from coin_sniper.models import OrderState
+        pending = OrderState(client_id="x", symbol="BTCUSDT", side="BUY", status="NEW", executed_qty=0.0)
+        ex.fail_next("get_order", ApiResult(ok=True, value=pending), times=times)
+
+    def test_non_final_unexecuted_buy_is_unknown_and_retried_in_check_6(self):
+        ex, feed = make_world()
+        self.pending_buy_lookups(ex, probe.BUY_LOOKUP_ATTEMPTS)   # 4번 조회 내내 "접수됨, 체결 0"
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[4]["status"], "FAIL")
+        self.assertIn("확인하지 못함", r[4]["observed"])
+        self.assertEqual(r[6]["status"], "PASS")                  # 6번의 확인 조회에서 체결이 보여 판다
+        self.assertEqual(len(sells(ex)), 1)
+
+    def test_non_final_unexecuted_buy_still_pending_is_flagged_in_report(self):
+        ex, feed = make_world()
+        self.pending_buy_lookups(ex, probe.BUY_LOOKUP_ATTEMPTS + 1)
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        buy_id = [c for c in ex.calls if c[0] == "market_buy"][0][1]["client_id"]
+        self.assertEqual(sells(ex), [])                           # 확인된 수량만 판다
+        self.assertEqual(r[6]["status"], "FAIL")
+        self.assertTrue(any(buy_id in f for f in r[6]["followup"]))
+        self.assertIn(buy_id, probe.render_report(results, NOW))
+
+    def test_balances_failure_in_check_6_keeps_notes(self):
+        ex, feed = make_world()
+        ex.drop_response_next("place_stop")                       # 5번이 손절 주문을 남긴다 → 6번이 취소 재시도
+        real, seen = ex.balances, []
+
+        def balances():
+            seen.append(1)
+            if len(seen) == 3:                                    # 1, 2번 다음, 6번의 잔고 조회
+                return ApiResult(ok=False, kind="transient", error="HTTP 503")
+            return real()
+        ex.balances = balances
+        results, _ = run(ex, feed)
+        r = by_id(results)
+        self.assertEqual(r[6]["status"], "FAIL")
+        self.assertIn("balances 실패", r[6]["observed"])
+        self.assertIn("취소 재시도", r[6]["observed"])
+
     def test_lost_stop_response_cancelled_before_sell(self):
         ex, feed = make_world()
         ex.drop_response_next("place_stop")

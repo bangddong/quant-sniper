@@ -164,8 +164,8 @@ def _check_buy(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
         ctx.pop("buy_id")
         raise _Fail(f"market_buy 실패 ({sent.kind}): {sent.error}")
     state = _lookup_order(ex, sleep, client_id, BUY_LOOKUP_ATTEMPTS)
-    if state is None:
-        ctx["buy_unknown"] = True
+    if state is None or (not state.is_final and state.executed_qty <= 0):
+        ctx["buy_unknown"] = True                      # 접수만 됐을 수 있다: 6번이 확인된 수량만 다시 본다
         raise _Fail(f"매수 결과를 확인하지 못함 (client id {client_id}, 전송 응답: "
                     f"{'ok' if sent.ok else sent.error}). 데모 계정에 BTC가 남았을 수 있음")
     if state.executed_qty <= 0:
@@ -243,8 +243,10 @@ def _check_sell(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
             bal = ex.balances()
             seen = f"BTC 잔고 {bal.value.get(rule.base)}" if bal.ok else f"잔고 조회 실패: {bal.error}"
             fail(f"매수 {ctx['buy_id']}를 확인하지 못해 매도하지 않음 ({seen}). BTC가 남았을 수 있음")
-    balances = _need(ex.balances(), "balances")
-    free = balances.get(rule.base, (0.0, 0.0))[0]
+    got = ex.balances()
+    if not got.ok:
+        fail(f"balances 실패 ({got.kind}): {got.error}")
+    free = got.value.get(rule.base, (0.0, 0.0))[0]
     qty = floor_to_step(min(ctx["received"], free), rule.step_size)    # 이 확인이 산 수량을 넘기지 않는다
     if qty <= 0:
         fail(f"팔 수량이 없음 (받은 수량 {ctx['received']:.10g}, 가용 {free:.10g})")
