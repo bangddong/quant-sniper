@@ -364,6 +364,32 @@ class Engine:
         elif res.kind != "fatal":
             self._set_halt(ACCOUNT_FETCH, f"계좌 조회 실패: {res.error}")
 
+    def _exchange_short(self, symbol: str, pos: dict) -> Decimal | None:
+        """이번 루프 잔고(사용 가능 + 잠김)가 장부 수량 − 1스텝보다 적으면 그 거래소 수량, 아니면 None.
+        규칙을 모르면 허용 오차 0. 잔고를 모르면 호출하지 않는다."""
+        rule = self.rules.get(symbol)
+        free, locked = self.balances.get(self.base_asset(symbol), (0.0, 0.0))
+        held = _dec(free) + _dec(locked)
+        need = _dec(pos["qty"]) - (_dec(rule.step_size) if rule else Decimal(0))
+        return held if held < need else None
+
+    def order_hold(self, symbol: str) -> bool:
+        """청산 단계에서 이 종목에 주문을 보내지 않아야 하는가(RECON_MISMATCH의 종목).
+        같은 루프에서 봇 자신의 체결이 장부를 줄였을 수 있으므로, 이번 루프 잔고를 알면 지금 장부로 다시 본다."""
+        if symbol not in self.mismatched_symbols():
+            return False
+        pos = self.positions.get(symbol)
+        if pos is None or self.balances is None:
+            return True
+        return self._exchange_short(symbol, pos) is not None
+
+    def mismatched_symbols(self) -> set[str]:
+        """마지막 대조에서 장부보다 거래소 수량이 모자랐던 종목(RECON_MISMATCH가 걸려 있을 때만).
+        이 종목에는 어떤 주문도 보내지 않는다(스펙 7.3: 매도도 보류). 잔고를 모르는 루프는 직전 판정을 쓴다."""
+        if not self.halts.is_set(RECON_MISMATCH):
+            return set()
+        return set(self.risk_state.get("mismatched_symbols") or [])
+
     def base_asset(self, symbol: str) -> str:
         rule = self.rules.get(symbol)
         if rule is not None:
@@ -375,14 +401,13 @@ class Engine:
             return
         if self.positions:                                 # 냉시작: 허용 오차(수량 단위)를 알아야 한다
             self._ensure_rules(self._now)                  # 실패하면 오차 0(fail-closed)
-        short = []
+        short, mismatched = [], []
         for symbol, pos in self.positions.items():
-            rule = self.rules.get(symbol)
-            free, locked = self.balances.get(self.base_asset(symbol), (0.0, 0.0))
-            held = _dec(free) + _dec(locked)
-            need = _dec(pos["qty"]) - (_dec(rule.step_size) if rule else Decimal(0))
-            if held < need:
+            held = self._exchange_short(symbol, pos)
+            if held is not None:
                 short.append(f"{symbol} 장부 {pos['qty']} / 거래소 {float(held)}")
+                mismatched.append(symbol)
+        self.risk_state["mismatched_symbols"] = sorted(mismatched)   # 저장: 재시작 직후 잔고를 몰라도 보류 유지
         if short:
             self._set_halt(RECON_MISMATCH, "계좌·장부 불일치: " + ", ".join(short))
         else:

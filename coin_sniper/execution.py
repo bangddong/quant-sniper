@@ -35,6 +35,7 @@ EXCHANGE_STOP_REASON = "거래소 손절"
 EXCHANGE_STOP_PARTIAL_REASON = "거래소 손절(부분)"
 BUY_DROPPED_REASON = "매수 주문 미확인 폐기: 거래소 잔고 확인 필요"
 FEE_UNPRICED_REASON = "수수료 자산 가격 모름"
+MISMATCH_HOLD_REASON = "장부·거래소 수량 불일치: 주문 보류"
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
 
 
@@ -455,6 +456,14 @@ class Executor:
         quote = e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
         if quote is None:
             e._event("RISK", "실시간 시세 없음: 청산 판단 보류", symbol)
+            return
+        # 거래소에 장부만큼 없다: 감시만 하고 주문(매도·보호 등록·취소)은 보내지 않는다. 단 봇 자신의 보호 주문 기록이
+        # 남아 있으면 그 체결이 부족분일 수 있으므로(부분 체결 등) 보호 주문 정리 절차를 막지 않는다. 그 주문이 거래소에
+        # 없거나 끝나면 위의 확인 단계가 기록을 지우고, 다음부터는 여기서 보류된다.
+        if not pos.get("protective") and e.order_hold(symbol):
+            pos["highest_price"] = max(float(pos["highest_price"]), quote.price)
+            update_stop(pos, quote.price)
+            e._event("RISK", MISMATCH_HOLD_REASON, symbol)
             return
         if self._is_dust(rule, float(pos["qty"]), quote.price):
             self._dust_exit(symbol, now)

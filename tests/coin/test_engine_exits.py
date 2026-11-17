@@ -836,5 +836,49 @@ class ConfirmDeadlineTests(unittest.TestCase):
         self.assertEqual(created, (now + 50 * SEC).isoformat())
 
 
+class ReconMismatchHoldTests(unittest.TestCase):
+    """장부·거래소 수량 불일치 종목은 감시만 하고 주문은 보내지 않는다 (F10, 스펙 7.3)."""
+
+    def test_mismatched_symbol_sends_no_orders_until_balance_matches(self):
+        from decimal import Decimal
+        from coin_sniper.halts import RECON_MISMATCH
+        eng, ex, feed, store = make_engine(test=self)
+        eng.startup(T0)
+        add_position(eng, ex, SYM, 1.0, 100.0)
+        ex._account("SOL")[0] = Decimal(0)                    # 데모 초기화·직접 매도로 거래소에서 사라졌다
+        ex.set_price(SYM, 90.0)
+        feed.set_quote(SYM, 90.0)                             # 손절선(95) 아래
+        order_calls = ("market_sell", "market_buy", "place_stop", "cancel_order")
+        for i in range(3):
+            r = eng.run_once(T0 + 30 * i * SEC)
+            self.assertIn(RECON_MISMATCH, codes(r))
+        self.assertEqual([n for n in names(ex) if n in order_calls], [])
+        self.assertEqual(eng.metrics.summary(T0, None)["orders_sent"], 0)
+        self.assertEqual(eng.mismatched_symbols(), {SYM})
+        held = [e for e in store.load("events", []) if e["reason"] == "장부·거래소 수량 불일치: 주문 보류"]
+        self.assertEqual(len(held), 1)                        # 한 줄에 합쳐진다
+        self.assertEqual(held[0]["count"], 3)
+        self.assertEqual(eng.positions[SYM]["highest_price"], 100.0)   # 감시(보호선 계산)는 계속
+        ex._account("SOL")[0] = Decimal(1)                    # 다시 맞는다
+        r = eng.run_once(T0 + 90 * SEC)
+        self.assertNotIn(RECON_MISMATCH, codes(r))
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+        self.assertNotIn(SYM, store.load("positions", {}))
+
+    def test_mismatch_hold_survives_restart_before_balances_are_known(self):
+        from decimal import Decimal
+        eng, ex, feed, store = make_engine(test=self)
+        eng.startup(T0)
+        add_position(eng, ex, SYM, 1.0, 100.0)
+        ex._account("SOL")[0] = Decimal(0)
+        ex.set_price(SYM, 90.0)
+        feed.set_quote(SYM, 90.0)
+        eng.run_once(T0)
+        eng2 = restart_engine(eng, T0 + 30 * SEC)
+        ex.fail_next("balances", TRANSIENT)                   # 재시작 첫 루프는 잔고를 모른다
+        eng2.run_once(T0 + 30 * SEC)
+        self.assertEqual(calls(ex, "market_sell"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
