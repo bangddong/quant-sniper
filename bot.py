@@ -18,9 +18,11 @@ from config import (
     SLIPPAGE_ESTIMATE_PCT, ORDER_CONFIRM_TIMEOUT_SECONDS,
     MARKET_PROXY_CODE, ENTRY_START_TIME, ENTRY_END_TIME, AUTO_GIT_PUSH,
     MIN_MARKET_CAP_KRW, MAX_MARKET_CAP_KRW, MAX_RISK_PER_TRADE_PCT,
-    EQUITY_SLOWDOWN_DRAWDOWN_PCT, EQUITY_HALT_DRAWDOWN_PCT
+    EQUITY_SLOWDOWN_DRAWDOWN_PCT, EQUITY_HALT_DRAWDOWN_PCT,
+    MAX_POSITIONS_PER_SECTOR, ATR_STOP_MULTIPLIER,
+    MIN_STOP_LOSS_PCT, MAX_STOP_LOSS_PCT
 )
-from strategy import evaluate_signals
+from strategy import calculate_atr, evaluate_signals
 from kiwoom_api import KiwoomRestAPI
 from kiwoom_realtime import KiwoomRealtimeFeed
 
@@ -178,15 +180,26 @@ def render_dashboard(status, detail, positions, realtime, events, now=None, cont
         f"| {int(context.get('universe_count', 0))} | {int(context.get('raw_signal_count', 0))} "
         f"| {int(context.get('confirming_signal_count', 0))} | {int(context.get('confirmed_signal_count', 0))} |",
         "", "#### 감시 종목 전체", "",
-        "| 종목 | 코드 |",
-        "|---|---:|",
+        "| 종목 | 코드 | 업종 | 현재가 | 최대 수량 | 매수 가능성 |",
+        "|---|---:|---|---:|---:|---|",
     ]
-    universe_symbols = context.get("universe_symbols", [])
+    universe_symbols = context.get("tradeability") or context.get("universe_symbols", [])
     if universe_symbols:
         for item in universe_symbols:
-            lines.append(f"| {_md(item.get('name'))} | `{_md(item.get('code'))}` |")
+            price = item.get("price")
+            max_shares = item.get("max_shares")
+            eligibility = (
+                ("가능" if item.get("eligible") else _md(item.get("reason", "불가")))
+                if "eligible" in item else "계산 대기"
+            )
+            lines.append(
+                f"| {_md(item.get('name'))} | `{_md(item.get('code'))}` "
+                f"| {_md(item.get('sector', '미분류'))} "
+                f"| {f'{float(price):,.0f}원' if price else '-'} "
+                f"| {int(max_shares) if max_shares is not None else '-'} | {eligibility} |"
+            )
     else:
-        lines.append("| - | - |")
+        lines.append("| - | - | - | - | - | - |")
     lines += [
         "", "#### 신호 확인 단계", "",
         "| 종목 | 전략 | 연속 확인 |",
@@ -324,6 +337,7 @@ def sync_dashboard_to_branch(status, detail, positions, realtime, context=None):
         "universe_source": render_context.get("universe_source"),
         "universe_count": render_context.get("universe_count", 0),
         "universe_symbols": render_context.get("universe_symbols", []),
+        "tradeability": render_context.get("tradeability", []),
         "raw_signal_count": render_context.get("raw_signal_count", 0),
         "confirming_signal_count": render_context.get("confirming_signal_count", 0),
         "confirmed_signal_count": render_context.get("confirmed_signal_count", 0),
@@ -480,6 +494,51 @@ def calculate_entry_shares(total_assets, cash, entry_price, stop_loss_pct,
     shares_by_cash = int(cash // entry_price)
     return max(0, min(shares_by_allocation, shares_by_risk, shares_by_cash))
 
+def sector_limit_reached(candidate_sector, positions, universe_metadata,
+                         max_per_sector=MAX_POSITIONS_PER_SECTOR):
+    """미분류를 제외하고 동일 업종 보유 수가 상한에 도달했는지 확인한다."""
+    if not candidate_sector or candidate_sector == "미분류":
+        return False
+    same_sector = 0
+    for name, pos in positions.items():
+        sector = pos.get("sector") or universe_metadata.get(name, {}).get("sector")
+        if sector == candidate_sector:
+            same_sector += 1
+    return same_sector >= max_per_sector
+
+def build_tradeability(active_universe, universe_metadata, candles_dict,
+                       total_assets, cash, size_multiplier=1.0):
+    """현재가·ATR·계좌 한도로 1주 이상 주문 가능한 감시 종목을 분류한다."""
+    results = []
+    for name, code in active_universe.items():
+        candles = candles_dict.get(name, [])
+        price = float(candles[-1]["close"]) if candles else 0.0
+        if price > 0:
+            atr = calculate_atr(candles)
+            stop_pct = max(
+                MIN_STOP_LOSS_PCT,
+                min(MAX_STOP_LOSS_PCT, atr / price * ATR_STOP_MULTIPLIER),
+            )
+            shares = calculate_entry_shares(
+                total_assets, cash, price, stop_pct, size_multiplier
+            )
+            reason = "1주 이상 가능" if shares > 0 else "1주가 투자/위험/현금 한도 초과"
+        else:
+            stop_pct = None
+            shares = 0
+            reason = "가격 데이터 없음"
+        meta = universe_metadata.get(name, {})
+        results.append({
+            "name": name, "code": code,
+            "sector": meta.get("sector", "미분류"),
+            "price": price or None,
+            "stop_loss_pct": stop_pct,
+            "max_shares": shares,
+            "eligible": shares > 0,
+            "reason": reason,
+        })
+    return results
+
 def check_git_permission():
     """봇 기동 시 깃 푸시 권한 사전 점검"""
     if not AUTO_GIT_PUSH:
@@ -560,6 +619,7 @@ def run_trading_loop():
     realtime.start()
     last_screened_date = None
     active_universe = DEFAULT_UNIVERSE
+    universe_metadata = {}
     risk_date = None
     opening_assets = None
     trading_halted = False
@@ -600,9 +660,16 @@ def run_trading_loop():
             
             # 매일 아침 전일(D-1) 확정 거래대금 TOP 우량주 동적 스크리닝 갱신 (Lookahead 방지)
             universe_cache = load_json(UNIVERSE_FILE, {})
-            if universe_cache.get("date") == today_str and universe_cache.get("symbols"):
+            cache_symbols = universe_cache.get("symbols", {})
+            cache_metadata = universe_cache.get("metadata", {})
+            cache_complete = bool(cache_symbols) and all(
+                name in cache_metadata for name in cache_symbols
+            )
+            if universe_cache.get("date") == today_str and cache_symbols:
                 active_universe = universe_cache["symbols"]
-                last_screened_date = today_str
+                universe_metadata = cache_metadata
+                if cache_complete:
+                    last_screened_date = today_str
             dashboard_context.update({
                 "universe_date": universe_cache.get("date", "-"),
                 "universe_source": universe_cache.get(
@@ -611,7 +678,8 @@ def run_trading_loop():
                 "universe_count": len(active_universe),
                 "universe_names": list(active_universe.keys()),
                 "universe_symbols": [
-                    {"name": name, "code": code}
+                    {"name": name, "code": code,
+                     "sector": universe_metadata.get(name, {}).get("sector", "미분류")}
                     for name, code in active_universe.items()
                 ],
             })
@@ -637,8 +705,13 @@ def run_trading_loop():
                 )
                 if screened:
                     active_universe = screened
+                    universe_metadata = api.last_universe_metadata
                     last_screened_date = today_str
-                    save_json(UNIVERSE_FILE, {"date": today_str, "symbols": screened})
+                    save_json(UNIVERSE_FILE, {
+                        "date": today_str, "symbols": screened,
+                        "metadata": universe_metadata,
+                        "source": "kiwoom_ka10031_query_type_2_previous_day_value",
+                    })
                     print(f"[{now_str}] ✅ 오늘자 감시 유니버스 {len(active_universe)}종목 갱신 완료:")
                     print("   ", ", ".join(list(active_universe.keys())[:10]), "...")
                 else:
@@ -666,10 +739,12 @@ def run_trading_loop():
                 )
                 if screened:
                     active_universe = screened
+                    universe_metadata = api.last_universe_metadata
                     last_screened_date = today_str
                     save_json(UNIVERSE_FILE, {
                         "date": today_str, "symbols": screened,
-                        "source": "kiwoom_ka10031_previous_day",
+                        "metadata": universe_metadata,
+                        "source": "kiwoom_ka10031_query_type_2_previous_day_value",
                     })
                     print(f"[{now_str}] ✅ 장중 유니버스 {len(screened)}종목 복구 완료")
                 else:
@@ -799,6 +874,13 @@ def run_trading_loop():
                     candles_dict[name] = c
                 if cache_miss:
                     time.sleep(API_REQUEST_DELAY)
+
+            if account.get("ok"):
+                dashboard_context["tradeability"] = build_tradeability(
+                    active_universe, universe_metadata, candles_dict,
+                    float(account.get("total_assets") or 0),
+                    float(account.get("cash") or 0), entry_size_multiplier,
+                )
                 
             # 2. 보유 포지션 감시 및 청산 체크 (동적 손절, 트레일링 스탑, 익절)
             closed_positions = []
@@ -972,6 +1054,17 @@ def run_trading_loop():
                         dashboard_dirty = True
                         continue
                     code = active_universe[name]
+                    candidate_sector = universe_metadata.get(name, {}).get(
+                        "sector", "미분류"
+                    )
+                    if sector_limit_reached(
+                        candidate_sector, positions, universe_metadata
+                    ):
+                        reason = f"동일 업종 보유 상한({MAX_POSITIONS_PER_SECTOR}종목)"
+                        print(f"[{now_str}] [SKIP] {name}: {reason}")
+                        record_dashboard_event("SKIP", name, code, reason)
+                        dashboard_dirty = True
+                        continue
                     entry_p = sig["entry_price"]
                     stop_loss_pct = float(sig.get("stop_loss_pct", STOP_LOSS_PCT))
                     shares = calculate_entry_shares(
@@ -1011,6 +1104,7 @@ def run_trading_loop():
                             break
                         positions[name] = {
                             "code": code,
+                            "sector": candidate_sector,
                             "shares": filled_qty,
                             "buy_price": fill_price,
                             "stop_loss_pct": stop_loss_pct,

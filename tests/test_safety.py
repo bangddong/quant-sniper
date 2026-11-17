@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 import config
 from bot import (
-    account_drawdown_controls, calculate_entry_shares,
+    account_drawdown_controls, build_tradeability, calculate_entry_shares,
     build_operational_status, confirm_persistent_signals, git_commit_and_push, is_entry_window,
     is_market_open, market_session_progress, save_json, trading_days_held,
-    update_dashboard_events, update_position_stop, render_dashboard,
+    sector_limit_reached, update_dashboard_events, update_position_stop,
+    render_dashboard,
 )
 from kiwoom_api import KiwoomRestAPI
 
@@ -86,6 +87,32 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(calculate_entry_shares(300000, 300000, 100000, 0.03), 0)
         # -8% 감속 구간에서는 신규 주문 수량이 절반 수준으로 줄어든다.
         self.assertEqual(calculate_entry_shares(300000, 300000, 20000, 0.03, 0.5), 1)
+
+    def test_sector_limit_allows_two_but_blocks_third_position(self):
+        metadata = {
+            "반도체A": {"sector": "반도체"},
+            "반도체B": {"sector": "반도체"},
+            "반도체C": {"sector": "반도체"},
+        }
+        one = {"반도체A": {"sector": "반도체"}}
+        two = {**one, "반도체B": {"sector": "반도체"}}
+        self.assertFalse(sector_limit_reached("반도체", one, metadata))
+        self.assertTrue(sector_limit_reached("반도체", two, metadata))
+        self.assertFalse(sector_limit_reached("미분류", two, metadata))
+
+    def test_tradeability_separates_affordable_symbols(self):
+        def candles(price):
+            return [{"open": price, "high": price, "low": price,
+                     "close": price, "vol": 1000} for _ in range(10)]
+        result = build_tradeability(
+            {"가능주": "000001", "고가주": "000002"},
+            {"가능주": {"sector": "기계"}, "고가주": {"sector": "기계"}},
+            {"가능주": candles(50000), "고가주": candles(100000)},
+            300000, 300000,
+        )
+        self.assertTrue(result[0]["eligible"])
+        self.assertEqual(result[0]["max_shares"], 1)
+        self.assertFalse(result[1]["eligible"])
 
     def test_equity_drawdown_slows_then_halts_entries(self):
         peak, drawdown, multiplier, halted = account_drawdown_controls(920000, 1000000)
@@ -223,7 +250,8 @@ class SafetyTests(unittest.TestCase):
                 {"stk_cd": "069500", "stk_nm": "KODEX200"},
             ]},
             {"return_code": 0, "lastPrice": "20000", "listCount": "100000000",
-             "marketName": "KOSPI", "auditInfo": "", "orderWarning": "0"},
+             "marketName": "KOSPI", "upName": "반도체", "auditInfo": "",
+             "orderWarning": "0"},
             {"return_code": 0, "lastPrice": "30000", "listCount": "100000000",
              "marketName": "ETF", "auditInfo": "", "orderWarning": "0"},
         ])
@@ -231,6 +259,7 @@ class SafetyTests(unittest.TestCase):
             20, 1_000_000_000_000, 5_000_000_000_000
         )
         self.assertEqual(universe, {"후보주": "000001"})
+        self.assertEqual(api.last_universe_metadata["후보주"]["sector"], "반도체")
 
     def test_kiwoom_daily_candles_are_returned_oldest_first(self):
         with patch.object(config, "LIVE_TRADING_ENABLED", True):

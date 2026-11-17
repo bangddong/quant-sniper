@@ -29,6 +29,7 @@ class KiwoomRestAPI:
         self.base_url = "https://api.kiwoom.com"
         self.token = None
         self.token_expiry = 0
+        self.last_universe_metadata = {}
 
         missing = [name for name, value in (
             ("KIWOOM_APP_KEY", self.app_key),
@@ -117,7 +118,7 @@ class KiwoomRestAPI:
             return {"return_code": -1, "return_msg": str(exc)}
 
     def get_previous_day_universe(self, top_n, min_market_cap, max_market_cap):
-        """키움 전일 거래대금 순위와 전일 시총으로 장중에도 유니버스를 복구한다."""
+        """ka10031 조회구분 2의 전일 거래대금 순위와 전일 시총으로 유니버스를 만든다."""
         ranking = self._post_domestic(
             "/api/dostk/rkinfo", "ka10031",
             {"mrkt_tp": "000", "qry_tp": "2", "rank_strt": "0",
@@ -128,6 +129,7 @@ class KiwoomRestAPI:
             return {}
 
         selected = {}
+        metadata = {}
         for item in ranking.get("pred_trde_qty_upper", []):
             code = str(item.get("stk_cd", "")).lstrip("AJQ")[-6:]
             name = str(item.get("stk_nm", "")).strip()
@@ -155,8 +157,15 @@ class KiwoomRestAPI:
                 continue
             if min_market_cap <= previous_market_cap <= max_market_cap:
                 selected[name] = code
+                metadata[name] = {
+                    "code": code,
+                    "sector": str(info.get("upName", "")).strip() or "미분류",
+                    "previous_close": previous_close,
+                    "previous_market_cap": previous_market_cap,
+                }
                 if len(selected) >= top_n:
                     break
+        self.last_universe_metadata = metadata
         return selected
 
     def get_account_snapshot(self):
