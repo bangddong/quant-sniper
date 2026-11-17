@@ -79,6 +79,16 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(s["uptime_pct"], 50.0)
         self.assertEqual(m.summary(midnight, None)["uptime_pct"], 50.0)
 
+    def test_uptime_window_longer_than_data_starts_at_first_loop_day(self):
+        m = Metrics()
+        m.record_restart(day(-3))                            # 루프 없이 재시작만 있던 날은 기준이 아니다
+        midnight = datetime(2026, 11, 16, 0, 0, tzinfo=timezone.utc)
+        for _ in range(1440):
+            m.record_loop(True, midnight)                     # 어제 하루의 절반
+        now = datetime(2026, 11, 17, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(m.summary(now, 7)["uptime_pct"], 50.0)   # 7일이 아니라 어제부터
+        self.assertEqual(m.summary(now, None)["uptime_pct"], 50.0)
+
     def test_uptime_counts_today_elapsed_only_and_caps(self):
         m = Metrics()
         now = datetime(2026, 11, 17, 1, 0, 0, tzinfo=timezone.utc)   # 3600초 경과

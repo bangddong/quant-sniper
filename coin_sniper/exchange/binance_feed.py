@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import time
 from dataclasses import replace
@@ -96,6 +97,9 @@ class BinanceFeed:
                           high=float(k["h"]), low=float(k["l"]), volume=float(k["v"]),
                           quote_volume=float(k["q"]), day=day, received_at=0.0)
         except (ValueError, TypeError, KeyError, OverflowError, OSError):
+            return
+        prices = (quote.open, quote.high, quote.low, quote.price)
+        if not all(math.isfinite(p) and p > 0 for p in prices):   # 0·음수·nan·inf 가격은 시세가 아니다
             return
         with self._lock:
             quote.received_at = self._clock()

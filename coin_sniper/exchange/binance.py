@@ -66,12 +66,16 @@ class BinanceExchange:
         return result
 
     def _send(self, name: str, method: str, path: str, params: dict,
-              signed: bool) -> tuple[ApiResult, int | None]:
-        """HTTP 한 번. on_call을 정확히 한 번 부른다. (결과, 거래소 오류 코드)를 돌려준다."""
+              signed: bool, expected_codes: frozenset[int] = frozenset()) -> tuple[ApiResult, int | None]:
+        """HTTP 한 번. on_call을 정확히 한 번 부른다. (결과, 거래소 오류 코드)를 돌려준다.
+        expected_codes: 예상된 답인 오류 코드(예: 주문 조회의 -2013 "주문 없음"). on_call에는 성공 호출로 알린다."""
         try:
             result, code = self._send_once(method, path, params, signed)
         except Exception as exc:     # 공개 메서드는 절대 예외를 던지지 않는다. 메시지는 키 노출 방지를 위해 버린다.
             result, code = self._unexpected(exc, signed), None
+        if not result.ok and code in expected_codes:
+            self._report(name, ApiResult(ok=True))
+            return result, code
         return self._report(name, result), code
 
     @staticmethod
@@ -150,15 +154,16 @@ class BinanceExchange:
         return self._call_with_code(name, method, path, params, signed)[0]
 
     def _call_with_code(self, name: str, method: str, path: str, params: dict | None = None,
-                        signed: bool = True) -> tuple[ApiResult, int | None]:
+                        signed: bool = True, expected_codes: frozenset[int] = frozenset()
+                        ) -> tuple[ApiResult, int | None]:
         """서명 요청 + (-1021일 때만) 시간 재동기화 후 1회 재시도."""
         params = params or {}
-        result, code = self._send(name, method, path, params, signed)
+        result, code = self._send(name, method, path, params, signed, expected_codes)
         if not result.ok and signed and code == _CLOCK_CODE:
             sync = self.server_time()
             if sync.ok:
                 self._offset_ms = sync.value - int(self._clock() * 1000)
-                result, code = self._send(name, method, path, params, signed)
+                result, code = self._send(name, method, path, params, signed, expected_codes)
         return result, code
 
     # ---- 공개 API ---------------------------------------------------------------
@@ -201,7 +206,8 @@ class BinanceExchange:
 
     def get_order(self, symbol: str, client_id: str) -> ApiResult:
         res, code = self._call_with_code("order.get", "GET", "/api/v3/order",
-                                         {"symbol": symbol, "origClientOrderId": client_id})
+                                         {"symbol": symbol, "origClientOrderId": client_id},
+                                         expected_codes=frozenset({_UNKNOWN_ORDER}))   # "없음"은 정상 답
         if not res.ok and code == _UNKNOWN_ORDER:
             return ApiResult(ok=True, value=OrderState(client_id=client_id, symbol=symbol, side="",
                                                        status="UNKNOWN", exists=False))

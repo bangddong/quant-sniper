@@ -45,6 +45,7 @@ python -W error -m unittest discover -s tests/coin -v
 | `COIN_LIVE_TRADING_ENABLED` | `false` | `MODE=live`는 이 값이 `true`일 때만 실행된다. 코인 봇 전용이다(주식 봇의 `LIVE_TRADING_ENABLED`는 보지 않는다). |
 | `STARTING_CAPITAL_USDT` | `1000` | 봇의 가상 계좌 시작 자본(USDT). 처음 실행할 때 상태에 저장되며, 그 뒤에는 `reconcile --reset-capital`로만 다시 반영된다. |
 | `AUTO_GIT_PUSH` | `false` | `true`면 대시보드를 `origin/dashboard` 브랜치에 게시한다. |
+| `COIN_DASHBOARD_BRANCH` | `dashboard` | 코인 봇 대시보드를 게시할 브랜치 이름. |
 
 주의:
 
@@ -54,8 +55,8 @@ python -W error -m unittest discover -s tests/coin -v
     주식 봇 때문에 `LIVE_TRADING_ENABLED=true`여도 코인 봇은 실거래가 되지 않는다(`MODE=live`면 실행을 거부한다).
   - 주식 봇의 `AUTO_GIT_PUSH` 기본값은 `true`, 코인 봇은 `false`다. 한 봇에만 다르게 주려면 그 프로세스의 환경 변수로
     직접 지정한다(예: 리눅스 `AUTO_GIT_PUSH=false python bot.py`). 환경 변수가 `.env`보다 우선한다.
-- **두 봇은 같은 `origin/dashboard` 브랜치에 강제 push한다.** 둘 다 게시하면 서로의 대시보드를 덮어쓴다.
-  동시에 돌릴 때는 한쪽만 게시하게 한다.
+- **두 봇은 기본으로 같은 `origin/dashboard` 브랜치에 강제 push한다.** 둘 다 게시하면 서로의 대시보드를 덮어쓴다.
+  동시에 돌릴 때는 한쪽만 게시하거나, 코인 봇의 브랜치를 `COIN_DASHBOARD_BRANCH`(기본 `dashboard`, 예: `coin-dashboard`)로 바꾼다.
 - 바이낸스 계정의 **「BNB로 수수료 내기」는 끄는 것을 권한다**(숫자가 단순해진다). 켜 두어도 봇은 맞게 계산한다:
   BNB 등 제3 자산으로 낸 수수료는 체결을 반영할 때 그 자산의 USDT 시세(실시간 시세, 없으면 일봉 종가)로 값을 매겨
   매수 원가에 더하고 매도 대금에서 뺀다. 값을 매길 시세를 받지 못하면 그 체결은 반영하지 않고 「체결 미확인」으로 두었다가
@@ -293,9 +294,11 @@ python coin_bot.py status
 열은 「오늘(UTC 0시~)」「7일」(오늘 포함 7개 UTC 날짜)「전체」(지표가 있는 첫날부터). 지표는 UTC 날짜별로 쌓고 400일 보관한다.
 
 - API 호출·실패율: 바이낸스 REST 어댑터를 거친 모든 호출 중 실패 비율. 일시적(네트워크, 5xx, 호출 한도, 점검)과 확정적(잔고 부족, 규칙 위반 등) 구분.
+  주문 조회의 "주문 없음"(-2013)은 예상된 답이라 실패로 세지 않는다.
 - 주문: 전송 / 거절 / 체결 미확인 / 부분 체결 건수.
 - 시세 재연결 횟수, 시세 끊김 시간(루프마다, 시세 연결이 끊겼거나 `feed_stale`이 걸려 있으면 루프 간격(최대 60초)을 더한다).
 - 가동률 = 정상 완료 루프 수 × 30초 / 그 기간의 경과 시간(오늘은 UTC 0시부터 지금까지), 최대 100%.
+  기간이 기록보다 길면(예: 처음 실행한 지 3일인데 7일 열) 루프가 처음 기록된 날부터 센다.
 - 중단 시간(사유별 상위 5): 루프마다 걸려 있던 사유에 루프 간격(최대 60초)을 더한다.
 - 봇 꺼짐 시간: 재시작 때 마지막 정상 루프와의 차이가 60초를 넘으면 그 차이를 더한다. 재시작 횟수, 루프 예외 횟수.
 

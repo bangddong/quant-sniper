@@ -487,6 +487,13 @@ class MainTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("risk_state.json", err)
 
+    def test_main_makes_console_streams_replace_unencodable_text(self):
+        out, err = mock.Mock(), mock.Mock()
+        with mock.patch.object(coin_bot.sys, "stdout", out), mock.patch.object(coin_bot.sys, "stderr", err):
+            coin_bot.main([])                                 # 도움말만 출력하고 끝나는 경로
+        out.reconfigure.assert_called_with(errors="replace")
+        err.reconfigure.assert_called_with(errors="replace")
+
     def test_run_via_main_completes_loops_and_releases_lock(self):
         real_run = coin_bot.run
         fake_run = mock.Mock(side_effect=lambda settings, **kw: real_run(
@@ -603,7 +610,7 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
     def blocking_publish(self):
         release = threading.Event()
         self.addCleanup(release.set)                             # 테스트가 끝나면 게시 스레드를 놓아 준다
-        return mock.Mock(side_effect=lambda *a: release.wait() or True)
+        return mock.Mock(side_effect=lambda *a, **k: release.wait() or True)
 
     def test_blocked_publish_never_stalls_the_trading_loop(self):
         publish = self.blocking_publish()
@@ -731,6 +738,17 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("중지합니다", out.getvalue())
         self.assertIsNotNone(self.store.load("risk_state", None)["last_loop_at"])
+
+    def test_publish_uses_configured_dashboard_branch(self):
+        publish = mock.Mock(return_value=True)
+        settings = dataclasses.replace(make_settings(self.state_dir), auto_git_push=True,
+                                       dashboard_branch="coin-dashboard")
+        publisher = coin_bot.BackgroundPublisher(publish, clock=lambda: 100.0, spawn=lambda fn: fn())
+        with redirect_stdout(io.StringIO()):
+            coin_bot.run(settings, exchange=self.ex, feed=self.feed, sleep=lambda _s: None, now_fn=self.now_fn,
+                         clock=lambda: 100.0, max_loops=1, publish_fn=publish, commit_fn=lambda: "-",
+                         publisher=publisher)
+        self.assertEqual(publish.call_args.kwargs["branch"], "coin-dashboard")
 
     def test_commit_is_set_on_engine_snapshot(self):
         publish = mock.Mock(return_value=True)

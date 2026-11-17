@@ -157,7 +157,7 @@ class BackgroundPublisher:
     def busy(self) -> bool:
         return self._job is not None
 
-    def submit(self, *args) -> bool:
+    def submit(self, *args, **kwargs) -> bool:
         if self._job is not None:
             return False
         job = {"started": self._clock(), "done": False, "result": None}
@@ -166,7 +166,7 @@ class BackgroundPublisher:
 
         def work() -> None:
             try:
-                result = "ok" if publish_fn(*args) else "failed"
+                result = "ok" if publish_fn(*args, **kwargs) else "failed"
             except Exception as exc:                      # 게시 문제는 매매를 멈추지 않는다
                 result = f"error:{type(exc).__name__}"
             with lock:
@@ -233,7 +233,7 @@ class PublishTracker:
             self.schedule.failed(now.timestamp())
             print(f"대시보드 게시 오류(매매는 계속): {type(exc).__name__}")
             return
-        self.publisher.submit(*args)
+        self.publisher.submit(*args, branch=settings.dashboard_branch)
 
 
 def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, sleep: Callable[[float], None] = time.sleep,
@@ -492,7 +492,19 @@ def _ask(prompt: str) -> bool:
         raise ReconcileAborted("중단: 변경 없음") from None
 
 
+def _safe_console() -> None:
+    """윈도우 cp949 콘솔 등에서 인코딩할 수 없는 문자가 있어도 출력이 예외로 죽지 않게 한다."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_console()
     parser = _parser()
     args = parser.parse_args(argv)
     if not args.command:

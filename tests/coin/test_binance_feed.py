@@ -81,6 +81,13 @@ class BinanceFeedTest(unittest.TestCase):
             self.feed.handle_message(raw)
         self.assertIsNone(self.feed.quote("BTCUSDT"))
 
+    def test_non_finite_or_non_positive_prices_are_ignored(self):
+        for field, value in (("c", "0"), ("o", "-1"), ("h", "nan"), ("l", "inf"), ("c", "NaN"), ("o", "0.0")):
+            event = json.loads(json.dumps(KLINE))
+            event["k"][field] = value
+            self.feed.handle_message(json.dumps(event))
+            self.assertIsNone(self.feed.quote("BTCUSDT"), (field, value))
+
     def test_quote_returns_copy(self):
         self.feed.handle_message(json.dumps(KLINE))
         self.feed.quote("BTCUSDT").price = 1.0

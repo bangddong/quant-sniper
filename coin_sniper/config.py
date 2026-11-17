@@ -29,7 +29,7 @@ FEED_RECONNECT_DELAY_SECONDS = 3
 ORDER_CONFIRM_TIMEOUT_SECONDS = 20; CANDLE_COUNT = 70   # 주문 하나의 체결 확인 전체 기한(단조 시계)
 ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS = 5   # 전송이 일시 오류로 실패한 주문의 확인 기한
 INTENT_NOT_FOUND_GRACE_SECONDS = 60     # 조회에 안 보이는 주문을 "주문된 적 없음"으로 볼 때까지의 유예
-PROTECTIVE_STOPS_ENABLED = True          # Task 3 결과로 확정
+PROTECTIVE_STOPS_ENABLED = True          # 데모 확인 스크립트(3번) 결과로 확정할 것 — 아직 미확인
 STOP_LIMIT_OFFSET_PCT = 0.01             # 손절 주문의 지정가 = 발동가 × (1 - 0.01)
 STOP_REPLACE_MIN_MOVE_PCT = 0.005
 RECON_ESCALATE_SECONDS = 600
@@ -38,6 +38,7 @@ RECV_WINDOW_MS = 5000; HTTP_TIMEOUT_SECONDS = 10; DEFAULT_BAN_RETRY_SECONDS = 60
 EVENT_RETENTION_DAYS = 7; METRICS_RETENTION_DAYS = 400
 DASHBOARD_MIN_INTERVAL_SECONDS = 300; DASHBOARD_HEARTBEAT_SECONDS = 1800   # 변화 있을 때 / 변화 없어도
 DASHBOARD_PUBLISH_TIMEOUT_SECONDS = 60   # git 명령 하나의 최대 시간(멈춘 push가 매매를 막지 않게)
+DASHBOARD_BRANCH = "dashboard"           # 게시 브랜치 기본값(환경 변수 COIN_DASHBOARD_BRANCH로 바꾼다)
 
 _ENDPOINTS = {
     "demo": ("https://demo-api.binance.com", "wss://demo-stream.binance.com/ws"),
@@ -61,6 +62,7 @@ class Settings:
     state_dir: Path
     starting_capital: float
     auto_git_push: bool
+    dashboard_branch: str = DASHBOARD_BRANCH
 
     def require_keys(self) -> None:
         for value in (self.api_key, self.api_secret):
@@ -95,4 +97,5 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         state_dir=_REPO_ROOT / "state" / mode,
         starting_capital=capital,
         auto_git_push=_flag(env.get("AUTO_GIT_PUSH", "false")),
+        dashboard_branch=env.get("COIN_DASHBOARD_BRANCH", "").strip() or DASHBOARD_BRANCH,
     )

@@ -28,7 +28,7 @@ from coin_sniper.config import (
 from coin_sniper.halts import LOOP_ERROR, MAINTENANCE, ORDER_UNCONFIRMED, PROTECTIVE_CANCEL
 from coin_sniper.ledger import add_intent, new_client_id
 from coin_sniper.models import ApiResult, OrderState, SymbolRules
-from coin_sniper.risk import floor_to_step, floor_to_tick, time_stop_due, update_stop
+from coin_sniper.risk import floor_to_step, floor_to_tick, is_tradable_amount, time_stop_due, update_stop
 
 TIME_STOP_REASON = f"타임스탑 ({MAX_HOLD_HOURS}시간 경과)"
 EXCHANGE_STOP_REASON = "거래소 손절"
@@ -326,7 +326,7 @@ class Executor:
 
     @staticmethod
     def _is_dust(rule: SymbolRules, qty: float, price: float) -> bool:
-        return qty <= 0 or floor_to_step(qty, rule.step_size) == 0 or qty * price < rule.min_notional
+        return not is_tradable_amount(qty, price, rule)    # 팔 수 없는 양(진입의 미관리 잔고 판정과 같은 규칙)
 
     def _close_dust(self, symbol: str, now: datetime) -> None:
         """팔 수 없는 포지션(1스텝 미만 또는 최소 주문 금액 미만)을 저널로 닫는다: 잔량 기록, 남은 원가는 손실,

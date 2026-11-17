@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from coin_sniper.config import (
-    DASHBOARD_HEARTBEAT_SECONDS, DASHBOARD_MIN_INTERVAL_SECONDS, DASHBOARD_PUBLISH_TIMEOUT_SECONDS, QUOTE_ASSET,
+    DASHBOARD_BRANCH, DASHBOARD_HEARTBEAT_SECONDS, DASHBOARD_MIN_INTERVAL_SECONDS, DASHBOARD_PUBLISH_TIMEOUT_SECONDS, QUOTE_ASSET,
     SIGNAL_CONFIRMATIONS,
 )
 from coin_sniper.halts import RECON_MISMATCH
@@ -365,7 +365,7 @@ def git_env() -> dict[str, str]:
 
 
 def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_dir: Path,
-            runner: Callable = subprocess.run, branch: str = "dashboard") -> bool:
+            runner: Callable = subprocess.run, branch: str = DASHBOARD_BRANCH) -> bool:
     """세 파일을 부모 없는 단일 커밋으로 origin/dashboard에 덮어쓴다(원본 sync_dashboard_to_branch와 같은 절차).
     어떤 실패든 False만 돌려준다: git의 출력(stderr)은 어디에도 남기지 않는다."""
     try:

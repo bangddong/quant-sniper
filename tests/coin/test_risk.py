@@ -92,6 +92,16 @@ class RiskTests(unittest.TestCase):
     def test_drawdown_none_peak_uses_equity(self):
         self.assertEqual(drawdown_controls(100, None), (100.0, 0.0, 1.0, False))
 
+    def test_is_tradable_amount_uses_floored_qty_and_min_notional(self):
+        from coin_sniper.risk import is_tradable_amount
+        r = SymbolRules(symbol="SOLUSDT", base="SOL", quote="USDT", trading=True,
+                        step_size=0.001, tick_size=0.01, min_notional=5.0)
+        self.assertTrue(is_tradable_amount(0.05, 100.0, r))          # 정확히 최소 금액
+        self.assertFalse(is_tradable_amount(0.0509, 98.5, r))        # 내림 0.05 × 98.5 < 5 (내리기 전은 5.01)
+        self.assertFalse(is_tradable_amount(0.0009, 1e6, r))         # 1스텝 미만
+        self.assertFalse(is_tradable_amount(0.0, 100.0, r))
+        self.assertFalse(is_tradable_amount(-1.0, 100.0, r))
+
     def test_time_stop_is_168_hours_from_entry(self):
         pos = {"entry_time": "2026-11-10T03:00:00+00:00"}
         self.assertFalse(time_stop_due(pos, datetime(2026, 11, 17, 2, 59, tzinfo=timezone.utc)))

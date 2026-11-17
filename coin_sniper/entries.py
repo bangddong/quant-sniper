@@ -15,7 +15,7 @@ from decimal import Decimal
 
 from coin_sniper import config
 from coin_sniper.config import MARKET_PROXY_SYMBOL, MAX_POSITIONS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS, SIGNAL_CONFIRMATIONS
-from coin_sniper.risk import account_value, floor_to_step, position_open_risk, size_entry
+from coin_sniper.risk import account_value, is_tradable_amount, position_open_risk, size_entry
 from coin_sniper.strategy import confirm_persistent_signals, day_progress, evaluate_signals
 
 SKIP_HELD = "이미 보유 중"
@@ -104,8 +104,7 @@ class EntryManager:
         if base not in e.unmanaged_assets:
             return False
         free, locked = (e.balances or {}).get(base, (0.0, 0.0))
-        qty = _dec(floor_to_step(float(_dec(free) + _dec(locked)), rule.step_size))
-        return qty > 0 and qty * _dec(price) >= _dec(rule.min_notional)
+        return is_tradable_amount(float(_dec(free) + _dec(locked)), price, rule)
 
     def _skip(self, symbol: str, reason: str) -> tuple[float, bool]:
         self.e._event("SKIP", reason, symbol)

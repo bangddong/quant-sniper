@@ -229,6 +229,16 @@ class BinanceRestTest(unittest.TestCase):
         self.assertTrue(ex.open_orders().ok)
         self.assertNotIn("symbol", op.query())
 
+    def test_unknown_order_lookup_is_reported_as_successful_call(self):
+        calls = []
+        ex, _ = make(http(400, {"code": -2013, "msg": "Order does not exist."}), calls=calls)
+        ex.get_order("ETHUSDT", "nope")
+        self.assertEqual([(n, r.ok) for n, r in calls], [("order.get", True)])   # 예상된 답: 실패율에 넣지 않는다
+        calls = []
+        ex, _ = make(http(400, {"code": -2013, "msg": "x"}), calls=calls)
+        ex.cancel_order("ETHUSDT", "nope")                    # 취소의 -2013은 그대로 실패
+        self.assertEqual([r.ok for _, r in calls], [False])
+
     def test_unknown_order_is_ok_but_not_exists(self):
         ex, _ = make(http(400, {"code": -2013, "msg": "Order does not exist."}))
         res = ex.get_order("ETHUSDT", "nope")

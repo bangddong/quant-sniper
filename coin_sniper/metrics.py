@@ -103,6 +103,9 @@ class Metrics:
                 halt_seconds[code] = halt_seconds.get(code, 0) + secs
 
         elapsed_today = (now_utc - now_utc.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
+        loop_days = sorted(k for k, b in self._days.items() if b["loops_ok"] + b["loops_failed"] > 0)
+        if loop_days:                                      # 기록보다 긴 기간: 루프가 처음 기록된 날부터
+            start = max(start, date.fromisoformat(loop_days[0]))
         n_days = max((today - start).days + 1, 0)
         period = max((n_days - 1) * _DAY_SECONDS + elapsed_today, 0) if n_days else 0
         uptime = min(total["loops_ok"] * POLL_INTERVAL_SECONDS / period * 100, 100.0) if period > 0 else 0.0

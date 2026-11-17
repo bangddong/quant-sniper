@@ -29,6 +29,14 @@ def floor_to_tick(price: float, tick: float) -> float:
     return _floor(price, tick)
 
 
+def is_tradable_amount(qty: float, price: float, rule: SymbolRules) -> bool:
+    """거래소에 낼 수 있는 양인가: 수량 단위로 내린 수량이 0보다 크고, 내린 수량 × 가격이 최소 주문 금액 이상."""
+    if not (math.isfinite(qty) and math.isfinite(price)) or qty <= 0 or price <= 0:
+        return False
+    floored = _d(floor_to_step(qty, rule.step_size))
+    return floored > 0 and floored * _d(price) >= _d(rule.min_notional)
+
+
 def account_value(risk_state: dict, positions: dict, prices: dict[str, float]) -> tuple[float, float]:
     """가상 계좌의 (현금, 평가자산). 가격이 없는 보유 종목은 KeyError."""
     cash = float(risk_state["starting_capital"]) + float(risk_state["realized_pnl"])
