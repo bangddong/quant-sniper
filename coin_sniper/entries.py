@@ -41,11 +41,13 @@ class EntryManager:
         self.raw = 0                       # 이번 루프 신호 수
         self.confirmed = 0                 # 이번 루프 확인된 신호 수
         self.evaluated = False             # 이번 루프에 평가했는가
+        self.not_evaluated_reason = "루프 실행 전"   # 평가하지 않은 이유(대시보드용), 평가했으면 의미 없음
 
     # ---- 루프 경계 -------------------------------------------------------------------
     def begin_loop(self) -> None:
         self.raw = self.confirmed = 0
         self.evaluated = False
+        self.not_evaluated_reason = "진입 허용 조건 미충족"   # run이 불리지 않은 경우
 
     def end_loop(self) -> None:
         """평가하지 않은 루프는 연속이 끊긴 것이다."""
@@ -60,10 +62,13 @@ class EntryManager:
     def run(self, now: datetime) -> None:
         e = self.e
         if e.equity is None or e.cash is None or e.balances is None:
+            self.not_evaluated_reason = "평가액·현금·계좌 잔고 모름"
             return                                         # 모르면 평가하지 않는다(end_loop가 초기화)
         today = now.astimezone(timezone.utc).date().isoformat()
         if not self._live(MARKET_PROXY_SYMBOL, today):
+            self.not_evaluated_reason = "시장 프록시 실시간 시세 없음"
             return                                         # 시장 봉이 실시간이 아니다: 평가하지 않음
+        self.not_evaluated_reason = "평가 중 오류 또는 호출 한도"   # 확인까지 끝나기 전에 빠져나간 경우
         market = e.candles(MARKET_PROXY_SYMBOL, now) or []
         candles_by_symbol = {}
         for symbol in e.universe.get("symbols", []):

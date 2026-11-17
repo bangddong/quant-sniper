@@ -14,14 +14,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable
 
+from coin_sniper import config
 from coin_sniper.config import (
-    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, MARKET_PROXY_SYMBOL,
-    MAX_POSITIONS, POLL_INTERVAL_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
+    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
+    MAX_POSITIONS, MIN_STOP_LOSS_PCT, POLL_INTERVAL_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
     RECON_ESCALATE_SECONDS, UNIVERSE_FETCH_PAUSE_SECONDS, UNIVERSE_MIN_COUNT,
     UNIVERSE_RETRY_SECONDS, Settings,
 )
 from coin_sniper.exchange.base import Exchange, Feed
-from coin_sniper.entries import EntryManager
+from coin_sniper.entries import SKIP_HELD, SKIP_QUOTE, SKIP_RULE, SKIP_SIZE, EntryManager
 from coin_sniper.execution import Executor
 from coin_sniper.halts import (
     ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, MAINTENANCE, RATE_LIMIT,
@@ -29,9 +30,9 @@ from coin_sniper.halts import (
     HaltBoard,
 )
 from coin_sniper.ledger import StateStore, record_event
-from coin_sniper.metrics import Metrics, append_equity
+from coin_sniper.metrics import Metrics, append_equity, period_returns
 from coin_sniper.models import ApiResult, SymbolRules
-from coin_sniper.risk import account_value, drawdown_controls
+from coin_sniper.risk import account_value, drawdown_controls, position_open_risk, size_entry
 from coin_sniper.strategy import in_entry_blackout
 from coin_sniper.universe import is_excluded, select_universe
 
@@ -86,6 +87,9 @@ class Engine:
         self.drawdown: float | None = None
         self.size_multiplier = 1.0                         # Task 12 수량 산정용
         self.unmanaged_assets: list[str] = []
+        self.commit = "-"                                  # 실행 커밋(CLI가 넣는다, 대시보드 표시용)
+        self.last_account_sync: str | None = None          # 마지막 계좌 조회 성공 시각(ISO UTC)
+        self._last_loop_ok: bool | None = None
         self._candles: dict[str, list[dict]] = {}          # 그날의 일봉 캐시 (REST 원본)
         self._candles_day: str | None = None
         self._feed_symbols: list[str] | None = None
@@ -137,6 +141,7 @@ class Engine:
             self.risk_state["last_loop_at"] = now.isoformat()
         ok = self._guarded(self._save_state) and ok
         self.metrics.record_loop(ok, now)
+        self._last_loop_ok = ok
         self._guarded(lambda: self.store.save("metrics", self.metrics.to_dict()))
         return LoopReport(now=now, ok=ok, equity=self.equity, cash=self.cash,
                           entry_allowed=self.entry_allowed(now), halts=self.halts.active(),
@@ -328,6 +333,7 @@ class Engine:
         res = self._call("balances")
         if res.ok:
             self.balances = dict(res.value)
+            self.last_account_sync = self._now.isoformat()
             self._clear_halt(ACCOUNT_FETCH)
             self._clear_halt(MAINTENANCE)                  # 계좌 조회가 되면 점검은 끝난 것으로 본다
         elif res.kind != "fatal":
@@ -502,6 +508,7 @@ class Engine:
                 and len(self.positions) < MAX_POSITIONS)
 
     def snapshot(self, now: datetime) -> dict:
+        """대시보드용 상태 사본. 거래소를 부르지 않는다(피드 시세와 메모리·저장 상태만 읽는다)."""
         halts = []
         for halt in self.halts.active():
             item = dict(halt)
@@ -509,10 +516,106 @@ class Engine:
             if halt["code"] == RECON_MISMATCH and (now - since).total_seconds() > RECON_ESCALATE_SECONDS:
                 item["needs_manual"] = True
             halts.append(item)
+        if self._last_loop_ok is False:
+            status = "error"
+        else:
+            status = "halted" if halts else "running"
+        connected, feed_error = self.feed.health()
+        proxy_last = self.feed.quote(MARKET_PROXY_SYMBOL, float("inf"))   # 오래됐어도 마지막 수신 시각
+        proxy = self.feed.quote(MARKET_PROXY_SYMBOL, QUOTE_MAX_AGE_SECONDS)
+        equity, rs, entries = self.equity, self.risk_state, self.entries
+        open_risk = sum(position_open_risk(p) for p in self.positions.values())
+        open_buys = sum(1 for i in self.intents.values() if i.get("side") == "BUY")
+        day_open = rs.get("day_open_equity")
         return {
-            "mode": self.settings.mode, "now": now.isoformat(), "halts": halts,
-            "equity": self.equity, "cash": self.cash,
-            "universe_date": self.universe.get("date"), "universe": list(self.universe.get("symbols", [])),
-            "positions": copy.deepcopy(self.positions), "unmanaged_assets": list(self.unmanaged_assets),
-            "entry_allowed": self.entry_allowed(now), "signal_progress": self.entries.progress(),
+            "mode": self.settings.mode, "now": now.isoformat(), "status": status,
+            "entry_allowed": self.entry_allowed(now), "halts": halts,
+            "feed_connected": bool(connected), "feed_error": feed_error or "",
+            "last_quote_at": (datetime.fromtimestamp(proxy_last.received_at, timezone.utc).isoformat()
+                              if proxy_last else None),
+            "last_account_sync": self.last_account_sync, "last_loop_at": rs.get("last_loop_at"),
+            "commit": self.commit,
+            "universe_date": self.universe.get("date"), "universe": self._universe_rows(open_risk),
+            "signal_progress": entries.progress(),
+            "entries_not_evaluated_reason": None if entries.evaluated else entries.not_evaluated_reason,
+            "equity": equity, "cash": self.cash, "starting_capital": float(rs.get("starting_capital", 0.0)),
+            "drawdown_pct": self.drawdown * 100 if equity is not None and self.drawdown is not None else None,
+            "daily_return_pct": (equity / float(day_open) - 1) * 100 if equity is not None and day_open else None,
+            "size_multiplier": float(self.size_multiplier),
+            "open_risk_pct": open_risk / equity * 100 if equity else None,
+            "free_slots": max(0, MAX_POSITIONS - len(self.positions) - open_buys),
+            "positions": [self._position_row(sym, pos, now) for sym, pos in self.positions.items()],
+            "unmanaged_assets": list(self.unmanaged_assets),
+            "protective_stops_enabled": bool(config.PROTECTIVE_STOPS_ENABLED),
+            "trades": self.store.load("trades", []), "events": copy.deepcopy(self.events),
+            "metrics": {"24h": self.metrics.summary(now, 1), "7d": self.metrics.summary(now, 7),
+                        "all": self.metrics.summary(now, None)},
+            "returns": self._returns(proxy.price if proxy else None),
+            "weekly_equity": self._weekly_equity(),
         }
+
+    def _universe_rows(self, open_risk: float) -> list[dict]:
+        """감시 종목별 지금의 최대 수량. 손절폭은 MIN_STOP_LOSS_PCT로 가정한 표시용 추정이다."""
+        cash = self.cash
+        if cash is not None and self.balances is not None:
+            cash = min(cash, float(self.balances.get(QUOTE_ASSET, (0.0, 0.0))[0]))
+        rows = []
+        for symbol in self.universe.get("symbols", []):
+            rule = self.rules.get(symbol)
+            quote = self.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
+            price = quote.price if quote else None
+            known = self.equity is not None and cash is not None
+            qty = 0.0
+            if rule is not None and rule.trading and price and known:
+                qty = size_entry(self.equity, cash, price, MIN_STOP_LOSS_PCT, open_risk, rule, self.size_multiplier)
+            if symbol in self.positions:
+                reason = SKIP_HELD
+            elif rule is None or not rule.trading:
+                reason = SKIP_RULE
+            elif price is None:
+                reason = SKIP_QUOTE
+            elif not known:
+                reason = "평가액·현금 모름"
+            elif qty <= 0:
+                reason = f"{SKIP_SIZE} (손절폭 {MIN_STOP_LOSS_PCT:.0%} 가정)"
+            else:
+                reason = ""
+            rows.append({"symbol": symbol, "price": price, "max_qty": qty, "eligible": not reason, "reason": reason})
+        return rows
+
+    def _position_row(self, symbol: str, pos: dict, now: datetime) -> dict:
+        quote = self.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
+        price, buy = (quote.price if quote else None), float(pos["buy_price"])
+        prot = pos.get("protective") or {}
+        if not config.PROTECTIVE_STOPS_ENABLED:
+            protective = "disabled"
+        else:
+            protective = "on" if prot.get("state") == "open" else "off"
+        held = (now - datetime.fromisoformat(pos["entry_time"])).total_seconds() / 3600
+        return {"symbol": symbol, "qty": float(pos["qty"]), "buy_price": buy, "price": price,
+                "return_pct": (price - buy) / buy * 100 if price and buy else None,
+                "initial_stop": buy * (1 - float(pos["stop_loss_pct"])), "stop_price": float(pos["stop_price"]),
+                "protective": protective, "protective_state": prot.get("state"),
+                "hours_left": max(0.0, MAX_HOLD_HOURS - held), "trailing_active": bool(pos.get("trailing_active")),
+                "strategy": pos.get("strategy")}
+
+    def _returns(self, btc_now: float | None) -> dict:
+        """period_returns 결과. 지금 평가액이나 BTC 시세를 모르면 그쪽 값은 None."""
+        out = period_returns(self.equity_history, self.equity if self.equity is not None else 1.0,
+                             btc_now if btc_now is not None else 1.0)
+        for row in out.values():
+            if self.equity is None:
+                row["bot"] = None
+            if btc_now is None:
+                row["btc"] = None
+        return out
+
+    def _weekly_equity(self) -> list[dict]:
+        """일요일(UTC) 평가액 최근 12개와 직전 일요일 줄 대비 수익률(%)."""
+        sundays = [r for r in self.equity_history if datetime.fromisoformat(r["day"]).weekday() == 6]
+        rows = []
+        for prev, row in zip([None] + sundays[:-1], sundays):
+            base = float(prev["equity"]) if prev else 0.0
+            rows.append({"day": row["day"], "equity": float(row["equity"]),
+                         "return_pct": (float(row["equity"]) / base - 1) * 100 if base else None})
+        return rows[-12:]
