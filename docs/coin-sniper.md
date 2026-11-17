@@ -42,16 +42,16 @@ python -W error -m unittest discover -s tests/coin -v
 | `MODE` | `demo` | `demo` 또는 `live`. 그 밖의 값이면 실행을 거부한다. |
 | `BINANCE_DEMO_API_KEY` / `BINANCE_DEMO_API_SECRET` | 없음 | `MODE=demo`일 때 쓰는 키. 비어 있거나 `your_`로 시작하면 `run`·`reconcile`이 거부한다(종료 코드 2). |
 | `BINANCE_LIVE_API_KEY` / `BINANCE_LIVE_API_SECRET` | 없음 | `MODE=live`일 때 쓰는 키. 출금 권한은 주지 말 것. |
-| `LIVE_TRADING_ENABLED` | `false` | `MODE=live`는 이 값이 `true`일 때만 실행된다. |
+| `COIN_LIVE_TRADING_ENABLED` | `false` | `MODE=live`는 이 값이 `true`일 때만 실행된다. 코인 봇 전용이다(주식 봇의 `LIVE_TRADING_ENABLED`는 보지 않는다). |
 | `STARTING_CAPITAL_USDT` | `1000` | 봇의 가상 계좌 시작 자본(USDT). 처음 실행할 때 상태에 저장되며, 그 뒤에는 `reconcile --reset-capital`로만 다시 반영된다. |
 | `AUTO_GIT_PUSH` | `false` | `true`면 대시보드를 `origin/dashboard` 브랜치에 게시한다. |
 
 주의:
 
 - **공개 저장소에서 `AUTO_GIT_PUSH=true`면 보유 종목·체결 내역·평가액이 공개된다.** 키·시크릿·계좌 식별정보는 게시하지 않는다.
-- `.env`는 주식 봇과 같이 쓴다. `LIVE_TRADING_ENABLED`와 `AUTO_GIT_PUSH`는 **두 봇에 함께 적용된다.**
-  - 주식 봇 때문에 `LIVE_TRADING_ENABLED=true`인 상태라면, 코인 봇은 `MODE=live`와 실거래 키를 넣는 순간 실거래가 된다.
-    `MODE`는 기본값(`demo`)으로 두거나 명시적으로 `demo`라고 적어 둔다.
+- `.env`는 주식 봇과 같이 쓴다. `AUTO_GIT_PUSH`는 **두 봇에 함께 적용된다.**
+  - 실거래 스위치는 따로다: 주식 봇은 `LIVE_TRADING_ENABLED`, 코인 봇은 `COIN_LIVE_TRADING_ENABLED`.
+    주식 봇 때문에 `LIVE_TRADING_ENABLED=true`여도 코인 봇은 실거래가 되지 않는다(`MODE=live`면 실행을 거부한다).
   - 주식 봇의 `AUTO_GIT_PUSH` 기본값은 `true`, 코인 봇은 `false`다. 한 봇에만 다르게 주려면 그 프로세스의 환경 변수로
     직접 지정한다(예: 리눅스 `AUTO_GIT_PUSH=false python bot.py`). 환경 변수가 `.env`보다 우선한다.
 - **두 봇은 같은 `origin/dashboard` 브랜치에 강제 push한다.** 둘 다 게시하면 서로의 대시보드를 덮어쓴다.

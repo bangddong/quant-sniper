@@ -387,7 +387,7 @@ class MainTests(TempStateMixin, unittest.TestCase):
     def test_run_refuses_on_bad_settings(self):
         code, _, err = self.call_main(["run"], env={"MODE": "live", "BINANCE_LIVE_API_KEY": "x"})
         self.assertEqual(code, 2)
-        self.assertIn("LIVE_TRADING_ENABLED", err)
+        self.assertIn("COIN_LIVE_TRADING_ENABLED", err)
 
     def test_run_refuses_on_corrupt_state(self):                     # 종료 코드 2, 원인 파일 이름 출력
         self.state_dir.mkdir(parents=True)

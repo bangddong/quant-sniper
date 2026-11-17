@@ -20,8 +20,14 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(SettingsError):
             load_settings({"MODE": "live", "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"})
 
+    def test_live_refused_with_only_shared_stock_bot_flag(self):
+        with self.assertRaises(SettingsError) as ctx:          # 주식 봇의 플래그는 코인 봇을 실거래로 만들지 않는다
+            load_settings({"MODE": "live", "LIVE_TRADING_ENABLED": "true",
+                           "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"})
+        self.assertIn("COIN_LIVE_TRADING_ENABLED", str(ctx.exception))
+
     def test_live_when_enabled(self):
-        cfg = load_settings({"MODE": "live", "LIVE_TRADING_ENABLED": "true",
+        cfg = load_settings({"MODE": "live", "COIN_LIVE_TRADING_ENABLED": "true",
                              "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"})
         self.assertEqual(cfg.rest_base, "https://api.binance.com")
         self.assertEqual(cfg.stream_base, "wss://stream.binance.com:9443/ws")

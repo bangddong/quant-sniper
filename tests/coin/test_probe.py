@@ -258,7 +258,7 @@ class RenderTests(unittest.TestCase):
 
 class MainTests(unittest.TestCase):
     def test_refuses_live(self):
-        env = {"MODE": "live", "LIVE_TRADING_ENABLED": "true",
+        env = {"MODE": "live", "COIN_LIVE_TRADING_ENABLED": "true",
                "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"}
         err = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \

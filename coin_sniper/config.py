@@ -76,8 +76,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     mode = env.get("MODE", "demo").strip().lower() or "demo"
     if mode not in _ENDPOINTS:
         raise SettingsError(f"알 수 없는 MODE: {mode!r} (demo 또는 live)")
-    if mode == "live" and not _flag(env.get("LIVE_TRADING_ENABLED", "false")):
-        raise SettingsError("live 모드는 LIVE_TRADING_ENABLED=true 가 필요합니다")
+    # 코인 봇 전용 실거래 스위치. 주식 봇과 같이 쓰는 LIVE_TRADING_ENABLED는 보지 않는다.
+    if mode == "live" and not _flag(env.get("COIN_LIVE_TRADING_ENABLED", "false")):
+        raise SettingsError("live 모드는 COIN_LIVE_TRADING_ENABLED=true 가 필요합니다 "
+                            "(주식 봇의 LIVE_TRADING_ENABLED는 코인 봇에 쓰이지 않습니다)")
     prefix = f"BINANCE_{mode.upper()}"
     rest_base, stream_base = _ENDPOINTS[mode]
     try:
