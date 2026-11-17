@@ -600,14 +600,27 @@ class Engine:
                 "strategy": pos.get("strategy")}
 
     def _returns(self, btc_now: float | None) -> dict:
-        """period_returns 결과. 지금 평가액이나 BTC 시세를 모르면 그쪽 값은 None."""
-        out = period_returns(self.equity_history, self.equity if self.equity is not None else 1.0,
+        """period_returns 결과 + 각 기간의 비교 기준일(base_day, period_returns와 같은 행 위치 규칙).
+        지금 평가액이나 BTC 시세를 모르면 그쪽 값은 None. "start"는 시작 자본 대비(봇만, 구간 시작일부터)."""
+        hist = self.equity_history
+        out = period_returns(hist, self.equity if self.equity is not None else 1.0,
                              btc_now if btc_now is not None else 1.0)
-        for row in out.values():
+        bases = {"1d": 1, "7d": 7, "30d": 30}
+        for key, row in out.items():
+            back = bases.get(key)
+            base = (hist[-back] if len(hist) >= back else None) if back else (hist[0] if hist else None)
+            row["base_day"] = base["day"] if base else None
             if self.equity is None:
                 row["bot"] = None
             if btc_now is None:
                 row["btc"] = None
+        capital = float(self.risk_state.get("starting_capital") or 0.0)
+        segment = self.risk_state.get("segment_start")
+        out["start"] = {
+            "bot": (self.equity / capital - 1) * 100 if self.equity is not None and capital > 0 else None,
+            "btc": None,
+            "base_day": datetime.fromisoformat(segment).astimezone(timezone.utc).date().isoformat() if segment else None,
+        }
         return out
 
     def _weekly_equity(self) -> list[dict]:

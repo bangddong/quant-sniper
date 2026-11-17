@@ -64,8 +64,11 @@ def snapshot(**over) -> dict:
                    {"type": "SKIP", "symbol": "XRPUSDT", "reason": "실시간 시세 없음",
                     "timestamp": "2026-11-17T10:00:00+00:00", "count": 4}],
         "metrics": {"24h": summary(), "7d": summary(api_total=900), "all": summary(api_total=5000)},
-        "returns": {"1d": {"bot": 0.35, "btc": -1.2}, "7d": {"bot": 1.25, "btc": 3.4},
-                    "30d": {"bot": None, "btc": None}, "all": {"bot": 1.25, "btc": 3.4}},
+        "returns": {"1d": {"bot": 0.35, "btc": -1.2, "base_day": "2026-11-16"},
+                    "7d": {"bot": 1.25, "btc": 3.4, "base_day": "2026-11-10"},
+                    "30d": {"bot": None, "btc": None, "base_day": None},
+                    "all": {"bot": 1.25, "btc": 3.4, "base_day": "2026-11-01"},
+                    "start": {"bot": 1.25, "btc": None, "base_day": "2026-11-01"}},
         "weekly_equity": [{"day": "2026-11-15", "equity": 1009.0, "return_pct": 0.9}],
         "entries_not_evaluated_reason": None,
     }
@@ -100,16 +103,21 @@ class RenderTests(unittest.TestCase):
     def test_returns_table_has_btc_comparison(self):
         md = render_dashboard(snapshot())
         self.assertIn("| 기간 | 봇 | BTC 보유 |", md)
-        self.assertIn("| 오늘 | +0.35% | -1.20% |", md)
-        self.assertIn("| 7일 | +1.25% | +3.40% |", md)
-        self.assertIn("| 30일 | - | - |", md)
-        self.assertIn("| 전체 | +1.25% | +3.40% |", md)
+        self.assertIn("| 전일 대비 (기준 2026-11-16 종가) | +0.35% | -1.20% |", md)
+        self.assertIn("| 7행 전 대비 (기준 2026-11-10 종가) | +1.25% | +3.40% |", md)
+        self.assertIn("| 30행 전 대비 (기준 -) | - | - |", md)
+        self.assertIn("| 첫 기록 대비 (기준 2026-11-01 종가) | +1.25% | +3.40% |", md)
+        self.assertIn("| 시작 자본 대비 (2026-11-01부터) | +1.25% | - |", md)
+        self.assertNotIn("기록 누락 있음", md)
+        self.assertIn("수익률은 UTC 0시 평가액 기록 기준이며, 봇이 꺼져 있던 날은 기록이 없습니다.", md)
         self.assertIn("실거래소와 유사하지만 같지 않음", md)
         self.assertIn("| 2026-11-15 | 1,009.00 | +0.90% |", md)   # 주간 평가액
 
     def test_error_rate_table_has_three_windows(self):
         md = render_dashboard(snapshot())
-        self.assertIn("| 항목 | 24시간 | 7일 | 전체 |", md)
+        self.assertIn("| 항목 | 오늘(UTC 0시~) | 7일 | 전체 |", md)
+        self.assertNotIn("24시간", md)
+        self.assertIn("오늘 열은 UTC 0시부터 10시간 18분 분량", md)
         for label in ("API 호출", "API 실패율", "일시적/확정적 실패", "주문 전송/거절/미확인/부분 체결",
                       "시세 재연결", "시세 끊김 시간", "가동률", "중단 시간", "재시작", "루프 예외"):
             self.assertTrue(any(line.startswith(f"| {label}") for line in md.splitlines()), label)
@@ -129,6 +137,46 @@ class RenderTests(unittest.TestCase):
         self.assertIn("중단", md.split("## 1. 현재 상태", 1)[1].split("###", 1)[0])
         plain = render_dashboard(snapshot(halts=[dict(halt, needs_manual=False)]))
         self.assertNotIn("수동 정리 필요", plain)
+
+    def test_returns_rows_flag_missing_days(self):
+        ret = dict(snapshot()["returns"])
+        ret["1d"] = {"bot": 0.1, "btc": 0.2, "base_day": "2026-11-15"}      # 11-16 줄 없음
+        ret["7d"] = {"bot": 0.1, "btc": 0.2, "base_day": "2026-11-09"}      # 7일보다 오래됨
+        md = render_dashboard(snapshot(returns=ret))
+        self.assertIn("| 전일 대비 (기준 2026-11-15 종가 · 기록 누락 있음) | +0.10% | +0.20% |", md)
+        self.assertIn("| 7행 전 대비 (기준 2026-11-09 종가 · 기록 누락 있음) |", md)
+        self.assertNotIn("첫 기록 대비 (기준 2026-11-01 종가 · 기록 누락", md)
+
+    def test_start_capital_row_dash_when_unknown(self):
+        ret = dict(snapshot()["returns"], start={"bot": None, "btc": None, "base_day": "2026-11-01"})
+        md = render_dashboard(snapshot(returns=ret))
+        self.assertIn("| 시작 자본 대비 (2026-11-01부터) | - | - |", md)
+
+    def test_risk_label_names_daily_basis(self):
+        md = render_dashboard(snapshot())
+        self.assertIn("일일 손실 한도 기준 수익률 (오늘 첫 평가 대비)", md)
+        self.assertNotIn("| 오늘 수익률 |", md)
+
+    def test_universe_labels_when_entries_halted(self):
+        md = render_dashboard(snapshot())
+        self.assertIn("| SOLUSDT | 100 | 1.75 | 가능 |", md)
+        self.assertIn("| 매수 가능 |", md)
+        md = render_dashboard(snapshot(entry_allowed=False, status="halted"))
+        self.assertIn("| SOLUSDT | 100 | 1.75 | 가능(신규 매수 중단 중) |", md)
+        self.assertIn("수량 기준 가능 (현재 신규 매수 중단)", md)
+
+    def test_demo_footnote_only_in_demo(self):
+        self.assertIn("실거래소와 유사하지만 같지 않음", render_dashboard(snapshot()))
+        self.assertNotIn("실거래소와 유사하지만 같지 않음", render_dashboard(snapshot(mode="live")))
+
+    def test_max_drawdown_dash_without_capital(self):
+        md = render_dashboard(snapshot(starting_capital=None))
+        row = next(l for l in md.split("### 누적 성과", 1)[1].splitlines() if l.startswith("| 3 |"))
+        self.assertEqual(row.split(" | ")[5], "-")
+        self.assertIsNone(performance_stats([sell(-5)], None)["max_drawdown_pct"])
+        md = render_dashboard(snapshot(starting_capital=1000.0))
+        row = next(l for l in md.split("### 누적 성과", 1)[1].splitlines() if l.startswith("| 3 |"))
+        self.assertEqual(row.split(" | ")[5], "0.50%")
 
     def test_not_evaluated_reason_shown(self):
         md = render_dashboard(snapshot(entries_not_evaluated_reason="시장 프록시 실시간 시세 없음"))
@@ -270,6 +318,20 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(s.due(2109.0, False))
         self.assertTrue(s.due(2110.0, False))               # 하트비트: 30분
 
+    def test_schedule_backs_off_after_failure_but_keeps_flags(self):
+        s = PublishSchedule()
+        s.published(0.0)
+        s.mark_dirty(critical=True)
+        self.assertTrue(s.due(100.0, False))
+        s.failed(100.0)
+        self.assertFalse(s.due(100.0, True))
+        self.assertFalse(s.due(399.0, True))                # 실패 후 5분은 critical이어도 기다린다
+        self.assertTrue(s.due(400.0, False))                # 플래그는 남아 있다
+        s.failed(400.0)
+        self.assertFalse(s.due(699.0, False))
+        s.published(700.0)
+        self.assertFalse(s.due(701.0, False))
+
 
 class PublishTests(unittest.TestCase):
     def setUp(self):
@@ -306,6 +368,14 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(kwargs["cwd"], self.repo)
             self.assertTrue(kwargs["capture_output"])
             self.assertTrue(kwargs["check"])
+            self.assertEqual(kwargs["timeout"], 60)
+            self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+            self.assertIn("PATH", {k.upper() for k in kwargs["env"]})
+        for args_, kwargs in self.calls:                    # mktree는 input이 표준 입력이다(inherit 아님)
+            if args_[1] == "mktree":
+                self.assertNotIn("stdin", kwargs)
+            else:
+                self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual((self.work / "README.md").read_text(encoding="utf-8"), "# readme")
         self.assertEqual(json.loads((self.work / "dashboard_state.json").read_text(encoding="utf-8")), {"a": 1})
         self.assertEqual(json.loads((self.work / "dashboard_events.json").read_text(encoding="utf-8")),
@@ -317,6 +387,10 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(publish("# r", {}, [], self.repo, self.work, runner=run))
         run = self.runner([FileNotFoundError("git")])
         self.assertFalse(publish("# r", {}, [], self.repo, self.work, runner=run))
+        run = self.runner(["b1", "b2", "b3", "tree1", "commit1",
+                           subprocess.TimeoutExpired(["git", "push"], 60)])
+        self.assertFalse(publish("# r", {}, [], self.repo, self.work, runner=run))
+        self.assertEqual(len(self.calls), 6)
 
 
 class EngineSnapshotTests(unittest.TestCase):
@@ -353,7 +427,7 @@ class EngineSnapshotTests(unittest.TestCase):
         self.assertAlmostEqual(later["hours_left"], config.MAX_HOLD_HOURS - 10)
         self.assertAlmostEqual(pos["initial_stop"], pos["buy_price"] * (1 - eng.positions["SOLUSDT"]["stop_loss_pct"]))
         self.assertEqual(set(snap["metrics"]), {"24h", "7d", "all"})
-        self.assertEqual(set(snap["returns"]), {"1d", "7d", "30d", "all"})
+        self.assertEqual(set(snap["returns"]), {"1d", "7d", "30d", "all", "start"})
         self.assertEqual(snap["free_slots"], config.MAX_POSITIONS - 1)
         self.assertGreater(snap["open_risk_pct"], 0)
         rows = {r["symbol"]: r for r in snap["universe"]}
@@ -405,6 +479,15 @@ class EngineSnapshotTests(unittest.TestCase):
         feed._quotes.pop("BTCUSDT")
         snap = eng.snapshot(T0)
         self.assertIsNone(snap["returns"]["1d"]["btc"])
+        self.assertEqual(snap["returns"]["1d"]["base_day"], "2026-11-16")
+        self.assertIsNone(snap["returns"]["7d"]["base_day"])
+        self.assertEqual(snap["returns"]["all"]["base_day"], "2026-11-16")
+        start = snap["returns"]["start"]
+        self.assertEqual(start["base_day"], "2026-11-17")             # segment_start(UTC 날짜)
+        self.assertAlmostEqual(start["bot"], (eng.equity / 1000.0 - 1) * 100)
+        self.assertIsNone(start["btc"])
+        eng.equity = None
+        self.assertIsNone(eng.snapshot(T0)["returns"]["start"]["bot"])
         self.assertIsNone(snap["last_quote_at"])
 
     def test_weekly_equity_sundays_with_week_return(self):

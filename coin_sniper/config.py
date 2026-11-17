@@ -36,6 +36,7 @@ SLIPPAGE_ESTIMATE_PCT = 0.001
 RECV_WINDOW_MS = 5000; HTTP_TIMEOUT_SECONDS = 10; DEFAULT_BAN_RETRY_SECONDS = 60
 EVENT_RETENTION_DAYS = 7; METRICS_RETENTION_DAYS = 400
 DASHBOARD_MIN_INTERVAL_SECONDS = 300; DASHBOARD_HEARTBEAT_SECONDS = 1800   # 변화 있을 때 / 변화 없어도
+DASHBOARD_PUBLISH_TIMEOUT_SECONDS = 60   # git 명령 하나의 최대 시간(멈춘 push가 매매를 막지 않게)
 
 _ENDPOINTS = {
     "demo": ("https://demo-api.binance.com", "wss://demo-stream.binance.com/ws"),

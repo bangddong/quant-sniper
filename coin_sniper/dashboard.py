@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Callable
 
 from coin_sniper.config import (
-    DASHBOARD_HEARTBEAT_SECONDS, DASHBOARD_MIN_INTERVAL_SECONDS, QUOTE_ASSET, SIGNAL_CONFIRMATIONS,
+    DASHBOARD_HEARTBEAT_SECONDS, DASHBOARD_MIN_INTERVAL_SECONDS, DASHBOARD_PUBLISH_TIMEOUT_SECONDS, QUOTE_ASSET,
+    SIGNAL_CONFIRMATIONS,
 )
 from coin_sniper.halts import RECON_MISMATCH
 
@@ -49,16 +50,24 @@ def _table(header: list[str], align: str, rows: list[tuple], empty: str = "-") -
     return lines
 
 
-def _kst(iso: str | None) -> str | None:
+def _utc(iso: str | None) -> datetime | None:
     if not iso:
         return None
     try:
         t = datetime.fromisoformat(iso)
     except (TypeError, ValueError):
         return None
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return t.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _utc_day(iso: str | None):
+    t = _utc(iso)
+    return t.date() if t else None
+
+
+def _kst(iso: str | None) -> str | None:
+    t = _utc(iso)
+    return t.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S") if t else None
 
 
 def _num(value, fmt: str = ",.2f", suffix: str = "") -> str | None:
@@ -90,7 +99,7 @@ def _closed_stats(sells: list[dict]) -> tuple[int, float | None, float | None]:
     return len(sells), round(wins / len(sells) * 100, 1), avg
 
 
-def performance_stats(trades: list[dict], starting_capital: float = 1000.0) -> dict:
+def performance_stats(trades: list[dict], starting_capital: float | None = 1000.0) -> dict:
     """청산 성과. 청산 1건 = SELL 기록 1건(부분 매도도 각각), counted False(잔량 정리)는 뺀다.
     수수료·슬리피지는 모든 체결(BUY·SELL, counted 무관)에서 센다. 기초 자산 외 수수료 자산은 값을 매기지 않는다."""
     sells = sorted((t for t in trades if t.get("type") == "SELL" and t.get("counted")),
@@ -130,13 +139,13 @@ def performance_stats(trades: list[dict], starting_capital: float = 1000.0) -> d
         "max_loss_streak": max_streak, "total_net_pnl": sum(pnls), "total_fees_usdt": fees,
         "fees_unpriced_assets": sorted(unpriced),
         "avg_slippage_pct": sum(slips) / len(slips) if slips else None,
-        "max_drawdown_pct": max_dd / starting_capital * 100 if starting_capital else 0.0,
+        "max_drawdown_pct": max_dd / starting_capital * 100 if starting_capital else None,
         "by_strategy": by_strategy,
     }
 
 
 def _stats(snap: dict) -> dict:
-    return performance_stats(snap.get("trades") or [], snap.get("starting_capital") or 1000.0)
+    return performance_stats(snap.get("trades") or [], snap.get("starting_capital"))   # 모르면 최대 낙폭 "-"
 
 
 # ---- Markdown ---------------------------------------------------------------------------
@@ -176,13 +185,15 @@ def _status_section(s: dict) -> list[str]:
 
 def _watch_section(s: dict) -> list[str]:
     universe = s.get("universe") or []
+    allowed = bool(s.get("entry_allowed"))
+    ok_text = "가능" if allowed else "가능(신규 매수 중단 중)"
     lines = ["", "### 오늘의 감시", "", *_table(
-        ["기준일(UTC)", "감시 종목", "매수 가능"], "lrr",
+        ["기준일(UTC)", "감시 종목", "매수 가능" if allowed else "수량 기준 가능 (현재 신규 매수 중단)"], "lrr",
         [(s.get("universe_date"), len(universe), sum(1 for u in universe if u.get("eligible")))]),
         "", "#### 감시 종목", "", *_table(
         ["종목", "현재가", "최대 수량", "매수 가능성"], "lrrl",
         [(u.get("symbol"), _num(u.get("price"), ",.6g"), _qty(u.get("max_qty")),
-          "가능" if u.get("eligible") else (u.get("reason") or "불가")) for u in universe], "감시 종목 없음"),
+          ok_text if u.get("eligible") else (u.get("reason") or "불가")) for u in universe], "감시 종목 없음"),
         "", "#### 신호 확인 단계", "", *_table(
         ["종목", "전략", "연속 확인"], "llr",
         [(p.get("symbol"), STRATEGY_KO.get(p.get("strategy"), p.get("strategy")),
@@ -193,7 +204,8 @@ def _watch_section(s: dict) -> list[str]:
 
 def _risk_section(s: dict) -> list[str]:
     return ["", "### 위험 관리", "", *_table(
-        ["고점 대비 낙폭", "오늘 수익률", "주문 배율", "열린 위험 합계", "남은 슬롯"], "rrrrr",
+        ["고점 대비 낙폭", "일일 손실 한도 기준 수익률 (오늘 첫 평가 대비)", "주문 배율", "열린 위험 합계", "남은 슬롯"],
+        "rrrrr",
         [(_pct(s.get("drawdown_pct"), False), _pct(s.get("daily_return_pct")),
           _num((s.get("size_multiplier") or 0) * 100, ".0f", "%"), _pct(s.get("open_risk_pct"), False),
           s.get("free_slots"))])]
@@ -217,11 +229,21 @@ def _positions_section(s: dict) -> list[str]:
 
 def _returns_section(s: dict) -> list[str]:
     ret = s.get("returns") or {}
-    periods = [("오늘", "1d"), ("7일", "7d"), ("30일", "30d"), ("전체", "all")]
+    today = _utc_day(s.get("now"))
+    rows = []
+    for label, key, span in (("전일 대비", "1d", 1), ("7행 전 대비", "7d", 7), ("30행 전 대비", "30d", 30),
+                             ("첫 기록 대비", "all", None)):
+        r = ret.get(key) or {}
+        base = r.get("base_day")
+        basis = f"기준 {base} 종가" if base else "기준 -"
+        if base and span and today and (today - datetime.fromisoformat(base).date()).days > span:
+            basis += " · 기록 누락 있음"
+        rows.append((f"{label} ({basis})", _pct(r.get("bot")), _pct(r.get("btc"))))
+    start = ret.get("start") or {}
+    rows.append((f"시작 자본 대비 ({start.get('base_day') or '-'}부터)", _pct(start.get("bot")), None))
     st = _stats(s)
-    lines = ["", "## 2. 수익률", "", "### 기간별", "", *_table(
-        ["기간", "봇", "BTC 보유"], "lrr",
-        [(label, _pct((ret.get(k) or {}).get("bot")), _pct((ret.get(k) or {}).get("btc"))) for label, k in periods]),
+    lines = ["", "## 2. 수익률", "", "### 기간별", "", *_table(["기간", "봇", "BTC 보유"], "lrr", rows),
+        "", "> 수익률은 UTC 0시 평가액 기록 기준이며, 봇이 꺼져 있던 날은 기록이 없습니다.",
         "", "### 누적 성과", "", *_table(
         ["청산", "승률", "평균 이익", "평균 손실", "Profit Factor", "최대 낙폭", "최대 연속 손실", "누적 순손익",
          "누적 수수료", "평균 슬리피지"], "rrrrrrrrrr",
@@ -239,8 +261,9 @@ def _returns_section(s: dict) -> list[str]:
         "기록 없음"),
         "", "> 청산 1건은 매도 기록 1건입니다(부분 매도도 각각 1건). 잔량 정리는 통계에서 뺍니다. "
             "최대 낙폭은 누적 순손익 기준(시작 자본 대비)입니다.",
-        "> 기간별 수익률은 UTC 0시 평가액 기록 대비입니다. 데모 가격은 실거래소와 유사하지만 같지 않음.",
     ]
+    if str(s.get("mode", "demo")).lower() == "demo":
+        lines.append("> 데모 가격은 실거래소와 유사하지만 같지 않음.")
     if st["fees_unpriced_assets"]:
         lines.append(f"> 누적 수수료에서 뺀 자산(가격 모름): {_md(', '.join(st['fees_unpriced_assets']))}")
     return lines
@@ -271,8 +294,11 @@ def _errors_section(s: dict) -> list[str]:
         line("재시작", lambda x: f"{x.get('restarts', 0)}회"),
         line("루프 예외", lambda x: f"{x.get('loops_failed', 0)}회"),
     ]
-    return ["", "## 3. 오류율", "", *_table(["항목", "24시간", "7일", "전체"], "lrrr", rows),
-            "", "> 24시간은 오늘(UTC 0시부터), 7일은 오늘 포함 7일(UTC)입니다."]
+    now = _utc(s.get("now"))
+    minutes = (now.hour * 60 + now.minute) if now else None
+    cover = f"{minutes // 60}시간 {minutes % 60}분" if minutes is not None else "-"
+    return ["", "## 3. 오류율", "", *_table(["항목", "오늘(UTC 0시~)", "7일", "전체"], "lrrr", rows),
+            "", f"> 오늘 열은 UTC 0시부터 {cover} 분량입니다. 7일은 오늘 포함 7일(UTC 날짜)입니다."]
 
 
 def _events_section(s: dict) -> list[str]:
@@ -336,9 +362,13 @@ def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_d
                  "dashboard_events.json": json.dumps(events, ensure_ascii=False, indent=2),
                  "dashboard_state.json": json.dumps(state, ensure_ascii=False, indent=2)}
 
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")   # 자격 증명 프롬프트로 멈추지 않는다
+
         def git(*args, **extra) -> str:
+            if "input" not in extra:                       # mktree는 input이 표준 입력(파이프)이다
+                extra["stdin"] = subprocess.DEVNULL
             return runner(["git", *args], cwd=repo_dir, capture_output=True, text=True, check=True,
-                          **extra).stdout.strip()
+                          timeout=DASHBOARD_PUBLISH_TIMEOUT_SECONDS, env=env, **extra).stdout.strip()
         tree_input = ""
         for name, text in files.items():           # 이름 순서(git 트리 정렬과 같다)
             _write_atomic(work_dir / name, text)
@@ -348,15 +378,17 @@ def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_d
         commit = git("commit-tree", tree, "-m", COMMIT_MESSAGE)
         git("push", "-f", "origin", f"{commit}:refs/heads/dashboard")
         return True
-    except Exception:                              # git 없음, 비정상 종료, 파일 쓰기 실패 모두
+    except Exception:                              # git 없음, 비정상 종료, 시간 초과, 파일 쓰기 실패 모두
         return False
 
 
 class PublishSchedule:
-    """체결·위험·오류(critical)는 즉시, 변화가 있거나 보유 중이면 5분, 변화가 없어도 30분마다."""
+    """체결·위험·오류(critical)는 즉시, 변화가 있거나 보유 중이면 5분, 변화가 없어도 30분마다.
+    게시가 실패하면(failed) 그때부터 5분은 critical이어도 다시 시도하지 않는다. 플래그는 남겨 둔다."""
 
     def __init__(self):
         self._last: float | None = None
+        self._failed_at: float | None = None
         self._dirty = False
         self._critical = False
 
@@ -364,7 +396,12 @@ class PublishSchedule:
         self._dirty = True
         self._critical = self._critical or critical
 
+    def failed(self, now_ts: float) -> None:
+        self._failed_at = now_ts
+
     def due(self, now_ts: float, has_positions: bool) -> bool:
+        if self._failed_at is not None and now_ts - self._failed_at < DASHBOARD_MIN_INTERVAL_SECONDS:
+            return False
         if self._last is None or self._critical:
             return True
         elapsed = now_ts - self._last
@@ -374,4 +411,5 @@ class PublishSchedule:
 
     def published(self, now_ts: float) -> None:
         self._last = now_ts
+        self._failed_at = None
         self._dirty = self._critical = False
