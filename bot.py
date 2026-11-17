@@ -685,15 +685,16 @@ def run_trading_loop():
             positions = load_json(POSITIONS_FILE, {})
             trades = load_json(TRADES_FILE, [])
 
-            # 실계좌가 상태의 원본이다. 조회 실패 시 신규 주문을 차단한다.
+            # 실계좌가 상태의 원본이다. 조회 실패는 해당 루프의 신규 주문만 차단한다.
+            # 다음 조회가 정상이면 영구 안전잠금과 구분해 즉시 거래를 재개한다.
             account = api.get_account_snapshot()
+            account_lookup_failed = not account.get("ok")
             risk_state = load_json(RISK_FILE, {})
             if peak_assets is None:
                 peak_assets = risk_state.get("peak_assets") or None
-            if not account.get("ok"):
-                trading_halted = True
+            if account_lookup_failed:
                 risk_reasons.append(f"계좌 조회 실패: {account.get('error', 'unknown')}")
-                print(f"[{now_str}] [RISK] 계좌 조회 실패로 신규 주문을 중단합니다.")
+                print(f"[{now_str}] [RISK] 계좌 조회 실패로 이번 루프의 신규 주문을 중단합니다.")
             elif risk_date != today_str:
                 risk_date = today_str
                 if risk_state.get("date") == today_str:
@@ -891,7 +892,8 @@ def run_trading_loop():
             if not is_entry_window(now):
                 print(f"[{now_str}] [ENTRY] 신규 진입 허용 시간({ENTRY_START_TIME}~{ENTRY_END_TIME}) 외")
 
-            if not trading_halted and is_entry_window(now) and len(positions) < MAX_POSITIONS:
+            loop_halted = trading_halted or account_lookup_failed
+            if not loop_halted and is_entry_window(now) and len(positions) < MAX_POSITIONS:
                 market_candles = get_kiwoom_candles(
                     api, realtime, daily_candle_cache, MARKET_PROXY_CODE, now
                 )
@@ -1036,14 +1038,16 @@ def run_trading_loop():
                         trading_halted = True
                         risk_reasons.append("매수 체결 내역 GitHub push 실패")
                     
+            # 주문 처리 중 새 영구 안전잠금이 발생했을 수 있으므로 최종 상태를 다시 계산한다.
+            loop_halted = trading_halted or account_lookup_failed
             print(f"[{now_str}] 감시 완료. 현재 보유 종목: {list(positions.keys())}")
             status, detail = build_operational_status(
-                trading_halted, risk_reasons, len(positions)
+                loop_halted, risk_reasons, len(positions)
             )
             dashboard_context.update({
                 "last_loop_at": now_str,
                 "entry_allowed": (
-                    not trading_halted and is_entry_window(now)
+                    not loop_halted and is_entry_window(now)
                     and len(positions) < MAX_POSITIONS
                 ),
             })
