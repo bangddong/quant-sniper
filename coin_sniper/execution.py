@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 import copy
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 from coin_sniper import config
 from coin_sniper.config import (
-    MAX_HOLD_HOURS, ORDER_CONFIRM_TIMEOUT_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
+    INTENT_NOT_FOUND_GRACE_SECONDS, MAX_HOLD_HOURS, ORDER_CONFIRM_TIMEOUT_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
     STOP_LIMIT_OFFSET_PCT, STOP_REPLACE_MIN_MOVE_PCT,
 )
 from coin_sniper.halts import LOOP_ERROR, MAINTENANCE, ORDER_UNCONFIRMED, PROTECTIVE_CANCEL
@@ -70,40 +71,51 @@ class Executor:
         e.store.save("intents", e.intents)                 # 보내기 전에 저장(write-ahead)
         e.metrics.record_order("sent", now)
         send = e._call("market_buy" if side == "BUY" else "market_sell", symbol, qty, cid)
-        state = self._confirm(symbol, cid)                 # 보낸 결과와 상관없이 항상 조회로 확인
+        if not send.ok and send.kind == "transient":       # 실패한 그 시점에 건다(다음 계좌 조회 성공 때 해제)
+            e._set_halt(MAINTENANCE, f"거래소 주문 실패(일시 오류): {symbol} {_SIDE_KO[side]} ({send.error})")
+        rejected = not send.ok and send.kind == "permanent"
+        state = self._confirm(symbol, cid, rejected)       # 보낸 결과와 상관없이 항상 조회로 확인
         return self._settle(cid, state, send, now)
 
-    def _confirm(self, symbol: str, cid: str) -> OrderState | None:
+    def _confirm(self, symbol: str, cid: str, accept_absent: bool) -> OrderState | None:
+        """is_final이 될 때까지 1초 간격으로 조회한다. "없음"은 명시적 거절 뒤에만 바로 받아들이고,
+        그 밖에는 조회 지연일 수 있으므로 계속 조회한다. 끝까지 없으면 마지막 "없음" 상태를 돌려준다."""
+        last = None
         for attempt in range(max(1, int(ORDER_CONFIRM_TIMEOUT_SECONDS))):
             if attempt:
                 self.e.sleep(1)
             res = self.e._call("get_order", symbol, cid)
-            if res.ok and (not res.value.exists or res.value.is_final):
+            if not res.ok:
+                continue
+            if res.value.exists and res.value.is_final:
                 return res.value
-        return None
+            if not res.value.exists:
+                if accept_absent:
+                    return res.value
+                last = res.value
+        return last
 
     def _settle(self, cid: str, state: OrderState | None, send: ApiResult | None,
                 now: datetime) -> Outcome:
-        """확인 결과 분류. send가 None이면 재시작 후 의도 해소(전송 결과를 모른다)."""
+        """확인 결과 분류. send가 None이면 재시작 후 의도 해소(전송 결과를 모른다).
+        체결 정보(수량·금액·수수료)는 항상 get_order 한 곳에서만 가져온다(전송 응답은 쓰지 않는다)."""
         e = self.e
         intent = e.intents[cid]
         symbol, side = intent["symbol"], intent["side"]
         if state is None:
-            e.metrics.record_order("unconfirmed", now)
-            e._set_halt(ORDER_UNCONFIRMED, f"체결 미확인: {symbol} {_SIDE_KO[side]} {cid}")
-            return Outcome("unconfirmed", cid)
+            return self._unknown(cid, now)
         send_failed = send is not None and not send.ok
         if not state.exists:
-            self._drop_intent(cid)
-            if send is None:                               # 거래소가 못 본 의도: 조용히 지운다
-                return Outcome("absent", cid, state)
-            e.metrics.record_order("rejected", now)
-            error = send.error if send_failed else "거래소에 주문 없음"
-            if send_failed and send.kind == "transient":
-                e._set_halt(MAINTENANCE, f"거래소 주문 거부(일시 오류): {symbol} {_SIDE_KO[side]} ({error})")
-            else:
-                e._event("RISK", f"{_SIDE_KO[side]} 거절: {error}", symbol)
-            return Outcome("absent", cid, state, error)
+            if send_failed and send.kind == "permanent":   # 거래소가 명시적으로 거절: 바로 지운다
+                self._drop_intent(cid)
+                e.metrics.record_order("rejected", now)
+                e._event("RISK", f"{_SIDE_KO[side]} 거절: {send.error}", symbol)
+                return Outcome("rejected", cid, state, send.error)
+            age = (now - datetime.fromisoformat(intent["created_at"])).total_seconds()
+            if age < INTENT_NOT_FOUND_GRACE_SECONDS:       # 조회 지연일 수 있다: 모름
+                return self._unknown(cid, now)
+            self._drop_intent(cid)                         # 유예가 지나도 없다: 주문된 적 없음
+            return Outcome("absent", cid, state)
         if state.executed_qty <= 0:
             self._drop_intent(cid)
             e.metrics.record_order("rejected", now)
@@ -111,15 +123,33 @@ class Executor:
             e._event("RISK", f"{_SIDE_KO[side]} 거절: {error}", symbol)
             return Outcome("rejected", cid, state, error)
         rule = e.rules.get(symbol)
-        step = _dec(rule.step_size) if rule else Decimal(0)
-        full = _dec(state.executed_qty) >= _dec(intent["qty"]) - step
+        if rule is None:                                   # 수량 단위·최소 금액을 모르면 반영하지 않는다
+            return self._unknown(cid, now, "종목 규칙 미확보")
+        full = _dec(state.executed_qty) >= _dec(intent["qty"]) - _dec(rule.step_size)
         self._apply(cid, state, now)
         e.metrics.record_order("filled" if full else "partial", now)
         return Outcome("filled" if full else "partial", cid, state)
 
+    def _unknown(self, cid: str, now: datetime, why: str = "") -> Outcome:
+        """결과를 모른다: 의도를 남기고 ORDER_UNCONFIRMED. 미확인 지표는 의도당 한 번만 센다."""
+        e = self.e
+        intent = e.intents[cid]
+        if not intent.get("unconfirmed_logged"):
+            intent["unconfirmed_logged"] = True
+            e.store.save("intents", e.intents)
+            e.metrics.record_order("unconfirmed", now)
+        detail = f"체결 미확인: {intent['symbol']} {_SIDE_KO[intent['side']]} {cid}"
+        e._set_halt(ORDER_UNCONFIRMED, f"{detail} ({why})" if why else detail)
+        return Outcome("unconfirmed", cid)
+
     # ==== 1단계: 의도 해소 =============================================================
     def resolve_intents(self, now: datetime) -> None:
         e = self.e
+        if not e.intents:
+            e._clear_halt(ORDER_UNCONFIRMED)
+            return
+        e._ensure_rules(now)                               # 재시작 직후엔 규칙이 비어 있다
+        no_rules = set()
         for cid in list(e.intents):
             intent = e.intents.get(cid)
             if intent is None:
@@ -127,13 +157,18 @@ class Executor:
             if "journal" in intent:                        # 반영 도중 죽었다: 같은 값을 다시 쓴다
                 self._commit(cid)
                 continue
+            if intent["symbol"] not in e.rules:            # 규칙 없이는 반영하지 않는다: 남겨 둔다
+                no_rules.add(intent["symbol"])
+                continue
             res = e._call("get_order", intent["symbol"], cid)
             if not res.ok or (res.value.exists and not res.value.is_final):
-                continue                                   # 모름: 남겨 두고 다음 루프에 다시
+                self._unknown(cid, now)                    # 모름: 남겨 두고 다음 루프에 다시
+                continue
             self._settle(cid, res.value, None, now)
         if e.intents:
             pending = ", ".join(sorted({i["symbol"] for i in e.intents.values()}))
-            e._set_halt(ORDER_UNCONFIRMED, f"체결 미확인 주문: {pending}")
+            why = f" (종목 규칙 미확보: {', '.join(sorted(no_rules))})" if no_rules else ""
+            e._set_halt(ORDER_UNCONFIRMED, f"체결 미확인 주문: {pending}{why}")
         else:
             e._clear_halt(ORDER_UNCONFIRMED)
 
@@ -144,31 +179,34 @@ class Executor:
         if self._trade_recorded(cid):                      # 이미 반영된 체결
             self._drop_intent(cid)
             return
+        rule = e.rules.get(intent["symbol"])
+        if rule is None:                                   # 명시적 방어: 단위를 모르는 반영은 하지 않는다
+            raise RuntimeError(f"종목 규칙 없이 체결 반영 불가: {intent['symbol']}")
         if intent["side"] == "SELL":
             if intent["symbol"] not in e.positions:        # 체결을 지어내지 않는다
                 self._drop_intent(cid)
                 e._event("RISK", f"매도 체결 반영 불가: 장부에 포지션 없음 ({cid})", intent["symbol"])
                 return
-            journal = self._sell_journal(intent, state, now)
+            journal = self._sell_journal(intent, state, rule, now)
         else:
-            journal = self._buy_journal(intent, state, now)
+            journal = self._buy_journal(intent, state, rule, now)
         intent["journal"] = journal
         e.store.save("intents", e.intents)                 # 저널이 먼저 디스크에 있어야 한다
         self._commit(cid)
 
-    def _buy_journal(self, intent: dict, state: OrderState, now: datetime) -> dict:
+    def _buy_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
         """매수 체결 반영 자리 (Task 12). 장부를 직접 바꾸지 말고 아래 저널을 돌려준다(_commit이 쓴다):
         {"trade": 체결 기록(type "BUY", client_id 필수), "position": 반영 뒤 이 종목 포지션 dict(없애려면 None),
          "realized_pnl": 반영 뒤 risk_state["realized_pnl"](매수는 그대로), "dust": None}.
-        intent에는 symbol, side, qty, kind, reason, ref_price, extra(execute_market에 넘긴 값)가 있다."""
+        intent에는 symbol, side, qty, kind, reason, ref_price, extra(execute_market에 넘긴 값)가 있다.
+        rule은 항상 있다(규칙이 없으면 _settle이 반영 전에 멈춘다)."""
         raise NotImplementedError("매수 체결 반영은 Task 12에서 구현한다")
 
-    def _sell_journal(self, intent: dict, state: OrderState, now: datetime) -> dict:
+    def _sell_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
         e = self.e
         symbol = intent["symbol"]
         pos = copy.deepcopy(e.positions[symbol])
-        rule = e.rules.get(symbol)
-        step = _dec(rule.step_size) if rule else Decimal(0)
+        step = _dec(rule.step_size)
         sold, held = _dec(state.executed_qty), _dec(pos["qty"])
         quote_qty = float(state.quote_qty)
         proceeds = quote_qty - float(state.fees.get(QUOTE_ASSET, 0.0))
@@ -202,12 +240,31 @@ class Executor:
                 "realized_pnl": float(e.risk_state.get("realized_pnl", 0.0)) + net}
 
     @staticmethod
-    def _is_dust(rule: SymbolRules | None, qty: float, price: float) -> bool:
-        if qty <= 0:
-            return True
-        if rule is None:                                   # 규칙을 모르면 잔량 판정도 못 한다: 남겨 둔다
-            return False
-        return floor_to_step(qty, rule.step_size) == 0 or qty * price < rule.min_notional
+    def _is_dust(rule: SymbolRules, qty: float, price: float) -> bool:
+        return qty <= 0 or floor_to_step(qty, rule.step_size) == 0 or qty * price < rule.min_notional
+
+    def _close_dust(self, symbol: str, now: datetime) -> None:
+        """팔 수 없는 포지션(1스텝 미만 또는 최소 주문 금액 미만)을 저널로 닫는다: 잔량 기록, 남은 원가는 손실,
+        통계에서 빠지는 체결 기록(counted False), RISK 이벤트 하나."""
+        e = self.e
+        pos = e.positions[symbol]
+        cid = f"dust-{uuid.uuid4().hex[:12]}"
+        qty, cost = float(pos["qty"]), float(pos["cost"])
+        add_intent(e.intents, cid, symbol, "SELL", qty, "dust", "잔량 정리", now)
+        trade = {
+            "time": now.isoformat(), "type": "SELL", "symbol": symbol, "qty": 0, "price": None,
+            "quote_qty": 0.0, "fees": {}, "strategy": pos.get("strategy"), "reason": "잔량 정리",
+            "client_id": cid, "entry_price": float(pos["buy_price"]), "gross_pnl": 0.0, "net_pnl": -cost,
+            "net_return_pct": -100.0 if cost else 0.0, "slippage_pct": None, "counted": False,
+            "dust_writeoff": cost,
+        }
+        dust = {"symbol": symbol, "qty": qty, "time": now.isoformat(), "client_id": cid} if qty > 0 else None
+        e.intents[cid].update(ref_price=None, extra={}, journal={
+            "trade": trade, "position": None, "dust": dust,
+            "realized_pnl": float(e.risk_state.get("realized_pnl", 0.0)) - cost})
+        e.store.save("intents", e.intents)
+        self._commit(cid)
+        e._event("RISK", "잔량 정리: 최소 주문 미만 포지션 종료", symbol)
 
     def _commit(self, cid: str) -> None:
         """저널을 장부에 쓴다. 몇 번 불려도 결과가 같다."""
@@ -233,7 +290,7 @@ class Executor:
         e.store.save("risk_state", e.risk_state)
         self._drop_intent(cid)
         trade = journal["trade"]
-        if new and trade["type"] == "SELL":
+        if new and trade["type"] == "SELL" and trade.get("counted", True):
             e._event("SELL", trade["reason"], symbol, qty=trade["qty"], price=trade["price"],
                      net_return_pct=trade["net_return_pct"])
 
@@ -278,6 +335,10 @@ class Executor:
     def _manage_position(self, symbol: str, now: datetime) -> bool:
         """한 포지션 처리. 보호 주문 취소에 실패했으면 True."""
         e = self.e
+        rule = e.rules.get(symbol)
+        if rule is None:                                   # 수량·가격 단위를 모른다: 주문도 반영도 하지 않는다
+            e._event("RISK", "종목 규칙 없음: 주문 보류", symbol)
+            return False
         enabled = config.PROTECTIVE_STOPS_ENABLED
         if enabled and e.positions[symbol].get("protective"):
             if not self._check_protective(symbol, now) or symbol not in e.positions:
@@ -287,37 +348,54 @@ class Executor:
         if quote is None:
             e._event("RISK", "실시간 시세 없음: 청산 판단 보류", symbol)
             return False
+        if self._is_dust(rule, float(pos["qty"]), quote.price):
+            return self._dust_exit(symbol, now)
         pos["highest_price"] = max(float(pos["highest_price"]), quote.price)
         stop, reason = update_stop(pos, quote.price)
         if quote.price > stop:
             reason = TIME_STOP_REASON if time_stop_due(pos, now) else None
-        if reason is None and not enabled:
-            return False
-        rule = e.rules.get(symbol)
-        if rule is None:                                   # 수량·가격을 내릴 수 없다: 보내지 않는다
-            e._event("RISK", "종목 규칙 없음: 주문 보류", symbol)
-            return False
         if reason is not None:
             return self._exit(symbol, rule, reason, quote.price, now)
+        if not enabled:
+            return False
         return self._ensure_protective(symbol, rule, stop, now)
+
+    def _release_protective(self, symbol: str, now: datetime) -> str | None:
+        """팔기 전에 보호 주문을 푼다. None이면 계속 진행, 아니면 _cancel_protective의 결과(진행 중단)."""
+        e = self.e
+        if not (config.PROTECTIVE_STOPS_ENABLED and e.positions[symbol].get("protective")):
+            return None
+        result = self._cancel_protective(symbol, now)      # 걸린 주문이 수량을 잠그므로 먼저 취소
+        if result == "ok" and symbol in e.positions:
+            return None
+        return result
 
     def _exit(self, symbol: str, rule: SymbolRules, reason: str, price: float, now: datetime) -> bool:
         e = self.e
-        if config.PROTECTIVE_STOPS_ENABLED and e.positions[symbol].get("protective"):
-            result = self._cancel_protective(symbol, now)  # 걸린 주문이 수량을 잠그므로 먼저 취소
-            if result == "failed":
-                return True
-            if symbol not in e.positions:
-                return False
+        blocked = self._release_protective(symbol, now)
+        if blocked is not None:
+            return blocked == "failed"
         qty = floor_to_step(e.positions[symbol]["qty"], rule.step_size)
-        if qty > 0:
+        if self._is_dust(rule, float(e.positions[symbol]["qty"]), price):
+            self._close_dust(symbol, now)                  # 보호 주문의 부분 체결 뒤 남은 게 잔량일 수 있다
+        elif qty > 0:
             self.execute_market(symbol, "SELL", qty, "exit", reason, now, ref_price=price)
         return False
 
+    def _dust_exit(self, symbol: str, now: datetime) -> bool:
+        blocked = self._release_protective(symbol, now)
+        if blocked is not None:
+            return blocked == "failed"
+        self._close_dust(symbol, now)
+        return False
+
     def _check_protective(self, symbol: str, now: datetime) -> bool:
-        """거래소의 보호 주문 상태를 장부에 맞춘다. 조회 실패면 False(이번 루프는 이 종목을 건너뛴다)."""
+        """거래소의 보호 주문 상태를 장부에 맞춘다. 조회 실패면 False(이번 루프는 이 종목을 건너뛴다).
+        체결은 항상 저널로 먼저 반영하고, 그다음에 protective를 비운다."""
         e = self.e
         prot = e.positions[symbol]["protective"]
+        if prot.get("state") == "canceled":                # 취소는 됐고 체결 확인이 남았다: 다시 취소하지 않는다
+            return self._settle_canceled(symbol, now)
         res = e._call("get_order", symbol, prot["client_id"])
         if not res.ok:                                     # 모름 ≠ 없음
             e._event("RISK", f"보호 주문 조회 실패: {res.error}", symbol)
@@ -325,6 +403,7 @@ class Executor:
         st = res.value
         if st.exists and st.status == "FILLED":
             self._apply_external(symbol, st, EXCHANGE_STOP_REASON, now)
+            self._clear_protective(symbol, prot["client_id"])
             return True
         if st.exists and not st.is_final:
             if prot.get("state") != "open":
@@ -333,29 +412,52 @@ class Executor:
             return True
         if st.exists and st.executed_qty > 0:
             self._apply_external(symbol, st, EXCHANGE_STOP_PARTIAL_REASON, now)
-        if symbol in e.positions:
-            e.positions[symbol]["protective"] = None
-            e.store.save("positions", e.positions)
+        self._clear_protective(symbol, prot["client_id"])
         e._event("RISK", "보호 주문 없음: 재등록", symbol)
         return True
 
     def _cancel_protective(self, symbol: str, now: datetime) -> str:
-        """"ok" | "failed"(PROTECTIVE_CANCEL 설정) | "filled"(이미 체결: 거래소 손절로 반영)."""
+        """"ok" | "failed"(PROTECTIVE_CANCEL 설정) | "filled"(이미 체결: 거래소 손절로 반영)
+        | "pending"(취소는 됐지만 체결 조회 실패: "canceled"로 남기고 이번 루프는 팔지 않는다).
+        취소 응답의 체결 정보는 쓰지 않는다(수수료가 없다). 체결은 get_order로 확인한다."""
         e = self.e
-        cid = e.positions[symbol]["protective"]["client_id"]
+        prot = e.positions[symbol]["protective"]
+        cid = prot["client_id"]
         res = e._call("cancel_order", symbol, cid)
         if not res.ok:
             got = e._call("get_order", symbol, cid)
             if got.ok and got.value.exists and got.value.status == "FILLED":
                 self._apply_external(symbol, got.value, EXCHANGE_STOP_REASON, now)
+                self._clear_protective(symbol, cid)
                 return "filled"
             e._set_halt(PROTECTIVE_CANCEL, f"보호 주문 취소 실패: {symbol} ({res.error})")
             return "failed"
-        e.positions[symbol]["protective"] = None
-        e.store.save("positions", e.positions)
-        if res.value is not None and res.value.executed_qty > 0:
-            self._apply_external(symbol, res.value, EXCHANGE_STOP_PARTIAL_REASON, now)
-        return "ok"
+        prot["state"] = "canceled"
+        e.store.save("positions", e.positions)             # 죽어도 다음 루프가 체결 확인부터 한다
+        return "ok" if self._settle_canceled(symbol, now) else "pending"
+
+    def _settle_canceled(self, symbol: str, now: datetime) -> bool:
+        """취소된 보호 주문의 체결분을 get_order(수수료 포함)로 확인해 반영하고 기록을 지운다. 조회 실패면 False."""
+        e = self.e
+        cid = e.positions[symbol]["protective"]["client_id"]
+        res = e._call("get_order", symbol, cid)
+        if not res.ok:
+            e._event("RISK", f"취소된 보호 주문 조회 실패: {res.error}", symbol)
+            return False
+        st = res.value
+        if st.exists and st.executed_qty > 0:
+            reason = EXCHANGE_STOP_REASON if st.status == "FILLED" else EXCHANGE_STOP_PARTIAL_REASON
+            self._apply_external(symbol, st, reason, now)
+        self._clear_protective(symbol, cid)
+        return True
+
+    def _clear_protective(self, symbol: str, cid: str) -> None:
+        """저널 반영 뒤에만 부른다. 그 주문의 기록일 때만 지운다."""
+        e = self.e
+        pos = e.positions.get(symbol)
+        if pos and pos.get("protective") and pos["protective"]["client_id"] == cid:
+            pos["protective"] = None
+            e.store.save("positions", e.positions)
 
     def _ensure_protective(self, symbol: str, rule: SymbolRules, stop: float, now: datetime) -> bool:
         e = self.e
@@ -368,7 +470,7 @@ class Executor:
             result = self._cancel_protective(symbol, now)
             if result == "failed":
                 return True
-            if result == "filled" or symbol not in e.positions:
+            if result != "ok" or symbol not in e.positions:
                 return False
         qty = floor_to_step(e.positions[symbol]["qty"], rule.step_size)
         if qty > 0:

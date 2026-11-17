@@ -409,5 +409,50 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(f.started, 1)
 
 
+class PartialStopAndLagTests(unittest.TestCase):
+    def test_partial_trigger_keeps_remainder_locked_and_open(self):
+        ex = make({"USDT": 0.0, "ABC": 5.0})
+        ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")
+        ex.set_price("ABCUSDT", 90.0)
+        ex.trigger_stops(fill_ratio=0.4)
+        o = ex.get_order("ABCUSDT", "p1").value
+        self.assertEqual(o.status, "PARTIALLY_FILLED")
+        self.assertAlmostEqual(o.executed_qty, 0.8)
+        self.assertAlmostEqual(o.quote_qty, 0.8 * 89.0)
+        self.assertAlmostEqual(o.fees["USDT"], 0.8 * 89.0 * 0.001)
+        b = bal(ex)
+        self.assertAlmostEqual(b["ABC"][0], 3.0)
+        self.assertAlmostEqual(b["ABC"][1], 1.2)
+        self.assertAlmostEqual(b["USDT"][0], 0.8 * 89.0 * 0.999)
+        self.assertEqual([s.client_id for s in ex.open_orders().value], ["p1"])
+        ex.trigger_stops()                          # 부분 체결된 주문은 다시 발동하지 않는다
+        self.assertAlmostEqual(ex.get_order("ABCUSDT", "p1").value.executed_qty, 0.8)
+
+    def test_cancel_partial_unlocks_remainder_and_reports_no_fees(self):
+        ex = make({"USDT": 0.0, "ABC": 5.0})
+        ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")
+        ex.set_price("ABCUSDT", 90.0)
+        ex.trigger_stops(fill_ratio=0.4)
+        r = ex.cancel_order("ABCUSDT", "p1")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.value.status, "CANCELED")
+        self.assertAlmostEqual(r.value.executed_qty, 0.8)
+        self.assertEqual(r.value.fees, {})              # 실제 어댑터처럼: 취소 응답엔 수수료가 없다
+        self.assertEqual(bal(ex)["ABC"], (4.2, 0.0))
+        o = ex.get_order("ABCUSDT", "p1").value
+        self.assertEqual(o.status, "CANCELED")
+        self.assertAlmostEqual(o.fees["USDT"], 0.8 * 89.0 * 0.001)
+
+    def test_hide_order_for_reports_unknown_then_visible(self):
+        ex = make()
+        ex.market_buy("ABCUSDT", 1.0, "b1")
+        ex.hide_order_for(2)
+        self.assertFalse(ex.get_order("ABCUSDT", "b1").value.exists)
+        self.assertFalse(ex.get_order("ABCUSDT", "b1").value.exists)
+        o = ex.get_order("ABCUSDT", "b1").value
+        self.assertTrue(o.exists)
+        self.assertEqual(o.status, "FILLED")
+
+
 if __name__ == "__main__":
     unittest.main()

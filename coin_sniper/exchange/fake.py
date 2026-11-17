@@ -79,6 +79,7 @@ class FakeExchange:
         self._failures: dict[str, list[ApiResult]] = {}
         self._drops: dict[str, int] = {}
         self._fill_ratio = 1.0
+        self._hidden = 0                   # 남은 "조회 지연" get_order 횟수
         self.calls: list[tuple[str, dict]] = []
 
     # ---- 테스트 조작 ------------------------------------------------------------
@@ -100,7 +101,13 @@ class FakeExchange:
     def set_trading(self, symbol: str, trading: bool) -> None:
         self._rules[symbol] = replace(self._rules[symbol], trading=trading)
 
-    def trigger_stops(self) -> None:
+    def hide_order_for(self, n_calls: int) -> None:
+        """다음 n번의 get_order는 (어떤 주문이든) exists=False로 답한다: 거래소 조회 지연 흉내."""
+        self._hidden = int(n_calls)
+
+    def trigger_stops(self, fill_ratio: float = 1.0) -> None:
+        """발동 조건(가격 ≤ 발동가)인 NEW 손절 주문을 지정가로 체결한다. fill_ratio < 1이면
+        floor_to_step(수량 × 비율)만 체결되고 PARTIALLY_FILLED로 남는다(나머지는 잠긴 채, 취소 가능)."""
         for order in self._orders.values():
             state = order.state
             if state.status != "NEW":
@@ -109,12 +116,14 @@ class FakeExchange:
             if price is None or price > order.stop_price:
                 continue
             rule = self._rules[state.symbol]
-            quote_qty = order.qty * _d(order.limit_price)
+            executed = order.qty if fill_ratio >= 1.0 else _d(
+                floor_to_step(float(order.qty) * fill_ratio, rule.step_size))
+            quote_qty = executed * _d(order.limit_price)
             fee = quote_qty * self._fee_rate
-            self._account(rule.base)[1] -= order.qty
+            self._account(rule.base)[1] -= executed
             self._account(rule.quote)[0] += quote_qty - fee
-            state.status = "FILLED"
-            state.executed_qty = float(order.qty)
+            state.status = "FILLED" if executed == order.qty else "PARTIALLY_FILLED"
+            state.executed_qty = float(executed)
             state.quote_qty = float(quote_qty)
             state.fees = {rule.quote: float(fee)}
 
@@ -221,19 +230,24 @@ class FakeExchange:
         order = self._orders.get(client_id)
         if order is None or order.state.symbol != symbol:
             return _fail("permanent", "HTTP 400 code -2011: Unknown order sent.")
-        if order.state.status != "NEW":
+        if order.state.status not in ("NEW", "PARTIALLY_FILLED"):
             return _fail("permanent", f"HTTP 400 code -2011: Order is {order.state.status}, cannot cancel")
         rule = self._rules[symbol]
         account = self._account(rule.base)
-        account[1] -= order.qty
-        account[0] += order.qty
+        rest = order.qty - _d(order.state.executed_qty)
+        account[1] -= rest
+        account[0] += rest
         order.state.status = "CANCELED"
-        return ApiResult(ok=True, value=_snap(order.state))
+        # 실제 어댑터처럼: 취소(DELETE) 응답에는 fills가 없어 수수료가 비어 있다. get_order는 실제 수수료를 준다.
+        return ApiResult(ok=True, value=replace(order.state, fees={}))
 
     @_api
     def get_order(self, symbol: str, client_id: str) -> ApiResult:
         order = self._orders.get(client_id)
-        if order is None or order.state.symbol != symbol:
+        hidden = self._hidden > 0
+        if hidden:
+            self._hidden -= 1
+        if hidden or order is None or order.state.symbol != symbol:
             return ApiResult(ok=True, value=OrderState(client_id=client_id, symbol=symbol, side="",
                                                        status="UNKNOWN", exists=False))
         return ApiResult(ok=True, value=_snap(order.state))
@@ -241,7 +255,7 @@ class FakeExchange:
     @_api
     def open_orders(self, symbol: str | None = None) -> ApiResult:
         return ApiResult(ok=True, value=[_snap(o.state) for o in self._orders.values()
-                                         if o.state.status == "NEW"
+                                         if not o.state.is_final
                                          and (symbol is None or o.state.symbol == symbol)])
 
 
