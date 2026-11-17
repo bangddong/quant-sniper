@@ -279,14 +279,76 @@ class EngineEntryTests(unittest.TestCase):
         intent_ref = self.trades(store)[0]
         self.assertAlmostEqual(intent_ref["slippage_pct"], 0.0)
 
-    def test_stale_quote_skips_with_event(self):
+    def test_stale_quote_at_evaluation_gives_no_signal(self):
         eng, ex, feed, store = make_engine(test=self)
         set_signal(ex, feed, SYM, age=100)                  # 일봉(REST)은 신호, 실시간 시세는 오래됨
         eng.startup(T0)
         reports = self.loops(eng, 0, 3)
-        self.assertEqual(reports[2].confirmed_signals, 1)
+        self.assertTrue(all(r.raw_signals == 0 for r in reports))   # 실시간 봉이 아니면 평가하지 않는다
         self.assertEqual(calls(ex, "market_buy"), [])
-        self.assertEqual([e["reason"] for e in events(reports[2], "SKIP", SYM)], ["실시간 시세 없음"])
+        self.assertEqual(events(reports[2], "SKIP", SYM), [])
+
+    def test_quote_stale_between_evaluation_and_sizing_skips(self):
+        eng, ex, feed, store = self.build()
+        self.loops(eng, 0, 2)
+        from coin_sniper import entries
+        real = entries.confirm_persistent_signals
+
+        def then_stale(*args):
+            out = real(*args)
+            set_signal(ex, feed, SYM, age=100)              # 평가 뒤, 수량 산정 전에 시세가 오래됨
+            return out
+        with mock.patch.object(entries, "confirm_persistent_signals", then_stale):
+            r = eng.run_once(at(2))
+        self.assertEqual(r.confirmed_signals, 1)
+        self.assertEqual(calls(ex, "market_buy"), [])
+        self.assertEqual([e["reason"] for e in events(r, "SKIP", SYM)], ["실시간 시세 없음"])
+
+    def test_stale_quote_loops_do_not_count_toward_confirmation(self):
+        eng, ex, feed, store = make_engine(test=self)
+        set_signal(ex, feed, SYM, age=100)
+        eng.startup(T0)
+        self.loops(eng, 0, 2)                               # 오래된 시세 2회: 확인 아님
+        set_signal(ex, feed, SYM)
+        self.loops(eng, 2, 2)                               # 실시간 1, 2회
+        self.assertEqual(calls(ex, "market_buy"), [])
+        eng.run_once(at(4))                                 # 실시간 3회 연속
+        self.assertEqual(len(calls(ex, "market_buy")), 1)
+
+    def test_market_proxy_quote_from_other_day_resets_confirmations(self):
+        eng, ex, feed, store = self.build()
+        self.loops(eng, 0, 2)
+        feed.set_quote("BTCUSDT", 90000.0, day="2026-11-16")   # 신선하지만 오늘 봉이 아니다
+        r = eng.run_once(at(2))
+        self.assertEqual(r.raw_signals, 0)
+        self.assertEqual(eng.snapshot(at(2))["signal_progress"], [])
+        feed.set_quote("BTCUSDT", 90000.0)
+        self.loops(eng, 3, 2)
+        self.assertEqual(calls(ex, "market_buy"), [])
+        eng.run_once(at(5))
+        self.assertEqual(len(calls(ex, "market_buy")), 1)
+
+    def test_failed_evaluation_resets_confirmations(self):
+        eng, ex, feed, store = self.build()
+        self.loops(eng, 0, 2)
+        from coin_sniper import entries
+        with mock.patch.object(entries, "evaluate_signals", side_effect=RuntimeError("boom")):
+            r = eng.run_once(at(2))
+        self.assertFalse(r.ok)
+        self.loops(eng, 3, 2)                               # 실패 뒤 1, 2회
+        self.assertEqual(calls(ex, "market_buy"), [])
+        eng.run_once(at(5))                                 # 실패 뒤 연속 3회
+        self.assertEqual(len(calls(ex, "market_buy")), 1)
+
+    def test_symbol_with_unmanaged_exchange_balance_skipped(self):
+        eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": 1.0})
+        set_signal(ex, feed, SYM)
+        set_signal(ex, feed, SYM2, open_ratio=0.93)
+        eng.startup(T0)
+        reports = self.loops(eng, 0, 3)
+        self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM2])
+        self.assertEqual([e["reason"] for e in events(reports[2], "SKIP", SYM)], ["거래소에 미관리 잔고 있음"])
+        self.assertNotIn(SYM, store.load("positions", {}))
 
     def test_no_entry_during_blackout(self):
         eng, ex, feed, store = self.build()

@@ -1,14 +1,16 @@
 """진입 (Task 12): 신호 평가, 연속 확인, 위험 기준 수량, 주문 절차로 매수, 보호 손절 주문.
 
 엔진 8단계(_manage_entries)가 entry_allowed(now)일 때만 부른다. 평가액·현금·계좌 잔고 중 하나라도 이번 루프에
-모르면 아무것도 평가하지 않는다(fail-closed). 평가하지 않은 루프에서는 연속 확인 횟수를 처음부터 다시 센다:
-신호는 "평가한 루프" 3회 연속으로 유지돼야 한다. 확인 횟수는 메모리에만 있다(키가 튜플이라 저장하지 않는다).
+모르면 아무것도 평가하지 않는다(fail-closed). 시세가 신선하고 오늘 날짜인 종목(실시간 봉)만 평가하고,
+시장 프록시가 실시간이 아니면 평가하지 않는다. 연속 확인까지 끝나야 "평가한 루프"다(중간 예외·호출 한도는 아니다).
+평가하지 않은 루프에서는 연속 확인 횟수를 처음부터 다시 센다: 신호는 "평가한 루프" 3회 연속으로 유지돼야 한다.
+확인 횟수는 메모리에만 있다(키가 튜플이라 저장하지 않는다).
 
 체결 반영(포지션·체결 기록)은 Executor._buy_journal이 저널로 한다. 여기서는 주문을 낼지만 정한다.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from coin_sniper import config
 from coin_sniper.config import MARKET_PROXY_SYMBOL, MAX_POSITIONS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS, SIGNAL_CONFIRMATIONS
@@ -17,6 +19,7 @@ from coin_sniper.strategy import confirm_persistent_signals, day_progress, evalu
 
 SKIP_HELD = "이미 보유 중"
 SKIP_INTENT = "미확정 주문 있음"
+SKIP_UNMANAGED = "거래소에 미관리 잔고 있음"
 SKIP_SLOTS = "최대 보유 종목 수 도달"
 SKIP_RULE = "종목 규칙 없음"
 SKIP_QUOTE = "실시간 시세 없음"
@@ -53,16 +56,21 @@ class EntryManager:
         e = self.e
         if e.equity is None or e.cash is None or e.balances is None:
             return                                         # 모르면 평가하지 않는다(end_loop가 초기화)
-        self.evaluated = True
+        today = now.astimezone(timezone.utc).date().isoformat()
+        if not self._live(MARKET_PROXY_SYMBOL, today):
+            return                                         # 시장 봉이 실시간이 아니다: 평가하지 않음
+        market = e.candles(MARKET_PROXY_SYMBOL, now) or []
         candles_by_symbol = {}
         for symbol in e.universe.get("symbols", []):
+            if not self._live(symbol, today):              # 마지막 봉이 실시간 시세로 만든 오늘 봉일 때만
+                continue
             candles = e.candles(symbol, now)
             if candles:
                 candles_by_symbol[symbol] = candles
-        market = e.candles(MARKET_PROXY_SYMBOL, now) or []
         signals = evaluate_signals(candles_by_symbol, market, day_progress(now))
         confirmed, self.confirmations = confirm_persistent_signals(
             signals, self.confirmations, SIGNAL_CONFIRMATIONS)
+        self.evaluated = True                              # 확인까지 끝난 루프만 평가한 루프다
         self.raw, self.confirmed = len(signals), len(confirmed)
         free_usdt = float(e.balances.get(QUOTE_ASSET, (0.0, 0.0))[0])
         for signal in confirmed:                           # score 오름차순(evaluate_signals 순서)
@@ -70,6 +78,10 @@ class EntryManager:
             free_usdt -= spent
             if stop:
                 break
+
+    def _live(self, symbol: str, today: str) -> bool:
+        quote = self.e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
+        return quote is not None and quote.day == today
 
     def _skip(self, symbol: str, reason: str) -> tuple[float, bool]:
         self.e._event("SKIP", reason, symbol)
@@ -83,6 +95,8 @@ class EntryManager:
             return self._skip(symbol, SKIP_HELD)
         if any(i["symbol"] == symbol for i in e.intents.values()):
             return self._skip(symbol, SKIP_INTENT)
+        if e.base_asset(symbol) in e.unmanaged_assets:     # 늦게 체결된 매수일 수 있다: 두 번 사지 않는다
+            return self._skip(symbol, SKIP_UNMANAGED)
         open_buys = sum(1 for i in e.intents.values() if i["side"] == "BUY")
         if len(e.positions) + open_buys >= MAX_POSITIONS:
             return self._skip(symbol, SKIP_SLOTS)
