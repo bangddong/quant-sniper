@@ -3,6 +3,7 @@
 원칙: 확인하지 못한 것은 "모름"이다. 모르면 신규 주문을 하지 않는다(fail-closed).
 시각은 항상 now 인자(UTC, timezone-aware)로 받는다. 하루 경계는 UTC 0시.
 청산(Task 11)과 진입(Task 12)은 _resolve_intents / _manage_exits / _manage_entries 자리에 끼워 넣는다.
+각 단계는 따로 예외를 잡는다: 한 단계가 실패해도 다음 단계(특히 청산)는 실행되고 LOOP_ERROR가 진입을 막는다.
 """
 from __future__ import annotations
 
@@ -21,7 +22,8 @@ from coin_sniper.config import (
 )
 from coin_sniper.exchange.base import Exchange, Feed
 from coin_sniper.halts import (
-    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, RATE_LIMIT, RECON_MISMATCH, UNIVERSE,
+    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, RATE_LIMIT, RECON_MISMATCH,
+    UNIVERSE,
     HaltBoard,
 )
 from coin_sniper.ledger import StateStore, record_event
@@ -85,8 +87,8 @@ class Engine:
         self._candles: dict[str, list[dict]] = {}          # 그날의 일봉 캐시 (REST 원본)
         self._candles_day: str | None = None
         self._feed_symbols: list[str] | None = None
-        self._universe_tried_at: datetime | None = None
-        self._pending_equity: tuple[str, float] | None = None   # (전날, 전날 마지막 평가액)
+        self._universe_tried_at: datetime | None = None   # 마지막 선정 시도(재시도 간격 기준)
+        self._loop_failed = False
         self._prev_loop_at: datetime | None = None
         self._now: datetime | None = None
         self._loop_events: list[dict] = []
@@ -121,7 +123,8 @@ class Engine:
     def run_once(self, now: datetime) -> LoopReport:
         self._now = now
         self._loop_events = []
-        ok = self._guarded(self._steps, now)
+        self._loop_failed = False
+        ok = self._guarded(self._steps, now) and not self._loop_failed
         if ok:
             self.risk_state["last_loop_at"] = now.isoformat()
         ok = self._guarded(self._save_state) and ok
@@ -140,23 +143,41 @@ class Engine:
             return                                         # 대기 중: 거래소를 전혀 부르지 않는다
         self.risk_state["rate_limit_until"] = None
         self._clear_halt(RATE_LIMIT)
+        steps = (
+            ("intents", self._resolve_intents, (now,)),            # 1 (Task 11)
+            ("day", self._roll_day, (now,)),                       # 2 날짜 장부만
+            ("account", self._sync_account, ()),                   # 3
+            ("reconcile", self._reconcile, ()),                    # 4
+            ("exits", self._manage_exits, (now,)),                 # 5 (Task 11)
+            ("universe", self._refresh_universe_if_due, (now,)),   # 6 감시 종목
+            ("candles", self._prepare_candles, (now,)),            # 6 캔들 + 평가액 기록
+            ("equity", self._evaluate_equity, ()),                 # 7
+        )
+        for name, fn, args in steps:
+            if not self._run_step(name, fn, *args):
+                return                                     # 호출 한도: 남은 단계는 거래소를 부르지 않는다
+        if not self._loop_failed:
+            self._clear_halt(LOOP_ERROR)
+        if not self.halts.active():
+            self._run_step("entries", self._manage_entries, now)   # 8 (Task 12)
+
+    def _run_step(self, name: str, fn: Callable, *args) -> bool:
+        """한 단계를 실행한다. 예외는 기록하고 계속, 호출 한도면 False(루프 중단)."""
         try:
-            self._resolve_intents(now)                     # 1 (Task 11)
-            self._roll_day(now)                            # 2
-            self._sync_account()                           # 3
-            self._reconcile()                              # 4
-            self._prepare_candles(now)                     # 5
-            self._manage_exits(now)                        # 6 (Task 11)
-            self._evaluate_equity()                        # 7
-            self._manage_entries(now)                      # 8 (Task 12)
+            fn(*args)
         except _RateLimited:
-            return
+            return False
+        except Exception as exc:                           # KeyboardInterrupt/SystemExit는 잡지 않는다
+            self._loop_failed = True
+            self._event("ERROR", f"{name}: {type(exc).__name__}: {exc}")
+            self._set_halt(LOOP_ERROR, f"루프 단계 오류({name}): {type(exc).__name__}")
+        return True
 
     def _guarded(self, fn: Callable, *args) -> bool:
         try:
             fn(*args)
             return True
-        except Exception as exc:                           # KeyboardInterrupt/SystemExit는 잡지 않는다
+        except Exception as exc:
             self._event("ERROR", f"{type(exc).__name__}: {exc}")
             return False
 
@@ -165,7 +186,8 @@ class Engine:
         """1단계: 진행 중 주문 의도 해소 (Task 11)."""
 
     def _manage_exits(self, now: datetime) -> None:
-        """6단계: 청산과 보호 주문 관리 (Task 11)."""
+        """5단계: 청산과 보호 주문 관리 (Task 11). 앞 단계가 실패해도 불린다:
+        self.balances·equity·캔들이 없을 수 있다. positions, rules(마지막 성공값), feed만 믿는다."""
 
     def _manage_entries(self, now: datetime) -> None:
         """8단계: 진입 (Task 12)."""
@@ -187,22 +209,31 @@ class Engine:
             self._set_halt(FATAL, f"{name}: {res.error}")
         return res
 
-    # ---- 2단계: 날짜 변경과 감시 종목 ---------------------------------------------------
+    # ---- 2단계: 날짜 장부 -----------------------------------------------------------
     def _roll_day(self, now: datetime) -> None:
         today = _day(now)
         rs = self.risk_state
-        if rs.get("day") != today:
-            if rs.get("day") and rs.get("last_equity") is not None:
-                self._pending_equity = (rs["day"], float(rs["last_equity"]))
-            rs["day"] = today
-            rs["day_open_equity"] = None                   # 오늘 첫 평가액으로 7단계에서 정한다
-            self._clear_halt(DAILY_LOSS)
-            self._universe_tried_at = None
-        throttled = (self._universe_tried_at is not None
-                     and (now - self._universe_tried_at).total_seconds() < UNIVERSE_RETRY_SECONDS)
-        if self.universe.get("date") != today or (not self.universe.get("symbols") and not throttled):
+        if rs.get("day") == today:
+            return
+        if rs.get("day") and rs.get("last_equity") is not None:
+            old = rs.get("pending_equity_row")
+            if old:                                        # 아직 못 쓴 줄은 BTC 없이 남긴다
+                self._append_equity_row(old["day"], old["equity"], None)
+            rs["pending_equity_row"] = {"day": rs["day"], "equity": float(rs["last_equity"])}
+        rs["day"] = today
+        rs["day_open_equity"] = None                       # 오늘 첫 평가액으로 7단계에서 정한다
+        self._clear_halt(DAILY_LOSS)
+
+    # ---- 6단계: 감시 종목 -----------------------------------------------------------
+    def _refresh_universe_if_due(self, now: datetime) -> None:
+        today = _day(now)
+        tried = self._universe_tried_at
+        if (tried is not None and _day(tried) == today
+                and (now - tried).total_seconds() < UNIVERSE_RETRY_SECONDS):
+            return
+        if self.universe.get("date") != today or not self.universe.get("symbols"):
             self._refresh_universe(now, today)
-        elif not self.rules and not throttled:             # 재시작: 오늘 목록은 있고 규칙만 없다
+        elif not self.rules:                               # 재시작: 오늘 목록은 있고 규칙만 없다
             self._universe_tried_at = now
             res = self._call("symbol_rules")
             if res.ok:
@@ -213,31 +244,39 @@ class Engine:
 
     def _refresh_universe(self, now: datetime, today: str) -> None:
         self._universe_tried_at = now
-        symbols: list[str] = []
-        res = self._call("symbol_rules")
-        if res.ok:
-            self.rules = dict(res.value)
-            known_bases = frozenset(r.base for r in self.rules.values())
-            wanted = [s for s, r in self.rules.items() if not is_excluded(r, known_bases)]
-            if MARKET_PROXY_SYMBOL not in wanted:
-                wanted.append(MARKET_PROXY_SYMBOL)
-            self._candles, self._candles_day = {}, today
-            for i, symbol in enumerate(wanted):
-                if i:
-                    self.sleep(UNIVERSE_FETCH_PAUSE_SECONDS)
-                got = self._call("daily_candles", symbol, CANDLE_COUNT)
-                if got.ok and got.value:                   # 실패한 종목만 뺀다
-                    self._candles[symbol] = got.value
-            symbols = select_universe(self.rules, self._candles)
-            detail = f"감시 종목 {len(symbols)}개 < 최소 {UNIVERSE_MIN_COUNT}개"
-        else:
-            detail = f"종목 규칙 조회 실패: {res.error}"
+        try:
+            symbols, detail = self._select_universe(today)
+        except Exception as exc:                           # 호출 한도 포함: 실패로 남기고 다시 올린다
+            self._universe_failed(today, f"감시 종목 선정 오류: {type(exc).__name__}")
+            raise
         if len(symbols) >= UNIVERSE_MIN_COUNT:
             self.universe = {"date": today, "symbols": symbols}
             self._clear_halt(UNIVERSE)
-        else:                                              # 이전 목록으로 대체하지 않는다
-            self.universe = {"date": today, "symbols": []}
-            self._set_halt(UNIVERSE, detail)
+        else:
+            self._universe_failed(today, detail)
+
+    def _universe_failed(self, today: str, detail: str) -> None:
+        self.universe = {"date": today, "symbols": []}     # 이전 목록으로 대체하지 않는다
+        self._set_halt(UNIVERSE, detail)
+
+    def _select_universe(self, today: str) -> tuple[list[str], str]:
+        res = self._call("symbol_rules")
+        if not res.ok:
+            return [], f"종목 규칙 조회 실패: {res.error}"
+        self.rules = dict(res.value)
+        known_bases = frozenset(r.base for r in self.rules.values())
+        wanted = [s for s, r in self.rules.items() if not is_excluded(r, known_bases)]
+        if MARKET_PROXY_SYMBOL not in wanted:
+            wanted.append(MARKET_PROXY_SYMBOL)
+        self._candles, self._candles_day = {}, today
+        for i, symbol in enumerate(wanted):
+            if i:
+                self.sleep(UNIVERSE_FETCH_PAUSE_SECONDS)
+            got = self._call("daily_candles", symbol, CANDLE_COUNT)
+            if got.ok and got.value:                       # 실패한 종목만 뺀다
+                self._candles[symbol] = got.value
+        symbols = select_universe(self.rules, self._candles)
+        return symbols, f"감시 종목 {len(symbols)}개 < 최소 {UNIVERSE_MIN_COUNT}개"
 
     # ---- 3·4단계: 계좌와 대조 ---------------------------------------------------------
     def _sync_account(self) -> None:
@@ -257,6 +296,10 @@ class Engine:
     def _reconcile(self) -> None:
         if self.balances is None:                          # 모르면 판정하지 않는다(기존 상태 유지)
             return
+        if self.positions and not self.rules:              # 냉시작: 허용 오차(수량 단위)를 알아야 한다
+            res = self._call("symbol_rules")
+            if res.ok:
+                self.rules = dict(res.value)
         short = []
         for symbol, pos in self.positions.items():
             rule = self.rules.get(symbol)
@@ -274,7 +317,7 @@ class Engine:
             asset for asset, (free, locked) in self.balances.items()
             if free + locked > 0 and asset != QUOTE_ASSET and asset not in managed)
 
-    # ---- 5단계: 캔들 ---------------------------------------------------------------
+    # ---- 6단계: 캔들과 평가액 기록 ------------------------------------------------------
     def _prepare_candles(self, now: datetime) -> None:
         today = _day(now)
         wanted = set(self.positions) | {MARKET_PROXY_SYMBOL}
@@ -284,12 +327,25 @@ class Engine:
         if ordered != self._feed_symbols:
             self.feed.set_symbols(ordered)
             self._feed_symbols = ordered
-        if self._pending_equity is not None:
-            proxy = self.candles(MARKET_PROXY_SYMBOL, now)
-            if proxy and len(proxy) >= 2:
-                day, equity = self._pending_equity
-                self.equity_history = append_equity(self.equity_history, day, equity, proxy[-2]["close"])
-                self._pending_equity = None
+        row = self.risk_state.get("pending_equity_row")
+        if not row:
+            return
+        proxy = self.candles(MARKET_PROXY_SYMBOL, now)
+        if not proxy:
+            return
+        closes = {c.get("date"): c["close"] for c in proxy}
+        if row["day"] in closes:
+            btc = closes[row["day"]]
+        elif row["day"] < proxy[0].get("date", ""):
+            btc = None                                     # 캔들 창보다 오래된 날: BTC 없이 기록
+        else:
+            return                                         # 그날 봉이 아직 없다: 다음 루프에 다시
+        self._append_equity_row(row["day"], row["equity"], btc)
+        del self.risk_state["pending_equity_row"]          # 기록이 저장된 뒤에만 지운다
+
+    def _append_equity_row(self, day: str, equity: float, btc: float | None) -> None:
+        self.equity_history = append_equity(self.equity_history, day, equity, btc)
+        self.store.save("equity_history", self.equity_history)
 
     def candles(self, symbol: str, now: datetime) -> list[dict] | None:
         """그날의 일봉(REST, 하루 한 번) + 진행 중 봉을 피드 시세로 덮어쓴 사본. 받을 수 없으면 None."""
@@ -304,9 +360,14 @@ class Engine:
             cached = self._candles[symbol] = res.value
         out = [dict(c) for c in cached]
         quote = self.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
-        if quote is not None and quote.day == today and out[-1].get("date") == today:
-            out[-1].update(open=quote.open, high=quote.high, low=quote.low, close=quote.price,
-                           vol=quote.volume, quote_vol=quote.quote_volume)
+        if quote is None or quote.day != today:
+            return out
+        live = {"date": today, "open": quote.open, "high": quote.high, "low": quote.low,
+                "close": quote.price, "vol": quote.volume, "quote_vol": quote.quote_volume}
+        if out[-1].get("date") == today:
+            out[-1].update(live)
+        elif out[-1].get("date", "") < today:              # REST에 오늘 봉이 없으면 붙인다(원본과 같다)
+            out = (out + [live])[-CANDLE_COUNT:]
         return out
 
     # ---- 7단계: 평가액, 낙폭, 일일 손실 ------------------------------------------------
@@ -382,10 +443,10 @@ class Engine:
         s = self.store
         s.save("positions", self.positions)
         s.save("intents", self.intents)
+        s.save("equity_history", self.equity_history)     # risk_state의 대기 줄보다 먼저
         s.save("risk_state", self.risk_state)
         s.save("universe", self.universe)
         s.save("events", self.events)
-        s.save("equity_history", self.equity_history)
         s.save("halts", self.halts.to_dict())
 
     # ---- 조회 ---------------------------------------------------------------------

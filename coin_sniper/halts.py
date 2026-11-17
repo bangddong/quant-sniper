@@ -14,6 +14,7 @@ RECON_MISMATCH = "recon_mismatch"
 ORDER_UNCONFIRMED = "order_unconfirmed"
 PROTECTIVE_CANCEL = "protective_cancel"
 FATAL = "fatal"
+LOOP_ERROR = "loop_error"
 
 
 class HaltBoard:

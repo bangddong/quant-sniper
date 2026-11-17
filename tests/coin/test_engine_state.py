@@ -1,10 +1,12 @@
 import unittest
+from unittest import mock
 from datetime import date, timedelta
 
 from coin_sniper import config
 from coin_sniper.engine import Engine, LoopReport
 from coin_sniper.halts import (
-    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, RATE_LIMIT, RECON_MISMATCH, UNIVERSE,
+    ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, RATE_LIMIT, RECON_MISMATCH,
+    UNIVERSE,
 )
 from coin_sniper.metrics import Metrics
 from coin_sniper.models import ApiResult
@@ -130,6 +132,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(rs["day_open_equity"], 970)
         self.assertEqual(store.load("equity_history", []),
                          [{"day": "2026-11-17", "equity": 960, "btc": btc[-2]["close"]}])
+        self.assertNotIn("pending_equity_row", rs)
 
     def test_restart_after_days_offline_rebuilds_day_state(self):
         old = utc(2026, 11, 13, 12)
@@ -150,7 +153,10 @@ class EngineStateTests(unittest.TestCase):
         offline = eng.metrics.summary(T0, None)["offline_seconds"]
         self.assertEqual(offline, 4 * 86400)
         self.assertEqual(eng.metrics.summary(T0, None)["restarts"], 1)
-        self.assertEqual([row["day"] for row in store.load("equity_history", [])], ["2026-11-13"])
+        btc_on_day = next(c["close"] for c in trending_candles(70, 72000, 270) if c["date"] == "2026-11-13")
+        self.assertEqual(store.load("equity_history", []),
+                         [{"day": "2026-11-13", "equity": 1000.0, "btc": btc_on_day}])   # 날짜로 고른 종가
+        self.assertNotIn("pending_equity_row", rs)
 
     def test_ledger_qty_missing_on_exchange_sets_recon_halt(self):
         eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
@@ -263,6 +269,7 @@ class EngineStateTests(unittest.TestCase):
 
     def test_loop_exception_is_recorded_not_raised(self):
         eng, ex, feed, store = self.build()
+        exits = self.record_exits(eng)
 
         def boom():
             raise ValueError("unexpected payload")
@@ -272,9 +279,175 @@ class EngineStateTests(unittest.TestCase):
         errors = [e for e in r.events if e["type"] == "ERROR"]
         self.assertEqual(len(errors), 1)
         self.assertIn("ValueError", errors[0]["reason"])
+        self.assertIn("unexpected payload", errors[0]["reason"])
+        self.assertIn(LOOP_ERROR, codes(r))
+        self.assertFalse(r.entry_allowed)
+        self.assertEqual(r.equity, 1000)                     # 다음 단계는 계속 실행된다
+        self.assertEqual(len(exits), 1)
         self.assertEqual(eng.metrics.summary(T0, None)["loops_failed"], 1)
-        self.assertEqual(store.load("events", [])[-1]["type"], "ERROR")
+        self.assertIn("ERROR", [e["type"] for e in store.load("events", [])])
         self.assertEqual(store.load("metrics", {})["days"]["2026-11-17"]["loops_failed"], 1)
+
+    # ---- fix round 1: 단계별 예외 격리, 청산 우선 ----------------------------------------
+    def record_exits(self, eng, ex=None):
+        seen = []
+
+        def hook(now):
+            seen.append(len(ex.calls) if ex is not None else now)
+        eng._manage_exits = hook
+        return seen
+
+    def test_exits_run_when_reconcile_raises(self):
+        eng, ex, feed, store = self.build()
+        exits = self.record_exits(eng)
+
+        def boom():
+            raise KeyError("qty")
+        eng._reconcile = boom
+        r = eng.run_once(T0)
+        self.assertFalse(r.ok)
+        self.assertEqual(len(exits), 1)
+        self.assertIn(LOOP_ERROR, codes(r))
+
+    def test_exits_run_when_universe_refresh_raises_and_retry_is_throttled(self):
+        eng, ex, feed, store = self.build()
+        exits = self.record_exits(eng)
+        with mock.patch("coin_sniper.engine.select_universe", side_effect=RuntimeError("bad data")):
+            r1 = eng.run_once(T0)
+            self.assertEqual(len(exits), 1)
+            self.assertIn(UNIVERSE, codes(r1))
+            self.assertFalse(r1.ok)
+            self.assertEqual(store.load("universe", {}), {"date": "2026-11-17", "symbols": []})
+            for i in range(1, 5):
+                eng.run_once(T0 + 30 * i * SEC)
+            self.assertEqual(calls_named(ex, "symbol_rules"), 1)
+            self.assertEqual(len(exits), 5)
+        r = eng.run_once(T0 + config.UNIVERSE_RETRY_SECONDS * SEC)
+        self.assertEqual(calls_named(ex, "symbol_rules"), 2)
+        self.assertNotIn(UNIVERSE, codes(r))
+
+    def test_exits_run_when_candle_preparation_raises(self):
+        eng, ex, feed, store = self.build()
+        exits = self.record_exits(eng)
+
+        def boom(now):
+            raise RuntimeError("candles")
+        eng._prepare_candles = boom
+        r = eng.run_once(T0)
+        self.assertEqual(len(exits), 1)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.equity, 1000)                     # 7단계는 계속 실행된다
+
+    def test_loop_error_blocks_entries_and_clears_after_clean_loop(self):
+        eng, ex, feed, store = self.build()
+        entries = []
+        eng._manage_entries = lambda now: entries.append(now)
+        eng.run_once(T0)
+        self.assertEqual(len(entries), 1)
+        original = eng._reconcile
+
+        def boom():
+            raise RuntimeError("x")
+        eng._reconcile = boom
+        r1 = eng.run_once(T0 + 30 * SEC)
+        self.assertIn(LOOP_ERROR, codes(r1))
+        self.assertFalse(r1.entry_allowed)
+        self.assertEqual(len(entries), 1)                    # 진입 단계는 건너뛴다
+        eng._reconcile = original
+        r2 = eng.run_once(T0 + 60 * SEC)
+        self.assertTrue(r2.ok)
+        self.assertNotIn(LOOP_ERROR, codes(r2))
+        self.assertTrue(r2.entry_allowed)
+        self.assertEqual(len(entries), 2)
+
+    def test_exits_run_before_universe_refresh_at_day_change(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        exits = self.record_exits(eng, ex)
+        n = len(ex.calls)
+        eng.run_once(utc(2026, 11, 18, 0, 0, 5))
+        names = [name for name, _ in ex.calls[n:]]
+        first_refresh = n + min(names.index("symbol_rules"), names.index("daily_candles"))
+        self.assertEqual(len(exits), 1)
+        self.assertLessEqual(exits[0], first_refresh)
+        self.assertIn("balances", [name for name, _ in ex.calls[n:exits[0]]])
+
+    # ---- fix round 1: 평가액 기록 보존 ------------------------------------------------
+    def test_pending_equity_row_survives_restart(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)                                     # last_equity 1000
+
+        def boom(now):
+            raise RuntimeError("down")
+        eng._prepare_candles = boom
+        day2 = utc(2026, 11, 18, 1)
+        eng.run_once(day2)                                   # 날짜는 넘어갔지만 기록 전에 실패
+        self.assertEqual(store.load("equity_history", []), [])
+        self.assertEqual(store.load("risk_state", {})["pending_equity_row"],
+                         {"day": "2026-11-17", "equity": 1000.0})
+        btc = trending_candles(70, 50000, 100, today=date(2026, 11, 18))
+        ex.set_candles("BTCUSDT", btc)
+        eng2 = Engine(ex, feed, store, Metrics(store.load("metrics", {})), eng.settings,
+                      sleep=lambda _s: None)
+        eng2.startup(day2 + 30 * SEC)
+        eng2.run_once(day2 + 30 * SEC)
+        self.assertEqual(store.load("equity_history", []),
+                         [{"day": "2026-11-17", "equity": 1000.0, "btc": btc[-2]["close"]}])
+        self.assertNotIn("pending_equity_row", store.load("risk_state", {}))
+
+    def test_pending_equity_row_older_than_candles_gets_no_btc(self):
+        old = utc(2026, 8, 1, 12)
+        eng, ex, feed, store = make_engine(test=self)
+        store.save("risk_state", {"starting_capital": 1000.0, "realized_pnl": 0.0, "peak_equity": 1000.0,
+                                  "day": "2026-08-01", "day_open_equity": 1000.0,
+                                  "segment_start": old.isoformat(), "last_loop_at": old.isoformat(),
+                                  "last_equity": 1000.0})
+        eng.startup(T0)
+        eng.run_once(T0)
+        self.assertEqual(store.load("equity_history", []),
+                         [{"day": "2026-08-01", "equity": 1000.0, "btc": None}])
+
+    def test_pending_equity_row_waits_while_candles_lack_its_day(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        stale = trending_candles(70, 50000, 100, today=date(2026, 11, 16))
+        ex.set_candles("BTCUSDT", stale[:-1])                # 11-15까지만: 11-17 봉이 아직 없다
+        eng.run_once(utc(2026, 11, 18, 1))
+        self.assertEqual(store.load("equity_history", []), [])
+        self.assertEqual(store.load("risk_state", {})["pending_equity_row"]["day"], "2026-11-17")
+
+    # ---- fix round 1: 진행 중 봉 ---------------------------------------------------
+    def test_candles_overwrite_forming_bar_with_live_quote(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        feed.set_quote("SOLUSDT", 123, open=110, high=125, low=105, volume=10)
+        c = eng.candles("SOLUSDT", T0)
+        self.assertEqual(len(c), 70)
+        self.assertEqual(c[-1], {"date": "2026-11-17", "open": 110, "high": 125, "low": 105, "close": 123,
+                                 "vol": 10, "quote_vol": 1230})
+        self.assertNotEqual(eng._candles["SOLUSDT"][-1]["close"], 123)   # 캐시는 그대로
+
+    def test_candles_append_forming_bar_when_rest_lacks_today(self):
+        eng, ex, feed, store = self.build()
+        ex.set_candles("SOLUSDT", trending_candles(70, 100, 1, today=date(2026, 11, 16)))
+        eng.run_once(T0)
+        feed.set_quote("SOLUSDT", 123, volume=10)
+        c = eng.candles("SOLUSDT", T0)
+        self.assertEqual(c[-1]["date"], "2026-11-17")
+        self.assertEqual(c[-1]["close"], 123)
+        self.assertEqual(c[-2]["date"], "2026-11-16")
+        self.assertEqual(len(c), config.CANDLE_COUNT)
+        self.assertEqual(eng._candles["SOLUSDT"][-1]["date"], "2026-11-16")
+
+    def test_candles_unchanged_without_fresh_quote_for_today(self):
+        eng, ex, feed, store = self.build()
+        rest = trending_candles(70, 100, 1, today=date(2026, 11, 16))
+        ex.set_candles("SOLUSDT", rest)
+        eng.run_once(T0)
+        feed.set_quote("SOLUSDT", 123, age=config.QUOTE_MAX_AGE_SECONDS + 1)
+        self.assertEqual(eng.candles("SOLUSDT", T0), rest)
+        feed.set_quote("SOLUSDT", 123, day="2026-11-16")
+        self.assertEqual(eng.candles("SOLUSDT", T0), rest)
 
     def test_state_survives_restart(self):
         eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
@@ -293,7 +466,8 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(eng2.metrics.summary(T0, None)["loops_ok"], 2)
         eng2.run_once(T0 + 60 * SEC)
         self.assertEqual(calls_named(ex, "daily_candles"), 7)  # 오늘 목록은 다시 고르지 않는다
-        self.assertEqual(calls_named(ex, "symbol_rules"), 2)   # 규칙만 다시 받는다
+        # 규칙만 다시 받는다: 첫 엔진(대조용 1 + 선정 1) + 재시작 대조용 1
+        self.assertEqual(calls_named(ex, "symbol_rules"), 3)
         self.assertIn("SOLUSDT", eng2.rules)
 
 

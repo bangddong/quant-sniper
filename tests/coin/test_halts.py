@@ -11,7 +11,8 @@ T0 = datetime(2026, 11, 17, 3, 0, 0, tzinfo=timezone.utc)
 class HaltBoardTest(unittest.TestCase):
     def test_codes_are_lowercase_names(self):
         for name in ("ACCOUNT_FETCH", "FEED_STALE", "MAINTENANCE", "RATE_LIMIT", "UNIVERSE", "DAILY_LOSS",
-                     "DRAWDOWN", "RECON_MISMATCH", "ORDER_UNCONFIRMED", "PROTECTIVE_CANCEL", "FATAL"):
+                     "DRAWDOWN", "RECON_MISMATCH", "ORDER_UNCONFIRMED", "PROTECTIVE_CANCEL", "FATAL",
+                     "LOOP_ERROR"):
             self.assertEqual(getattr(halts, name), name.lower())
 
     def test_halt_board_roundtrip_and_order(self):
