@@ -350,6 +350,34 @@ class EngineEntryTests(unittest.TestCase):
         self.assertEqual([e["reason"] for e in events(reports[2], "SKIP", SYM)], ["거래소에 미관리 잔고 있음"])
         self.assertNotIn(SYM, store.load("positions", {}))
 
+    def test_dust_left_after_exit_does_not_block_reentry(self):
+        eng, ex, feed, store = self.build()
+        entry = (T0 - timedelta(hours=config.MAX_HOLD_HOURS)).isoformat()
+        add_position(eng, ex, SYM, 1.0005, 100.0, entry_time=entry)   # 타임스탑: 1.0 매도, 0.0005 잔량
+        reports = self.loops(eng, 0, 3)
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+        self.assertIn("SOL", eng.unmanaged_assets)          # 팔 수 없는 잔량이 거래소에 남았다
+        self.assertEqual(events(reports[2], "SKIP", SYM), [])
+        self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM])
+        self.assertIn(SYM, store.load("positions", {}))
+
+    def unmanaged_case(self, sol_balance: float):
+        eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": sol_balance})
+        set_signal(ex, feed, SYM)
+        eng.startup(T0)
+        reports = self.loops(eng, 0, 3)
+        return ex, reports
+
+    def test_unmanaged_balance_exactly_min_notional_is_skipped(self):
+        ex, reports = self.unmanaged_case(0.05)              # 0.05 × 100 = 5 = 최소 주문 금액
+        self.assertEqual(calls(ex, "market_buy"), [])
+        self.assertEqual([e["reason"] for e in events(reports[2], "SKIP", SYM)], ["거래소에 미관리 잔고 있음"])
+
+    def test_unmanaged_balance_below_min_notional_is_bought(self):
+        ex, reports = self.unmanaged_case(0.0499)            # 내림 0.049 × 100 = 4.9 < 5
+        self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM])
+        self.assertEqual(events(reports[2], "SKIP", SYM), [])
+
     def test_no_entry_during_blackout(self):
         eng, ex, feed, store = self.build()
         reports = [eng.run_once(utc(2026, 11, 17, 0, 10, 30 * i)) for i in range(2)]

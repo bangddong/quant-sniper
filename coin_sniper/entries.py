@@ -11,10 +11,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from coin_sniper import config
 from coin_sniper.config import MARKET_PROXY_SYMBOL, MAX_POSITIONS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS, SIGNAL_CONFIRMATIONS
-from coin_sniper.risk import account_value, position_open_risk, size_entry
+from coin_sniper.risk import account_value, floor_to_step, position_open_risk, size_entry
 from coin_sniper.strategy import confirm_persistent_signals, day_progress, evaluate_signals
 
 SKIP_HELD = "이미 보유 중"
@@ -25,6 +26,10 @@ SKIP_RULE = "종목 규칙 없음"
 SKIP_QUOTE = "실시간 시세 없음"
 SKIP_SIZE = "투자·위험 한도 또는 최소 주문 금액 미달"
 RISK_LOW_USDT = "실제 USDT가 봇 현금보다 적음"
+
+
+def _dec(value: float) -> Decimal:
+    return Decimal(repr(float(value)))
 
 
 class EntryManager:
@@ -83,6 +88,17 @@ class EntryManager:
         quote = self.e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
         return quote is not None and quote.day == today
 
+    def _unmanaged_tradable(self, symbol: str, rule, price: float) -> bool:
+        """장부에 없는 기초 자산 잔고가 거래 가능한 양(1스텝 이상, 최소 주문 금액 이상)인가.
+        팔 수 없는 잔량(청산 뒤 남은 먼지)은 막지 않는다. 잔고는 이번 루프 조회값으로 본다."""
+        e = self.e
+        base = e.base_asset(symbol)
+        if base not in e.unmanaged_assets:
+            return False
+        free, locked = (e.balances or {}).get(base, (0.0, 0.0))
+        qty = _dec(floor_to_step(float(_dec(free) + _dec(locked)), rule.step_size))
+        return qty > 0 and qty * _dec(price) >= _dec(rule.min_notional)
+
     def _skip(self, symbol: str, reason: str) -> tuple[float, bool]:
         self.e._event("SKIP", reason, symbol)
         return 0.0, False
@@ -95,8 +111,6 @@ class EntryManager:
             return self._skip(symbol, SKIP_HELD)
         if any(i["symbol"] == symbol for i in e.intents.values()):
             return self._skip(symbol, SKIP_INTENT)
-        if e.base_asset(symbol) in e.unmanaged_assets:     # 늦게 체결된 매수일 수 있다: 두 번 사지 않는다
-            return self._skip(symbol, SKIP_UNMANAGED)
         open_buys = sum(1 for i in e.intents.values() if i["side"] == "BUY")
         if len(e.positions) + open_buys >= MAX_POSITIONS:
             return self._skip(symbol, SKIP_SLOTS)
@@ -106,6 +120,8 @@ class EntryManager:
         quote = e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
         if quote is None:
             return self._skip(symbol, SKIP_QUOTE)
+        if self._unmanaged_tradable(symbol, rule, quote.price):   # 늦게 체결된 매수일 수 있다: 두 번 사지 않는다
+            return self._skip(symbol, SKIP_UNMANAGED)
         bot_cash, _ = account_value(e.risk_state, e.positions, {s: 0.0 for s in e.positions})
         if free_usdt < bot_cash:
             e._event("RISK", RISK_LOW_USDT)
