@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import io
 import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
@@ -511,14 +514,17 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
     def now_fn(self):
         return self.ticks.pop(0)
 
-    def go(self, auto_push=False, publish_fn=None, schedule=None, loops=3):
+    def go(self, auto_push=False, publish_fn=None, schedule=None, loops=3, publisher=None, clock=None):
         settings = dataclasses.replace(make_settings(self.state_dir), auto_git_push=auto_push)
+        publish_fn = publish_fn or mock.Mock(return_value=True)
+        if publisher is None:                                    # 결정적: 게시를 그 자리에서 실행(결과는 다음 루프에 거둔다)
+            publisher = coin_bot.BackgroundPublisher(publish_fn, clock=lambda: 100.0, spawn=lambda fn: fn())
         out = io.StringIO()
         with redirect_stdout(out):
             code = coin_bot.run(settings, exchange=self.ex, feed=self.feed, sleep=self.sleeps.append,
-                                now_fn=self.now_fn, clock=lambda: 100.0, max_loops=loops,
-                                publish_fn=publish_fn or mock.Mock(return_value=True),
-                                commit_fn=lambda: "abc1234", schedule=schedule)
+                                now_fn=self.now_fn, clock=clock or (lambda: 100.0), max_loops=loops,
+                                publish_fn=publish_fn, commit_fn=lambda: "abc1234", schedule=schedule,
+                                publisher=publisher)
         return code, out.getvalue()
 
     @staticmethod
@@ -593,6 +599,47 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
         self.assertNotIn("boom", out)
         schedule.failed.assert_called_once()
         schedule.published.assert_not_called()
+
+    def blocking_publish(self):
+        release = threading.Event()
+        self.addCleanup(release.set)                             # 테스트가 끝나면 게시 스레드를 놓아 준다
+        return mock.Mock(side_effect=lambda *a: release.wait() or True)
+
+    def test_blocked_publish_never_stalls_the_trading_loop(self):
+        publish = self.blocking_publish()
+        publisher = coin_bot.BackgroundPublisher(publish, clock=lambda: 100.0)   # 진짜 데몬 스레드
+        started = time.monotonic()
+        code, out = self.go(auto_push=True, publish_fn=publish, loops=5, publisher=publisher)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.status_lines(out)), 5)
+        self.assertEqual(publish.call_count, 1)                  # 실행 중 새 요청은 쌓지 않고 버린다
+
+    def test_publish_running_too_long_is_reported_once_and_abandoned(self):
+        publish = self.blocking_publish()
+        ticks = itertools.count(0.0, 50.0)
+        clock = lambda: next(ticks)                              # noqa: E731
+        publisher = coin_bot.BackgroundPublisher(publish, clock=clock)
+        schedule = mock.Mock(wraps=PublishSchedule())
+        code, out = self.go(auto_push=True, publish_fn=publish, loops=6, publisher=publisher, clock=clock,
+                            schedule=schedule)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("대시보드 게시 지연"), 1)
+        schedule.failed.assert_called_once()
+        schedule.published.assert_not_called()
+        self.assertEqual(len(self.status_lines(out)), 6)
+
+    def test_marks_made_while_publishing_survive_the_result(self):
+        schedule = PublishSchedule()
+        publisher = coin_bot.BackgroundPublisher(mock.Mock(return_value=True), clock=lambda: 100.0,
+                                                 spawn=lambda fn: None)   # 끝나지 않는 게시
+        tracker = coin_bot.PublishTracker(schedule, publisher)
+        self.assertTrue(publisher.submit("r", {}, [], None, None))
+        tracker.mark(critical=True)                              # 게시가 도는 동안 생긴 중요 이벤트
+        publisher._job["done"], publisher._job["result"] = True, "ok"
+        with redirect_stdout(io.StringIO()):
+            tracker.collect(1000.0)
+        self.assertTrue(schedule.due(1001.0, False))             # 게시 완료가 그 표시를 지우지 않는다
 
     def test_banner_first_run_shows_env_capital_to_be_stored(self):
         settings = make_settings(self.state_dir, starting_capital=1500.0)

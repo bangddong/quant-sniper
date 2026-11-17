@@ -13,6 +13,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,9 @@ from pathlib import Path
 from typing import Callable
 
 from env_loader import load_dotenv
-from coin_sniper.config import POLL_INTERVAL_SECONDS, QUOTE_ASSET, Settings, SettingsError, load_settings
+from coin_sniper.config import (
+    DASHBOARD_PUBLISH_TIMEOUT_SECONDS, POLL_INTERVAL_SECONDS, QUOTE_ASSET, Settings, SettingsError, load_settings,
+)
 from coin_sniper.dashboard import STATUS_KO, PublishSchedule, build_state_json, publish, render_dashboard
 from coin_sniper.engine import Engine
 from coin_sniper.exchange.base import Exchange
@@ -133,29 +136,110 @@ def _event_line(event: dict) -> str:
     return " ".join(parts)
 
 
-def _maybe_publish(engine: Engine, settings: Settings, schedule: PublishSchedule, now: datetime,
-                   publish_fn: Callable, now_fn: Callable[[], datetime]) -> None:
-    if not schedule.due(now.timestamp(), bool(engine.positions)):
-        return
-    try:
-        snap = engine.snapshot(now)
-        ok = publish_fn(render_dashboard(snap), build_state_json(snap), snap["events"],
-                        REPO_ROOT, settings.state_dir / "dashboard")
-    except Exception as exc:                              # 게시 문제는 매매를 멈추지 않는다
-        schedule.failed(now_fn().timestamp())
-        print(f"대시보드 게시 오류(매매는 계속): {type(exc).__name__}")
-        return
-    if ok:
-        schedule.published(now_fn().timestamp())
-    else:
-        schedule.failed(now_fn().timestamp())
-        print("대시보드 게시 실패(매매는 계속)")
+def _daemon_thread(fn: Callable[[], None]) -> None:
+    threading.Thread(target=fn, name="dashboard-publish", daemon=True).start()
+
+
+class BackgroundPublisher:
+    """대시보드 게시(git)를 매매 스레드 밖의 데몬 스레드 하나에서 한다. 한 번에 하나만 돌고, 도는 중의 새 요청은
+    쌓지 않고 버린다. 결과는 매매 루프가 나중 루프에 collect()로 거둔다(기다리지 않는다).
+    2 × DASHBOARD_PUBLISH_TIMEOUT_SECONDS를 넘겨도 끝나지 않으면 "slow"를 한 번 돌려주고 그 스레드는 버린다
+    (데몬이라 프로세스 종료를 막지 않는다. 늦게 끝나도 결과는 무시한다)."""
+
+    def __init__(self, publish_fn: Callable, clock: Callable[[], float] = time.monotonic,
+                 spawn: Callable[[Callable[[], None]], None] = _daemon_thread):
+        self._publish_fn = publish_fn
+        self._clock = clock
+        self._spawn = spawn
+        self._lock = threading.Lock()
+        self._job: dict | None = None
+
+    def busy(self) -> bool:
+        return self._job is not None
+
+    def submit(self, *args) -> bool:
+        if self._job is not None:
+            return False
+        job = {"started": self._clock(), "done": False, "result": None}
+        self._job = job
+        publish_fn, lock = self._publish_fn, self._lock
+
+        def work() -> None:
+            try:
+                result = "ok" if publish_fn(*args) else "failed"
+            except Exception as exc:                      # 게시 문제는 매매를 멈추지 않는다
+                result = f"error:{type(exc).__name__}"
+            with lock:
+                job["result"], job["done"] = result, True
+        self._spawn(work)
+        return True
+
+    def collect(self) -> str | None:
+        """"ok" | "failed" | "error:<예외 이름>" | "slow"(버림), 아직이면 None."""
+        job = self._job
+        if job is None:
+            return None
+        with self._lock:
+            done, result = job["done"], job["result"]
+        if done:
+            self._job = None
+            return result
+        if self._clock() - job["started"] > 2 * DASHBOARD_PUBLISH_TIMEOUT_SECONDS:
+            self._job = None
+            return "slow"
+        return None
+
+
+class PublishTracker:
+    """게시 주기(PublishSchedule)와 백그라운드 게시를 잇는다. 게시가 도는 동안 생긴 변경 표시는
+    그 게시의 완료(published)가 지우지 않도록 완료 뒤에 다시 건다(그 스냅숏에는 없던 변경이다)."""
+
+    def __init__(self, schedule: PublishSchedule, publisher: BackgroundPublisher):
+        self.schedule = schedule
+        self.publisher = publisher
+        self._marks_in_flight: list[bool] = []
+
+    def mark(self, critical: bool) -> None:
+        self.schedule.mark_dirty(critical=critical)
+        if self.publisher.busy():
+            self._marks_in_flight.append(critical)
+
+    def collect(self, now_ts: float) -> None:
+        result = self.publisher.collect()
+        if result is None:
+            return
+        marks, self._marks_in_flight = self._marks_in_flight, []
+        if result == "ok":
+            self.schedule.published(now_ts)
+            for critical in marks:
+                self.schedule.mark_dirty(critical=critical)
+            return
+        self.schedule.failed(now_ts)
+        if result == "slow":
+            print("대시보드 게시 지연(매매는 계속): 끝나지 않은 게시를 버립니다")
+        elif result.startswith("error:"):
+            print(f"대시보드 게시 오류(매매는 계속): {result[len('error:'):]}")
+        else:
+            print("대시보드 게시 실패(매매는 계속)")
+
+    def maybe_submit(self, engine: Engine, settings: Settings, now: datetime) -> None:
+        if self.publisher.busy() or not self.schedule.due(now.timestamp(), bool(engine.positions)):
+            return
+        try:                                              # 스냅숏과 렌더링은 매매 스레드에서(상태를 읽는다)
+            snap = engine.snapshot(now)
+            args = (render_dashboard(snap), build_state_json(snap), snap["events"],
+                    REPO_ROOT, settings.state_dir / "dashboard")
+        except Exception as exc:
+            self.schedule.failed(now.timestamp())
+            print(f"대시보드 게시 오류(매매는 계속): {type(exc).__name__}")
+            return
+        self.publisher.submit(*args)
 
 
 def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, sleep: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = utc_now, clock: Callable[[], float] = time.monotonic,
         max_loops: int | None = None, publish_fn: Callable = publish, commit_fn: Callable[[], str] = read_commit,
-        schedule: PublishSchedule | None = None) -> int:
+        schedule: PublishSchedule | None = None, publisher: BackgroundPublisher | None = None) -> int:
     """봇 루프. 잠금은 호출자(main)가 잡는다. 반환값은 종료 코드."""
     store = StateStore(settings.state_dir)
     try:
@@ -180,6 +264,7 @@ def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, slee
         print(f"오류: {exc}. 빈 장부로 시작하지 않습니다. 파일을 확인하고 다시 실행하세요.", file=sys.stderr)
         return 2
     schedule = schedule if schedule is not None else PublishSchedule()
+    tracker = PublishTracker(schedule, publisher if publisher is not None else BackgroundPublisher(publish_fn, clock))
     take_reconnects = getattr(feed, "take_reconnect_count", None)
     prev_codes: set[str] | None = None
     loops = 0
@@ -200,12 +285,13 @@ def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, slee
             for event in report.events:
                 print(_event_line(event), flush=True)
             codes = {h["code"] for h in report.halts}
-            if settings.auto_git_push:
+            if settings.auto_git_push:                    # 게시는 기다리지 않는다(백그라운드)
+                tracker.collect(now.timestamp())
                 changed = prev_codes is not None and codes != prev_codes
                 if report.events or changed:
                     critical = changed or any(e.get("type") in CRITICAL_EVENT_TYPES for e in report.events)
-                    schedule.mark_dirty(critical=critical)
-                _maybe_publish(engine, settings, schedule, now, publish_fn, now_fn)
+                    tracker.mark(critical=critical)
+                tracker.maybe_submit(engine, settings, now)
             prev_codes = codes
             loops += 1
             if max_loops is not None and loops >= max_loops:

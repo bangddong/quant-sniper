@@ -357,8 +357,15 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def git_env() -> dict[str, str]:
+    """git에 넘기는 환경: 바이낸스 키(BINANCE_*)는 빼고, 어떤 자격 증명 프롬프트·창도 띄우지 않는다."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("BINANCE_")}
+    env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never", GIT_ASKPASS="")
+    return env
+
+
 def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_dir: Path,
-            runner: Callable = subprocess.run) -> bool:
+            runner: Callable = subprocess.run, branch: str = "dashboard") -> bool:
     """세 파일을 부모 없는 단일 커밋으로 origin/dashboard에 덮어쓴다(원본 sync_dashboard_to_branch와 같은 절차).
     어떤 실패든 False만 돌려준다: git의 출력(stderr)은 어디에도 남기지 않는다."""
     try:
@@ -368,7 +375,7 @@ def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_d
                  "dashboard_events.json": json.dumps(events, ensure_ascii=False, indent=2),
                  "dashboard_state.json": json.dumps(state, ensure_ascii=False, indent=2)}
 
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")   # 자격 증명 프롬프트로 멈추지 않는다
+        env = git_env()
 
         def git(*args, **extra) -> str:
             if "input" not in extra:                       # mktree는 input이 표준 입력(파이프)이다
@@ -382,7 +389,11 @@ def publish(readme: str, state: dict, events: list[dict], repo_dir: Path, work_d
             tree_input += f"100644 blob {blob}\t{name}\n"
         tree = git("mktree", input=tree_input)
         commit = git("commit-tree", tree, "-m", COMMIT_MESSAGE)
-        git("push", "-f", "origin", f"{commit}:refs/heads/dashboard")
+        # push는 출력을 잡지 않는다(DEVNULL): 시간 초과로 git을 죽여도 자격 증명 도우미 같은 손자 프로세스가
+        # 파이프를 붙잡고 있으면 subprocess가 파이프를 끝없이 기다린다.
+        runner(["git", "push", "-f", "origin", f"{commit}:refs/heads/{branch}"], cwd=repo_dir, check=True,
+               timeout=DASHBOARD_PUBLISH_TIMEOUT_SECONDS, env=env, stdin=subprocess.DEVNULL,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception:                              # git 없음, 비정상 종료, 시간 초과, 파일 쓰기 실패 모두
         return False

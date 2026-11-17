@@ -1,10 +1,12 @@
 import json
+import os
 import subprocess
 import unittest
 from datetime import timedelta
 from pathlib import Path
 import shutil
 import tempfile
+from unittest import mock
 
 from coin_sniper import config
 from coin_sniper.config import Settings
@@ -376,9 +378,14 @@ class PublishTests(unittest.TestCase):
                          "100644 blob b3\tdashboard_state.json\n")
         self.assertEqual(args[4], ["git", "commit-tree", "tree1", "-m", "dashboard: rolling 7-day snapshot"])
         self.assertEqual(args[5], ["git", "push", "-f", "origin", "commit1:refs/heads/dashboard"])
-        for _, kwargs in self.calls:
+        for args_, kwargs in self.calls:
             self.assertEqual(kwargs["cwd"], self.repo)
-            self.assertTrue(kwargs["capture_output"])
+            if args_[1] == "push":                          # 출력을 잡지 않는다: 손자 프로세스가 파이프를 붙잡지 못한다
+                self.assertNotIn("capture_output", kwargs)
+                self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+                self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+            else:
+                self.assertTrue(kwargs["capture_output"])
             self.assertTrue(kwargs["check"])
             self.assertEqual(kwargs["timeout"], 60)
             self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
@@ -392,6 +399,19 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(json.loads((self.work / "dashboard_state.json").read_text(encoding="utf-8")), {"a": 1})
         self.assertEqual(json.loads((self.work / "dashboard_events.json").read_text(encoding="utf-8")),
                          [{"type": "BUY"}])
+
+    def test_publish_env_has_no_binance_keys_and_never_prompts(self):
+        run = self.runner(["b1", "b2", "b3", "tree1", "commit1", ""])
+        secret_env = {"BINANCE_DEMO_API_KEY": "k-secret", "BINANCE_LIVE_API_SECRET": "s-secret",
+                      "GCM_INTERACTIVE": "always", "GIT_ASKPASS": "/usr/bin/askpass"}
+        with mock.patch.dict(os.environ, secret_env):
+            self.assertTrue(publish("# r", {}, [], self.repo, self.work, runner=run))
+        for _, kwargs in self.calls:
+            env = kwargs["env"]
+            self.assertFalse([k for k in env if k.upper().startswith("BINANCE_")])
+            self.assertEqual(env["GCM_INTERACTIVE"], "never")
+            self.assertEqual(env["GIT_ASKPASS"], "")
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
     def test_publish_failure_returns_false_without_raising(self):
         err = subprocess.CalledProcessError(1, ["git", "push"], stderr="fatal: token=SECRET")
