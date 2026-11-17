@@ -2,7 +2,7 @@
 
 원칙: 확인하지 못한 것은 "모름"이다. 모르면 신규 주문을 하지 않는다(fail-closed).
 시각은 항상 now 인자(UTC, timezone-aware)로 받는다. 하루 경계는 UTC 0시.
-청산·보호 주문·의도 복구는 execution.Executor(Task 11)에 있고, 진입(Task 12)은 _manage_entries 자리에 넣는다.
+청산·보호 주문·의도 복구는 execution.Executor(Task 11), 진입은 entries.EntryManager(Task 12)에 있다.
 각 단계는 따로 예외를 잡는다: 한 단계가 실패해도 다음 단계(특히 청산)는 실행되고 LOOP_ERROR가 진입을 막는다.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ from coin_sniper.config import (
     UNIVERSE_RETRY_SECONDS, Settings,
 )
 from coin_sniper.exchange.base import Exchange, Feed
+from coin_sniper.entries import EntryManager
 from coin_sniper.execution import Executor
 from coin_sniper.halts import (
     ACCOUNT_FETCH, DAILY_LOSS, DRAWDOWN, FATAL, FEED_STALE, LOOP_ERROR, MAINTENANCE, RATE_LIMIT,
@@ -95,7 +96,8 @@ class Engine:
         self._prev_loop_at: datetime | None = None
         self._now: datetime | None = None
         self._loop_events: list[dict] = []
-        self.executor = Executor(self, passthrough=(_RateLimited,))   # 주문 절차(매수는 Task 12가 쓴다)
+        self.executor = Executor(self, passthrough=(_RateLimited,))   # 주문 절차(매수·매도 공통)
+        self.entries = EntryManager(self)                  # 진입과 신호 연속 확인(메모리)
 
     # ---- 시작 ---------------------------------------------------------------------
     def startup(self, now: datetime) -> None:
@@ -128,7 +130,9 @@ class Engine:
         self._now = now
         self._loop_events = []
         self._loop_failed = False
+        self.entries.begin_loop()
         ok = self._guarded(self._steps, now) and not self._loop_failed
+        self.entries.end_loop()                            # 평가하지 않은 루프면 연속 확인을 처음부터
         if ok:
             self.risk_state["last_loop_at"] = now.isoformat()
         ok = self._guarded(self._save_state) and ok
@@ -136,7 +140,8 @@ class Engine:
         self._guarded(lambda: self.store.save("metrics", self.metrics.to_dict()))
         return LoopReport(now=now, ok=ok, equity=self.equity, cash=self.cash,
                           entry_allowed=self.entry_allowed(now), halts=self.halts.active(),
-                          events=list(self._loop_events))
+                          events=list(self._loop_events), raw_signals=self.entries.raw,
+                          confirmed_signals=self.entries.confirmed)
 
     def _steps(self, now: datetime) -> None:
         self.balances = None
@@ -201,7 +206,8 @@ class Engine:
         self.executor.manage_exits(now)
 
     def _manage_entries(self, now: datetime) -> None:
-        """8단계: 진입 (Task 12)."""
+        """8단계: 진입. entry_allowed(now)일 때만 불린다."""
+        self.entries.run(now)
 
     # ---- 거래소 호출 ----------------------------------------------------------------
     def _call(self, name: str, *args) -> ApiResult:
@@ -508,5 +514,5 @@ class Engine:
             "equity": self.equity, "cash": self.cash,
             "universe_date": self.universe.get("date"), "universe": list(self.universe.get("symbols", [])),
             "positions": copy.deepcopy(self.positions), "unmanaged_assets": list(self.unmanaged_assets),
-            "entry_allowed": self.entry_allowed(now),
+            "entry_allowed": self.entry_allowed(now), "signal_progress": self.entries.progress(),
         }

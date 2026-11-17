@@ -106,3 +106,34 @@ def restart_engine(engine: Engine, now: datetime, sleep=None) -> Engine:
                    engine.settings, sleep=sleep or (lambda _s: None))
     fresh.startup(now)
     return fresh
+
+
+SIGNAL_VOLUME = 2000.0              # 직전 20일 평균(1000)의 2배: 하루 중 언제든 거래량 확인을 통과한다
+
+
+def signal_candles(price: float, today: date = TODAY, open_ratio: float = 0.95, n: int = 70) -> list[dict]:
+    """변동성 돌파(VBO) 신호가 나는 일봉. 완료봉은 완만히 상승(20일선 상승), 당일봉은 시가 price×open_ratio에서
+    돌파 목표가를 넘어 price에 있다. open_ratio가 낮을수록 돌파폭(score)이 크다. 손절폭은 0.04로 정해진다."""
+    out = []
+    for i in range(n - 1):
+        close = price * (0.85 + 0.001 * i)
+        out.append({"date": (today - timedelta(days=n - 1 - i)).isoformat(), "open": close * 0.999,
+                    "high": close * 1.002, "low": close * 0.998, "close": close, "vol": 1000.0,
+                    "quote_vol": 5e7})
+    o, h, lo = price * open_ratio, price * 1.001, price * open_ratio * 0.999
+    out.append({"date": today.isoformat(), "open": o, "high": h, "low": lo, "close": price,
+                "vol": SIGNAL_VOLUME, "quote_vol": SIGNAL_VOLUME * price})
+    return out
+
+
+def set_signal(exchange: FakeExchange, feed: FakeFeed, symbol: str, price: float | None = None,
+               today: date = TODAY, open_ratio: float = 0.95, age: float = 0.0) -> None:
+    """symbol에 진짜 VBO 신호를 만든다(REST 일봉 + 같은 값의 실시간 당일봉 시세). 첫 run_once 전에 부른다
+    (감시 종목 선정 때 일봉이 캐시된다). 기본 BTCUSDT 일봉(상승 추세)이 시장 필터를 통과한다."""
+    price = DEFAULT_PRICES[symbol] if price is None else price
+    candles = signal_candles(price, today, open_ratio)
+    exchange.set_candles(symbol, candles)
+    exchange.set_price(symbol, price)
+    last = candles[-1]
+    feed.set_quote(symbol, price, open=last["open"], high=last["high"], low=last["low"],
+                   volume=SIGNAL_VOLUME, day=today.isoformat(), age=age)

@@ -8,14 +8,14 @@
 중간에 프로세스가 죽으면 재시작 1단계(resolve_intents)가 같은 저널을 다시 쓴다. 덮어쓰기라 몇 번 써도 결과가 같고,
 체결 기록은 client_id로 중복을 막으므로 한 체결이 두 번 반영되지 않는다.
 
-매수(Task 12): execute_market(symbol, "BUY", ...)을 부르고, _buy_journal을 채운다(그 메서드의 설명 참고).
+매수(Task 12, entries.py): execute_market(symbol, "BUY", ...)로 같은 절차를 타고 _buy_journal이 저널을 만든다.
 """
 from __future__ import annotations
 
 import copy
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from coin_sniper import config
@@ -31,6 +31,7 @@ from coin_sniper.risk import floor_to_step, floor_to_tick, time_stop_due, update
 TIME_STOP_REASON = f"타임스탑 ({MAX_HOLD_HOURS}시간 경과)"
 EXCHANGE_STOP_REASON = "거래소 손절"
 EXCHANGE_STOP_PARTIAL_REASON = "거래소 손절(부분)"
+BUY_DROPPED_REASON = "매수 주문 미확인 폐기: 거래소 잔고 확인 필요"
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
 
 
@@ -115,6 +116,8 @@ class Executor:
             if age < INTENT_NOT_FOUND_GRACE_SECONDS:       # 조회 지연일 수 있다: 모름
                 return self._unknown(cid, now)
             self._drop_intent(cid)                         # 유예가 지나도 없다: 주문된 적 없음
+            if side == "BUY":                              # 늦게 체결되면 장부 모르는 코인이 생긴다
+                e._event("RISK", BUY_DROPPED_REASON, symbol)
             return Outcome("absent", cid, state)
         if state.executed_qty <= 0:
             self._drop_intent(cid)
@@ -195,12 +198,31 @@ class Executor:
         self._commit(cid)
 
     def _buy_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
-        """매수 체결 반영 자리 (Task 12). 장부를 직접 바꾸지 말고 아래 저널을 돌려준다(_commit이 쓴다):
-        {"trade": 체결 기록(type "BUY", client_id 필수), "position": 반영 뒤 이 종목 포지션 dict(없애려면 None),
-         "realized_pnl": 반영 뒤 risk_state["realized_pnl"](매수는 그대로), "dust": None}.
-        intent에는 symbol, side, qty, kind, reason, ref_price, extra(execute_market에 넘긴 값)가 있다.
-        rule은 항상 있다(규칙이 없으면 _settle이 반영 전에 멈춘다)."""
-        raise NotImplementedError("매수 체결 반영은 Task 12에서 구현한다")
+        """매수 체결 반영 저널. 장부는 바꾸지 않는다(_commit이 쓴다).
+        수량은 실제 받은 수량(체결 − 코인으로 낸 수수료, 내림 없음), 원가는 체결 금액 + USDT 수수료.
+        1스텝 미만·최소 금액 미만의 작은 체결도 그대로 기록한다(다음 청산 단계의 잔량 정리가 닫는다)."""
+        symbol, extra = intent["symbol"], intent.get("extra") or {}
+        received = float(max(_dec(state.executed_qty) - _dec(state.fees.get(rule.base, 0.0)), Decimal(0)))
+        quote_qty = float(state.quote_qty)
+        cost = quote_qty + float(state.fees.get(QUOTE_ASSET, 0.0))
+        buy_price = state.avg_price
+        stop_loss_pct = float(extra["stop_loss_pct"])
+        position = {
+            "symbol": symbol, "qty": received, "buy_price": buy_price, "cost": cost,
+            "stop_loss_pct": stop_loss_pct, "trailing_gap_pct": float(extra["trailing_gap_pct"]),
+            "highest_price": buy_price, "stop_price": buy_price * (1 - stop_loss_pct), "trailing_active": False,
+            "entry_time": now.astimezone(timezone.utc).isoformat(), "strategy": extra.get("strategy"),
+            "protective": None,
+        }
+        ref = intent.get("ref_price")
+        trade = {
+            "time": now.isoformat(), "type": "BUY", "symbol": symbol, "qty": received, "price": buy_price,
+            "quote_qty": quote_qty, "fees": dict(state.fees), "strategy": extra.get("strategy"),
+            "reason": intent["reason"], "client_id": intent["client_id"],
+            "slippage_pct": (buy_price - ref) / ref * 100 if ref else None,
+        }
+        return {"trade": trade, "position": position, "dust": None,
+                "realized_pnl": float(self.e.risk_state.get("realized_pnl", 0.0))}
 
     def _sell_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
         e = self.e
@@ -293,6 +315,8 @@ class Executor:
         if new and trade["type"] == "SELL" and trade.get("counted", True):
             e._event("SELL", trade["reason"], symbol, qty=trade["qty"], price=trade["price"],
                      net_return_pct=trade["net_return_pct"])
+        elif new and trade["type"] == "BUY":
+            e._event("BUY", trade["reason"], symbol, qty=trade["qty"], price=trade["price"])
 
     def _apply_external(self, symbol: str, state: OrderState, reason: str, now: datetime) -> None:
         """거래소 보호 주문의 체결을 매도로 반영한다(시장가 주문 없음). 같은 의도·저널 경로를 탄다."""
