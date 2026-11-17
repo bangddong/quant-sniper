@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ TIME_STOP_REASON = f"타임스탑 ({MAX_HOLD_HOURS}시간 경과)"
 EXCHANGE_STOP_REASON = "거래소 손절"
 EXCHANGE_STOP_PARTIAL_REASON = "거래소 손절(부분)"
 BUY_DROPPED_REASON = "매수 주문 미확인 폐기: 거래소 잔고 확인 필요"
+FEE_UNPRICED_REASON = "수수료 자산 가격 모름"
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
 
 
@@ -129,7 +131,8 @@ class Executor:
         if rule is None:                                   # 수량 단위·최소 금액을 모르면 반영하지 않는다
             return self._unknown(cid, now, "종목 규칙 미확보")
         full = _dec(state.executed_qty) >= _dec(intent["qty"]) - _dec(rule.step_size)
-        self._apply(cid, state, now)
+        if not self._apply(cid, state, now):               # 수수료 자산 값을 모른다: 다음 루프에 다시
+            return self._unknown(cid, now, FEE_UNPRICED_REASON)
         e.metrics.record_order("filled" if full else "partial", now)
         return Outcome("filled" if full else "partial", cid, state)
 
@@ -176,35 +179,70 @@ class Executor:
             e._clear_halt(ORDER_UNCONFIRMED)
 
     # ==== 체결 반영 ===================================================================
-    def _apply(self, cid: str, state: OrderState, now: datetime) -> None:
+    def _apply(self, cid: str, state: OrderState, now: datetime) -> bool:
+        """체결을 저널로 반영한다. 반영했거나 이미 반영됐거나 반영할 수 없어 의도를 지웠으면 True.
+        False면 아무것도 쓰지 않았다(제3 자산 수수료의 값을 모른다): 의도는 남고 호출자가 "모름"으로 처리한다."""
         e = self.e
         intent = e.intents[cid]
         if self._trade_recorded(cid):                      # 이미 반영된 체결
             self._drop_intent(cid)
-            return
+            return True
         rule = e.rules.get(intent["symbol"])
         if rule is None:                                   # 명시적 방어: 단위를 모르는 반영은 하지 않는다
             raise RuntimeError(f"종목 규칙 없이 체결 반영 불가: {intent['symbol']}")
+        if intent["side"] == "SELL" and intent["symbol"] not in e.positions:   # 체결을 지어내지 않는다
+            self._drop_intent(cid)
+            e._event("RISK", f"매도 체결 반영 불가: 장부에 포지션 없음 ({cid})", intent["symbol"])
+            return True
+        other = self._other_fees_usdt(rule, state)
+        if other is None:                                  # 값을 모르는 수수료로 반영하지 않는다
+            e._event("RISK", f"{FEE_UNPRICED_REASON}: 체결 반영 보류", intent["symbol"])
+            return False
         if intent["side"] == "SELL":
-            if intent["symbol"] not in e.positions:        # 체결을 지어내지 않는다
-                self._drop_intent(cid)
-                e._event("RISK", f"매도 체결 반영 불가: 장부에 포지션 없음 ({cid})", intent["symbol"])
-                return
-            journal = self._sell_journal(intent, state, rule, now)
+            journal = self._sell_journal(intent, state, rule, now, other)
         else:
-            journal = self._buy_journal(intent, state, rule, now)
+            journal = self._buy_journal(intent, state, rule, now, other)
         intent["journal"] = journal
         e.store.save("intents", e.intents)                 # 저널이 먼저 디스크에 있어야 한다
         self._commit(cid)
+        return True
 
-    def _buy_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
+    def _other_fees_usdt(self, rule: SymbolRules, state: OrderState) -> float | None:
+        """기초 자산·USDT가 아닌 수수료 자산(BNB 등)의 USDT 가치 합. 하나라도 값을 모르면 None."""
+        total = 0.0
+        for asset, amount in state.fees.items():
+            if asset in (rule.base, QUOTE_ASSET) or not float(amount):
+                continue
+            price = self._asset_price(asset)
+            if price is None:
+                return None
+            total += float(amount) * price
+        return total
+
+    def _asset_price(self, asset: str) -> float | None:
+        """<자산>USDT 가격: 신선한 피드 시세, 없으면 일봉 1개의 종가(엔진 _call). 받을 수 없으면 None."""
+        e = self.e
+        pair = f"{asset}{QUOTE_ASSET}"
+        quote = e.feed.quote(pair, QUOTE_MAX_AGE_SECONDS)
+        if quote is not None and math.isfinite(quote.price) and quote.price > 0:
+            return float(quote.price)
+        res = e._call("daily_candles", pair, 1)
+        try:
+            close = float(res.value[-1]["close"]) if res.ok and res.value else None
+        except (KeyError, TypeError, ValueError, IndexError):
+            close = None
+        return close if close is not None and math.isfinite(close) and close > 0 else None
+
+    def _buy_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime,
+                     fee_other_usdt: float = 0.0) -> dict:
         """매수 체결 반영 저널. 장부는 바꾸지 않는다(_commit이 쓴다).
-        수량은 실제 받은 수량(체결 − 코인으로 낸 수수료, 내림 없음), 원가는 체결 금액 + USDT 수수료.
-        1스텝 미만·최소 금액 미만의 작은 체결도 그대로 기록한다(다음 청산 단계의 잔량 정리가 닫는다)."""
+        수량은 실제 받은 수량(체결 − 코인으로 낸 수수료, 내림 없음), 원가는 체결 금액 + USDT 수수료
+        + 제3 자산 수수료의 USDT 가치. 1스텝 미만·최소 금액 미만의 작은 체결도 그대로 기록한다
+        (다음 청산 단계의 잔량 정리가 닫는다)."""
         symbol, extra = intent["symbol"], intent.get("extra") or {}
         received = float(max(_dec(state.executed_qty) - _dec(state.fees.get(rule.base, 0.0)), Decimal(0)))
         quote_qty = float(state.quote_qty)
-        cost = quote_qty + float(state.fees.get(QUOTE_ASSET, 0.0))
+        cost = quote_qty + float(state.fees.get(QUOTE_ASSET, 0.0)) + fee_other_usdt
         buy_price = state.avg_price
         stop_loss_pct = float(extra["stop_loss_pct"])
         position = {
@@ -217,21 +255,23 @@ class Executor:
         ref = intent.get("ref_price")
         trade = {
             "time": now.isoformat(), "type": "BUY", "symbol": symbol, "qty": received, "price": buy_price,
-            "quote_qty": quote_qty, "fees": dict(state.fees), "strategy": extra.get("strategy"),
+            "quote_qty": quote_qty, "fees": dict(state.fees), "fee_other_usdt": fee_other_usdt,
+            "strategy": extra.get("strategy"),
             "reason": intent["reason"], "client_id": intent["client_id"],
             "slippage_pct": (buy_price - ref) / ref * 100 if ref else None,
         }
         return {"trade": trade, "position": position, "dust": None,
                 "realized_pnl": float(self.e.risk_state.get("realized_pnl", 0.0))}
 
-    def _sell_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime) -> dict:
+    def _sell_journal(self, intent: dict, state: OrderState, rule: SymbolRules, now: datetime,
+                      fee_other_usdt: float = 0.0) -> dict:
         e = self.e
         symbol = intent["symbol"]
         pos = copy.deepcopy(e.positions[symbol])
         step = _dec(rule.step_size)
         sold, held = _dec(state.executed_qty), _dec(pos["qty"])
         quote_qty = float(state.quote_qty)
-        proceeds = quote_qty - float(state.fees.get(QUOTE_ASSET, 0.0))
+        proceeds = quote_qty - float(state.fees.get(QUOTE_ASSET, 0.0)) - fee_other_usdt
         cost = float(pos["cost"])
         cost_part = cost if sold >= held - step else cost * float(sold / held)
         gross = quote_qty - float(pos["buy_price"]) * float(sold)
@@ -252,7 +292,7 @@ class Executor:
         base = cost_part + writeoff
         trade = {
             "time": now.isoformat(), "type": "SELL", "symbol": symbol, "qty": float(sold),
-            "price": avg, "quote_qty": quote_qty, "fees": dict(state.fees),
+            "price": avg, "quote_qty": quote_qty, "fees": dict(state.fees), "fee_other_usdt": fee_other_usdt,
             "strategy": e.positions[symbol].get("strategy"), "reason": intent["reason"],
             "client_id": intent["client_id"], "entry_price": float(e.positions[symbol]["buy_price"]),
             "gross_pnl": gross, "net_pnl": net, "net_return_pct": net / base * 100 if base else 0.0,
@@ -318,15 +358,23 @@ class Executor:
         elif new and trade["type"] == "BUY":
             e._event("BUY", trade["reason"], symbol, qty=trade["qty"], price=trade["price"])
 
-    def _apply_external(self, symbol: str, state: OrderState, reason: str, now: datetime) -> None:
-        """거래소 보호 주문의 체결을 매도로 반영한다(시장가 주문 없음). 같은 의도·저널 경로를 탄다."""
+    def _apply_external(self, symbol: str, state: OrderState, reason: str, now: datetime) -> bool:
+        """거래소 보호 주문의 체결을 매도로 반영한다(시장가 주문 없음). 같은 의도·저널 경로를 탄다.
+        False: 반영하지 못했다(수수료 자산 값 모름). 의도가 남아 다음 루프 1단계가 다시 반영한다:
+        호출자는 보호 주문 기록을 지우지 말고 이 종목을 이번 루프에서 더 다루지 않는다."""
         e = self.e
         cid = state.client_id
-        if cid in e.intents or self._trade_recorded(cid):
-            return
+        if self._trade_recorded(cid):
+            return True
+        if cid in e.intents:
+            return False                                   # 아직 반영 대기 중인 같은 체결
         add_intent(e.intents, cid, symbol, "SELL", state.executed_qty, "protective", reason, now)
         e.intents[cid].update(ref_price=None, extra={})
-        self._apply(cid, state, now)
+        e.store.save("intents", e.intents)
+        if self._apply(cid, state, now):
+            return True
+        self._unknown(cid, now, FEE_UNPRICED_REASON)
+        return False
 
     def _trade_recorded(self, cid: str) -> bool:
         return any(t.get("client_id") == cid for t in self.e.store.load("trades", []))
@@ -439,7 +487,8 @@ class Executor:
             return False
         st = res.value
         if st.exists and st.status == "FILLED":
-            self._apply_external(symbol, st, EXCHANGE_STOP_REASON, now)
+            if not self._apply_external(symbol, st, EXCHANGE_STOP_REASON, now):
+                return False                               # 반영 대기: 기록은 두고 이 종목은 건너뛴다
             self._clear_protective(symbol, prot["client_id"])
             return True
         if st.exists and not st.is_final:
@@ -448,7 +497,8 @@ class Executor:
                 e.store.save("positions", e.positions)
             return True
         if st.exists and st.executed_qty > 0:
-            self._apply_external(symbol, st, EXCHANGE_STOP_PARTIAL_REASON, now)
+            if not self._apply_external(symbol, st, EXCHANGE_STOP_PARTIAL_REASON, now):
+                return False
         self._clear_protective(symbol, prot["client_id"])
         e._event("RISK", "보호 주문 없음: 재등록", symbol)
         return True
@@ -464,7 +514,8 @@ class Executor:
         if not res.ok:
             got = e._call("get_order", symbol, cid)
             if got.ok and got.value.exists and got.value.status == "FILLED":
-                self._apply_external(symbol, got.value, EXCHANGE_STOP_REASON, now)
+                if not self._apply_external(symbol, got.value, EXCHANGE_STOP_REASON, now):
+                    return "pending"                       # 체결 반영 대기: 팔지도 새로 걸지도 않는다
                 self._clear_protective(symbol, cid)
                 return "filled"
             prot["cancel_failed"] = res.error or "취소 실패"
@@ -489,7 +540,8 @@ class Executor:
             return False
         if st.executed_qty > 0:
             reason = EXCHANGE_STOP_REASON if st.status == "FILLED" else EXCHANGE_STOP_PARTIAL_REASON
-            self._apply_external(symbol, st, reason, now)
+            if not self._apply_external(symbol, st, reason, now):
+                return False
         self._clear_protective(symbol, cid)
         return True
 

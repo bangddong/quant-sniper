@@ -101,7 +101,8 @@ def _closed_stats(sells: list[dict]) -> tuple[int, float | None, float | None]:
 
 def performance_stats(trades: list[dict], starting_capital: float | None = 1000.0) -> dict:
     """청산 성과. 청산 1건 = SELL 기록 1건(부분 매도도 각각), counted False(잔량 정리)는 뺀다.
-    수수료·슬리피지는 모든 체결(BUY·SELL, counted 무관)에서 센다. 기초 자산 외 수수료 자산은 값을 매기지 않는다."""
+    수수료·슬리피지는 모든 체결(BUY·SELL, counted 무관)에서 센다. 제3 자산 수수료는 체결 기록의 fee_other_usdt를
+    쓰고, 그 값이 없는 예전 기록의 제3 자산만 값을 매기지 않고 따로 알린다."""
     sells = sorted((t for t in trades if t.get("type") == "SELL" and t.get("counted")),
                    key=lambda t: str(t.get("time", "")))
     closed, win_rate, _ = _closed_stats(sells)
@@ -119,12 +120,15 @@ def performance_stats(trades: list[dict], starting_capital: float | None = 1000.
         max_dd = max(max_dd, peak - cum)
     fees, unpriced = 0.0, set()
     for t in trades:
+        priced_other = t.get("fee_other_usdt") is not None   # 제3 자산 수수료를 체결 때 USDT로 값 매김
+        if priced_other:
+            fees += float(t["fee_other_usdt"])
         for asset, amount in (t.get("fees") or {}).items():
             if asset == QUOTE_ASSET:
                 fees += float(amount)
             elif asset == _base(str(t.get("symbol", ""))) and t.get("price"):
                 fees += float(amount) * float(t["price"])
-            elif float(amount):
+            elif float(amount) and not priced_other:       # 이 변경 전 기록만: 값을 모른다
                 unpriced.add(asset)
     slips = [float(t["slippage_pct"]) for t in trades if t.get("slippage_pct") is not None]
     by_strategy = {}

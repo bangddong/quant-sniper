@@ -269,6 +269,18 @@ class PerformanceStatsTests(unittest.TestCase):
         self.assertEqual(stats["by_strategy"]["vbo"], {"closed": 2, "win_rate": 100.0, "avg_return_pct": 6.0})
         self.assertEqual(stats["by_strategy"]["rsi_recovery"]["win_rate"], 0.0)
 
+    def test_fees_use_valued_third_asset_fee_when_recorded(self):
+        new = {"time": "2026-11-12T00:00:00+00:00", "type": "BUY", "symbol": "SOLUSDT", "qty": 1.0, "price": 100.0,
+               "quote_qty": 100.0, "fees": {"BNB": 0.0002}, "fee_other_usdt": 0.12, "strategy": "vbo"}
+        stats = performance_stats([new], 1000.0)
+        self.assertAlmostEqual(stats["total_fees_usdt"], 0.12)
+        self.assertEqual(stats["fees_unpriced_assets"], [])
+        old = dict(new, fee_other_usdt=None, time="2026-11-11T00:00:00+00:00")
+        old.pop("fee_other_usdt")
+        stats = performance_stats([old, new], 1000.0)                        # 예전 기록만 따로 알린다
+        self.assertAlmostEqual(stats["total_fees_usdt"], 0.12)
+        self.assertEqual(stats["fees_unpriced_assets"], ["BNB"])
+
     def test_loss_streak_follows_time_order(self):
         trades = [sell(-1, time="2026-11-13T00:00:00+00:00"), sell(5, time="2026-11-10T00:00:00+00:00"),
                   sell(-2, time="2026-11-11T00:00:00+00:00"), sell(-3, time="2026-11-12T00:00:00+00:00")]

@@ -670,5 +670,103 @@ class EngineExitTests(unittest.TestCase):
         self.assertIn("ZZZUSDT", store.load("positions", {}))
 
 
+class ThirdAssetFeeTests(unittest.TestCase):
+    """BNB 같은 제3 자산으로 낸 수수료를 USDT로 값을 매겨 원가·대금·순손익·가상 현금에 넣는다 (F4)."""
+    BNB = 600.0
+
+    def build(self, price=92.0, bnb_quote=True):
+        eng, ex, feed, store = make_engine(test=self)
+        eng.startup(T0)
+        add_position(eng, ex, SYM, 1.0, 100.0)             # 원가 100, 손절선 95
+        ex._account("BNB")[0] += 1
+        ex.set_fee_asset("BNB", self.BNB)
+        ex.set_price(SYM, price)
+        feed.set_quote(SYM, price)
+        if bnb_quote:
+            feed.set_quote("BNBUSDT", self.BNB)
+        return eng, ex, feed, store
+
+    @staticmethod
+    def usdt(ex) -> float:
+        return float(ex._account("USDT")[0])
+
+    def test_sell_with_bnb_fee_values_fee_in_proceeds_and_cash(self):
+        eng, ex, feed, store = self.build(price=100.0)
+        eng.run_once(T0 - 30 * SEC)                           # 가격이 손절선 위일 때 상태를 맞춘다
+        ex.set_price(SYM, 92.0)
+        feed.set_quote(SYM, 92.0)
+        cash_before = account_value(eng.risk_state, eng.positions, {s: 0.0 for s in eng.positions})[0]
+        usdt_before = self.usdt(ex)
+        eng.run_once(T0)
+        t = store.load("trades", [])[-1]
+        fee_value = 92.0 * 0.001
+        self.assertEqual(t["fees"], {"BNB": unittest.mock.ANY})
+        self.assertAlmostEqual(t["fees"]["BNB"] * self.BNB, fee_value)
+        self.assertAlmostEqual(t["fee_other_usdt"], fee_value)
+        self.assertAlmostEqual(t["net_pnl"], 92.0 - fee_value - 100.0)
+        cash_after = account_value(eng.risk_state, eng.positions, {s: 0.0 for s in eng.positions})[0]
+        self.assertAlmostEqual(cash_after - cash_before, (self.usdt(ex) - usdt_before) - fee_value)
+
+    def test_buy_with_bnb_fee_adds_valued_fee_to_cost(self):
+        eng, ex, feed, store = self.build(price=100.0)
+        eng.run_once(T0)                                      # 규칙 확보
+        cash_before = account_value(eng.risk_state, eng.positions, {s: 0.0 for s in eng.positions})[0]
+        usdt_before = self.usdt(ex)
+        extra = {"stop_loss_pct": 0.05, "trailing_gap_pct": 0.05, "strategy": "vbo"}
+        out = eng.executor.execute_market("XRPUSDT", "BUY", 50.0, "entry", "vbo", T0, ref_price=2.0, extra=extra)
+        self.assertEqual(out.status, "filled")
+        pos = eng.positions["XRPUSDT"]
+        fee_value = 100.0 * 0.001
+        self.assertAlmostEqual(pos["qty"], 50.0)              # 기초 자산 수수료 없음
+        self.assertAlmostEqual(pos["cost"], 100.0 + fee_value)
+        t = store.load("trades", [])[-1]
+        self.assertAlmostEqual(t["fee_other_usdt"], fee_value)
+        cash_after = account_value(eng.risk_state, eng.positions, {s: 0.0 for s in eng.positions})[0]
+        self.assertAlmostEqual(cash_after - cash_before, (self.usdt(ex) - usdt_before) - fee_value)
+
+    def test_unpriced_fee_asset_keeps_intent_then_journals_once_when_price_known(self):
+        eng, ex, feed, store = self.build(bnb_quote=False)    # BNB 시세도 일봉도 없다
+        r1 = eng.run_once(T0)
+        self.assertEqual(len(calls(ex, "market_sell")), 1)
+        self.assertEqual(store.load("trades", []), [])         # 값을 모르는 수수료로 반영하지 않는다
+        self.assertIn(SYM, store.load("positions", {}))
+        self.assertEqual(len(store.load("intents", {})), 1)
+        self.assertIn(ORDER_UNCONFIRMED, codes(r1))
+        ex.set_candles("BNBUSDT", [{"date": "2026-11-17", "open": 590.0, "high": 610.0, "low": 580.0,
+                                    "close": self.BNB, "vol": 1.0, "quote_vol": 600.0}])
+        r2 = eng.run_once(T0 + 30 * SEC)                      # 일봉 종가로 값을 매겨 반영
+        trades = store.load("trades", [])
+        self.assertEqual(len(trades), 1)
+        self.assertAlmostEqual(trades[0]["fee_other_usdt"], 92.0 * 0.001)
+        self.assertEqual(store.load("intents", {}), {})
+        self.assertNotIn(SYM, store.load("positions", {}))
+        self.assertNotIn(ORDER_UNCONFIRMED, codes(r2))
+        self.assertEqual(len(calls(ex, "market_sell")), 1)     # 다시 팔지 않는다
+        eng.run_once(T0 + 60 * SEC)
+        self.assertEqual(len(store.load("trades", [])), 1)
+
+    def test_protective_fill_with_unpriced_fee_waits_without_selling(self):
+        eng, ex, feed, store = self.build(price=100.0, bnb_quote=False)
+        ex.set_fee_asset(None)
+        eng.run_once(T0)                                      # 보호 주문 등록
+        cid = eng.positions[SYM]["protective"]["client_id"]
+        ex.set_price(SYM, 90.0)
+        feed.set_quote(SYM, 90.0)
+        ex.trigger_stops()
+        ex._orders[cid].state.fees = {"BNB": 0.0001}          # 거래소가 BNB로 수수료를 받았다
+        r1 = eng.run_once(T0 + 30 * SEC)
+        self.assertEqual(store.load("trades", []), [])
+        self.assertIn(cid, store.load("intents", {}))
+        self.assertIn(ORDER_UNCONFIRMED, codes(r1))
+        self.assertEqual(calls(ex, "market_sell"), [])         # 장부 수량을 믿고 팔지 않는다
+        feed.set_quote("BNBUSDT", self.BNB)
+        eng.run_once(T0 + 60 * SEC)
+        trades = store.load("trades", [])
+        self.assertEqual([t["client_id"] for t in trades], [cid])
+        self.assertAlmostEqual(trades[0]["fee_other_usdt"], 0.0001 * self.BNB)
+        self.assertNotIn(SYM, store.load("positions", {}))
+        self.assertEqual(calls(ex, "market_sell"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

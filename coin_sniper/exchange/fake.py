@@ -79,6 +79,7 @@ class FakeExchange:
         self._failures: dict[str, list[ApiResult]] = {}
         self._drops: dict[str, int] = {}
         self._fill_ratio = 1.0
+        self._fee_asset: tuple[str, Decimal] | None = None   # 수수료를 낼 제3 자산과 그 USDT 가격
         self._hidden = 0                   # 남은 "조회 지연" get_order 횟수
         self.calls: list[tuple[str, dict]] = []
 
@@ -94,6 +95,11 @@ class FakeExchange:
 
     def set_fill_ratio(self, ratio: float) -> None:
         self._fill_ratio = float(ratio)
+
+    def set_fee_asset(self, asset: str | None, price: float = 0.0) -> None:
+        """시장가 체결 수수료를 제3 자산(예: BNB)으로 낸다: 수수료 가치(체결 금액 × 수수료율)를 price로 나눈 수량을
+        그 자산 잔고에서 뺀다. 기초 자산·USDT는 수수료 없이 오간다. None이면 원래대로."""
+        self._fee_asset = None if asset is None else (asset, _d(price))
 
     def drop_response_next(self, method: str) -> None:
         self._drops[method] = self._drops.get(method, 0) + 1
@@ -163,7 +169,18 @@ class FakeExchange:
         executed = want if ratio == 1.0 else _d(floor_to_step(float(want) * ratio, rule.step_size))
         quote_qty = executed * price
         fees: dict[str, float] = {}
-        if executed > 0:
+        if executed > 0 and self._fee_asset is not None:
+            asset, asset_price = self._fee_asset
+            fee = quote_qty * self._fee_rate / asset_price
+            self._account(asset)[0] -= fee
+            if side == "BUY":
+                self._account(rule.quote)[0] -= quote_qty
+                self._account(rule.base)[0] += executed
+            else:
+                self._account(rule.base)[0] -= executed
+                self._account(rule.quote)[0] += quote_qty
+            fees = {asset: float(fee)}
+        elif executed > 0:
             if side == "BUY":
                 fee = executed * self._fee_rate
                 self._account(rule.quote)[0] -= quote_qty
