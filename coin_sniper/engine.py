@@ -114,6 +114,10 @@ class Engine:
         self.events = s.load("events", [])
         self.equity_history = s.load("equity_history", [])
         self.halts = HaltBoard.from_dict(s.load("halts", {}))
+        if self.halts.is_set(FATAL):                       # 사람이 원인을 고치고 재시작했다(7.4). 남아 있으면 첫 호출에서 다시 걸린다
+            self._now = now
+            self.halts.clear(FATAL)
+            self._event("SYSTEM", "재시작으로 치명적 중단 해제")
         if not self.risk_state:
             self.risk_state = {
                 "starting_capital": float(self.settings.starting_capital), "realized_pnl": 0.0,

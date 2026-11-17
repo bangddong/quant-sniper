@@ -36,6 +36,7 @@ KST = timezone(timedelta(hours=9), "KST")
 COMMIT_TIMEOUT_SECONDS = 10
 CRITICAL_EVENT_TYPES = frozenset({"BUY", "SELL", "RISK", "ERROR"})
 MANUAL_REASON = "수동 정리"
+HOLD_BACK_TEXT = "보류: 미결 주문/보호 주문 기록 있음 — 봇을 먼저 실행해 정리되게 하세요"
 
 
 class ReconcileError(RuntimeError):
@@ -73,13 +74,13 @@ def read_commit(runner: Callable = subprocess.run) -> str:
 
 
 # ---- run ------------------------------------------------------------------------------
-def _banner(settings: Settings) -> None:
+def _banner(settings: Settings, risk_state: dict) -> None:
     print("=" * 60)
     print(f"Coin Sniper 시작  [{settings.mode.upper()}]")
     if settings.mode == "live":
         print("!" * 60)
         print("!! 실거래 모드입니다. 실제 자금으로 실제 주문이 나갑니다.")
-        if not (settings.state_dir / "risk_state.json").exists():   # 잠금 파일 때문에 폴더는 이미 있을 수 있다
+        if not risk_state:
             print("!! 첫 실행입니다: 실거래 상태 폴더가 아직 없습니다.")
         print("!! 멈추려면 Ctrl+C. 보유 포지션의 거래소 손절 주문은 남습니다.")
         print("!" * 60)
@@ -88,7 +89,18 @@ def _banner(settings: Settings) -> None:
     print(f"REST: {settings.rest_base}")
     print(f"시세: {settings.stream_base}")
     print(f"상태 폴더: {settings.state_dir}")
-    print(f"시작 자본(가상 계좌): {settings.starting_capital:,.2f} {QUOTE_ASSET}")
+    if risk_state:                                        # 저장된 값이 실제로 쓰인다(설정값은 재설정 때만 반영)
+        stored = float(risk_state.get("starting_capital") or 0.0)
+        segment = risk_state.get("segment_start")
+        try:
+            since = datetime.fromisoformat(segment).astimezone(timezone.utc).date().isoformat() if segment else "-"
+        except (TypeError, ValueError):
+            since = "-"
+        print(f"시작 자본(가상 계좌): {stored:,.2f} {QUOTE_ASSET} (구간 시작 {since})")
+        if abs(float(settings.starting_capital) - stored) > 1e-9:
+            print(f"설정값 {settings.starting_capital:,.2f} {QUOTE_ASSET}는 `reconcile --reset-capital` 실행 시 반영됩니다")
+    else:
+        print(f"시작 자본(가상 계좌): {settings.starting_capital:,.2f} {QUOTE_ASSET} (첫 실행: 이 값으로 저장)")
     print(f"대시보드 게시(AUTO_GIT_PUSH): {'켜짐' if settings.auto_git_push else '꺼짐'}")
     print(f"루프 주기: {POLL_INTERVAL_SECONDS}초")
     print("=" * 60)
@@ -145,13 +157,14 @@ def run(settings: Settings, *, exchange: Exchange | None = None, feed=None, slee
         max_loops: int | None = None, publish_fn: Callable = publish, commit_fn: Callable[[], str] = read_commit,
         schedule: PublishSchedule | None = None) -> int:
     """봇 루프. 잠금은 호출자(main)가 잡는다. 반환값은 종료 코드."""
-    _banner(settings)
     store = StateStore(settings.state_dir)
     try:
+        risk_state = store.load("risk_state", {})
         metrics = Metrics(store.load("metrics", None))
     except StateCorruptError as exc:
         print(f"오류: {exc}. 파일을 확인하고 다시 실행하세요.", file=sys.stderr)
         return 2
+    _banner(settings, risk_state)
     if exchange is None:
         # 어댑터는 이 메인 스레드에서만 불린다: 지표 기록이 안전하다.
         exchange = BinanceExchange(settings, on_call=lambda endpoint, result: metrics.record_api(
@@ -242,25 +255,36 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
         print(f"종목 규칙 조회 실패({got.error}): 허용 오차 0으로 판정합니다")
 
     print("수동 정리 계획 (장부 수량 / 거래소 사용 가능+잠김 수량):")
-    removed, kept = [], []
+    removed, kept, held_back = [], [], []
+    busy = {i.get("symbol") for i in intents.values()}
     for symbol in sorted(positions):
         pos = positions[symbol]
         rule = rules.get(symbol)
         free, locked = balances.get(_base_asset(symbol, rules), (0.0, 0.0))
         held = _dec(free) + _dec(locked)
         need = _dec(pos["qty"]) - (_dec(rule.step_size) if rule else Decimal(0))
-        missing = held < need
-        (removed if missing else kept).append(symbol)
-        action = f"정리(장부에서 삭제, 원가 {float(pos['cost']):,.2f} {QUOTE_ASSET} 손실 처리)" if missing else "유지"
+        if held >= need:
+            kept.append(symbol)
+            action = "유지"
+        elif symbol in busy or pos.get("protective") is not None:
+            # 봇 자신의 주문(미결 매도, 체결된 거래소 손절)일 수 있다: 그 체결은 봇이 다음 실행에서 장부에 반영한다
+            held_back.append(symbol)
+            action = HOLD_BACK_TEXT
+        else:
+            removed.append(symbol)
+            action = f"정리(장부에서 삭제, 원가 {float(pos['cost']):,.2f} {QUOTE_ASSET} 손실 처리)"
         print(f"  {symbol}: 장부 {pos['qty']} / 거래소 {float(held)} -> {action}")
     if not positions:
         print("  (장부에 포지션 없음)")
 
-    if reset_capital and kept:
+    if reset_capital and (kept or held_back):
         raise ReconcileError("포지션이 남아 있어 시작 자본을 재설정할 수 없습니다(원가가 이중으로 계산됩니다): "
-                             + ", ".join(kept))
+                             + ", ".join(sorted(kept + held_back)))
     if not removed and not reset_capital:
-        print("정리할 포지션이 없습니다. 장부는 그대로입니다.")
+        if held_back:
+            print("보류된 종목만 있어 장부는 그대로입니다. 봇을 실행해 미결 주문·보호 주문이 정리되게 한 뒤 다시 확인하세요.")
+        else:
+            print("정리할 포지션이 없습니다. 장부는 그대로입니다.")
         return []
     capital = float(starting_capital if starting_capital is not None else risk_state.get("starting_capital", 0.0))
     if reset_capital:
@@ -358,6 +382,9 @@ def _ask(prompt: str) -> bool:
         return input(prompt).strip().lower() == "y"
     except EOFError:
         return False
+    except KeyboardInterrupt:                             # 확인 중 Ctrl+C: 아무것도 바꾸지 않았다
+        print()
+        raise ReconcileAborted("중단: 변경 없음") from None
 
 
 def main(argv: list[str] | None = None) -> int:

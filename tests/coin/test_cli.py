@@ -97,10 +97,9 @@ class ReconcileTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(self.snapshot_files(), before)       # 아무것도 바꾸지 않는다
         self.assertIn("정리할 포지션이 없습니다", out.getvalue())
 
-    def test_reconcile_keeps_matching_and_removes_missing_with_their_intents(self):
+    def test_reconcile_keeps_matching_and_removes_missing_leaving_other_intents(self):
         self.seed({"SOLUSDT": position("SOLUSDT", 1.0, 100.0), "XRPUSDT": position("XRPUSDT", 50.0, 2.0)},
-                  intents={"cs-d-ex-aaa": {"client_id": "cs-d-ex-aaa", "symbol": "SOLUSDT", "side": "SELL"},
-                           "cs-d-en-bbb": {"client_id": "cs-d-en-bbb", "symbol": "ETHUSDT", "side": "BUY"}})
+                  intents={"cs-d-en-bbb": {"client_id": "cs-d-en-bbb", "symbol": "ETHUSDT", "side": "BUY"}})
         ex, _ = world({"USDT": 10000.0, "XRP": 50.0})
         with redirect_stdout(io.StringIO()):
             removed = coin_bot.reconcile(self.store, ex, NOW, False)
@@ -175,6 +174,58 @@ class ReconcileTests(TempStateMixin, unittest.TestCase):
             removed = coin_bot.reconcile(self.store, ex, NOW, False)
         self.assertEqual(removed, ["SOLUSDT"])
         self.assertIn("허용 오차 0", out.getvalue())
+
+    def test_missing_position_with_pending_intent_is_held_back(self):
+        intent = {"client_id": "cs-d-ex-aaa", "symbol": "SOLUSDT", "side": "SELL", "qty": 1.0, "kind": "exit"}
+        self.seed({"SOLUSDT": position("SOLUSDT", 1.0, 100.0)}, realized=5.0, intents={"cs-d-ex-aaa": intent})
+        ex, _ = world({"USDT": 10000.0})
+        before = self.snapshot_files()
+        with redirect_stdout(io.StringIO()) as out:
+            removed = coin_bot.reconcile(self.store, ex, NOW, False)
+        self.assertEqual(removed, [])
+        self.assertIn("보류", out.getvalue())
+        self.assertIn("봇을 먼저 실행", out.getvalue())
+        self.assertEqual(self.snapshot_files(), before)          # 포지션·의도·위험 상태 그대로
+
+    def test_missing_position_with_protective_record_is_held_back(self):
+        prot = {"client_id": "cs-d-pr-ccc", "state": "open", "stop_price": 95.0}
+        self.seed({"SOLUSDT": dict(position("SOLUSDT", 1.0, 100.0), protective=prot)})
+        ex, _ = world({"USDT": 10000.0})
+        before = self.snapshot_files()
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(coin_bot.reconcile(self.store, ex, NOW, False), [])
+        self.assertIn("보류", out.getvalue())
+        self.assertEqual(self.snapshot_files(), before)
+
+    def test_mixed_case_removes_only_clean_missing_position(self):
+        prot = {"client_id": "cs-d-pr-ccc", "state": "canceled", "stop_price": 95.0}
+        positions = {"SOLUSDT": dict(position("SOLUSDT", 1.0, 100.0), protective=prot),
+                     "XRPUSDT": position("XRPUSDT", 50.0, 2.0),
+                     "ADAUSDT": position("ADAUSDT", 100.0, 0.5)}
+        intents = {"cs-d-ex-ddd": {"client_id": "cs-d-ex-ddd", "symbol": "ADAUSDT", "side": "SELL"}}
+        self.seed(positions, realized=10.0, intents=intents)
+        cash_before, _ = account_value(self.store.load("risk_state", None), positions, {s: 0.0 for s in positions})
+        ex, _ = world({"USDT": 10000.0})                         # 셋 다 거래소에 없음
+        with redirect_stdout(io.StringIO()):
+            removed = coin_bot.reconcile(self.store, ex, NOW, False)
+        self.assertEqual(removed, ["XRPUSDT"])
+        left = self.store.load("positions", None)
+        self.assertEqual(left, {"SOLUSDT": positions["SOLUSDT"], "ADAUSDT": positions["ADAUSDT"]})
+        self.assertEqual(self.store.load("intents", None), intents)
+        rs = self.store.load("risk_state", None)
+        self.assertAlmostEqual(rs["realized_pnl"], 10.0 - 100.0)  # XRP 원가만
+        cash_after, _ = account_value(rs, left, {s: 0.0 for s in left})
+        self.assertAlmostEqual(cash_after, cash_before)
+        self.assertEqual([t["symbol"] for t in self.store.load("trades", None)], ["XRPUSDT"])
+
+    def test_reset_refused_when_held_back_positions_remain(self):
+        prot = {"client_id": "cs-d-pr-ccc", "state": "open", "stop_price": 95.0}
+        self.seed({"SOLUSDT": dict(position("SOLUSDT", 1.0, 100.0), protective=prot)})
+        ex, _ = world({"USDT": 10000.0})
+        before = self.snapshot_files()
+        with redirect_stdout(io.StringIO()), self.assertRaises(coin_bot.ReconcileError):
+            coin_bot.reconcile(self.store, ex, NOW, True)
+        self.assertEqual(self.snapshot_files(), before)
 
     def test_reconcile_asks_and_aborts_on_no(self):
         self.seed({"SOLUSDT": position("SOLUSDT", 1.0, 100.0)})
@@ -261,6 +312,26 @@ class MainTests(TempStateMixin, unittest.TestCase):
         lock = InstanceLock(self.state_dir / "coin_bot.lock")   # 끝나면 잠금이 풀려 있다
         lock.acquire()
         lock.release()
+
+    def test_reconcile_command_ctrl_c_at_prompt_changes_nothing(self):
+        self.seed({"SOLUSDT": position("SOLUSDT", 1.0, 100.0)})
+        before = self.snapshot_files()
+
+        def interrupt(_p=""):
+            raise KeyboardInterrupt
+        with mock.patch("builtins.input", interrupt):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(coin_bot, "load_dotenv", lambda _p: None), \
+                    mock.patch.dict(os.environ, DEMO_ENV, clear=True), \
+                    mock.patch.object(coin_bot, "load_settings",
+                                      lambda e: dataclasses.replace(load_settings(e), state_dir=self.state_dir)), \
+                    mock.patch.object(coin_bot, "BinanceExchange", lambda *a, **k: self.ex), \
+                    redirect_stdout(out), redirect_stderr(err):
+                code = coin_bot.main(["reconcile"])
+        self.assertEqual(code, 1)
+        self.assertIn("중단: 변경 없음", out.getvalue() + err.getvalue())
+        after = {k: v for k, v in self.snapshot_files().items()}
+        self.assertEqual(after, before)
 
     def test_reconcile_command_reset_refused_with_positions_exit_1(self):
         self.seed({"SOLUSDT": position("SOLUSDT", 1.0, 100.0)})
@@ -403,10 +474,43 @@ class RunLoopTests(TempStateMixin, unittest.TestCase):
 
     def test_publish_exception_does_not_stop_loop(self):
         publish = mock.Mock(side_effect=RuntimeError("boom"))
-        code, out = self.go(auto_push=True, publish_fn=publish)
+        schedule = mock.Mock(wraps=PublishSchedule())
+        code, out = self.go(auto_push=True, publish_fn=publish, schedule=schedule)
         self.assertEqual(code, 0)
         self.assertEqual(len(self.status_lines(out)), 3)
-        self.assertIn("대시보드", out)
+        self.assertIn("대시보드 게시 오류(매매는 계속): RuntimeError", out)
+        self.assertNotIn("boom", out)
+        schedule.failed.assert_called_once()
+        schedule.published.assert_not_called()
+
+    def test_banner_first_run_shows_env_capital_to_be_stored(self):
+        settings = make_settings(self.state_dir, starting_capital=1500.0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            coin_bot.run(settings, exchange=self.ex, feed=self.feed, sleep=lambda _s: None, now_fn=self.now_fn,
+                         clock=lambda: 0.0, max_loops=1, publish_fn=mock.Mock(), commit_fn=lambda: "-")
+        text = out.getvalue()
+        self.assertIn("시작 자본(가상 계좌): 1,500.00 USDT (첫 실행: 이 값으로 저장)", text)
+        self.assertNotIn("reset-capital", text)
+
+    def test_banner_shows_stored_capital_and_notes_changed_setting(self):
+        self.store.save("risk_state", {"starting_capital": 1000.0, "realized_pnl": 0.0, "peak_equity": None,
+                                       "day": None, "day_open_equity": None,
+                                       "segment_start": "2026-11-01T00:00:00+00:00", "last_loop_at": None})
+        settings = make_settings(self.state_dir, starting_capital=1500.0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            coin_bot.run(settings, exchange=self.ex, feed=self.feed, sleep=lambda _s: None, now_fn=self.now_fn,
+                         clock=lambda: 0.0, max_loops=1, publish_fn=mock.Mock(), commit_fn=lambda: "-")
+        text = out.getvalue()
+        self.assertIn("시작 자본(가상 계좌): 1,000.00 USDT (구간 시작 2026-11-01)", text)
+        self.assertIn("설정값 1,500.00 USDT는 `reconcile --reset-capital` 실행 시 반영됩니다", text)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            coin_bot.run(make_settings(self.state_dir, starting_capital=1000.0), exchange=self.ex, feed=self.feed,
+                         sleep=lambda _s: None, now_fn=self.now_fn, clock=lambda: 0.0, max_loops=1,
+                         publish_fn=mock.Mock(), commit_fn=lambda: "-")
+        self.assertNotIn("reset-capital", out.getvalue())
 
     def test_critical_events_mark_schedule_critical(self):
         schedule = mock.Mock(wraps=PublishSchedule())

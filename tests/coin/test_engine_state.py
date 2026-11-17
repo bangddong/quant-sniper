@@ -272,6 +272,33 @@ class EngineStateTests(unittest.TestCase):
             self.assertFalse(r.entry_allowed)
         self.assertIn(FATAL, codes(eng.run_once(utc(2026, 11, 18, 1))))
 
+    def test_restart_clears_fatal_with_system_event(self):
+        eng, ex, feed, store = self.build()
+        ex.fail_next("balances", ApiResult(False, kind="fatal", error="HTTP 401 code -2015: Invalid API-key"))
+        self.assertIn(FATAL, codes(eng.run_once(T0)))
+        self.assertIn("fatal", [h["code"] for h in store.load("halts", {})["halts"]])
+        fresh = Engine(ex, feed, store.__class__(store.state_dir), Metrics(), eng.settings, sleep=lambda _s: None)
+        fresh.startup(T0 + 60 * SEC)
+        self.assertFalse(fresh.halts.is_set(FATAL))
+        self.assertTrue(any(e["type"] == "SYSTEM" and e["reason"] == "재시작으로 치명적 중단 해제"
+                            for e in fresh.events))
+        r = fresh.run_once(T0 + 90 * SEC)
+        self.assertNotIn(FATAL, codes(r))
+        self.assertTrue(any(e["reason"] == "재시작으로 치명적 중단 해제"
+                            for e in store.load("events", [])))     # 첫 루프 저장에 남는다
+
+    def test_restart_with_cause_remaining_sets_fatal_again(self):
+        eng, ex, feed, store = self.build()
+        ex.fail_next("balances", ApiResult(False, kind="fatal", error="HTTP 401 code -2015: Invalid API-key"))
+        eng.run_once(T0)
+        fresh = Engine(ex, feed, store.__class__(store.state_dir), Metrics(), eng.settings, sleep=lambda _s: None)
+        fresh.startup(T0 + 60 * SEC)
+        self.assertFalse(fresh.halts.is_set(FATAL))
+        ex.fail_next("balances", ApiResult(False, kind="fatal", error="HTTP 401 code -2015: Invalid API-key"))
+        r = fresh.run_once(T0 + 90 * SEC)
+        self.assertIn(FATAL, codes(r))
+        self.assertFalse(r.entry_allowed)
+
     def test_loop_exception_is_recorded_not_raised(self):
         eng, ex, feed, store = self.build()
         exits = self.record_exits(eng)
