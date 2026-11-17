@@ -26,7 +26,7 @@ class UniverseTests(unittest.TestCase):
 
     def test_excludes_stable_leveraged_untradable_short_history_low_volume(self):
         r = {
-            "USDCUSDT": rules("USDC"), "BTCUPUSDT": rules("BTCUP"),
+            "USDCUSDT": rules("USDC"), "BTCUPUSDT": rules("BTCUP"), "BTCXUSDT": rules("BTC", trading=False),
             "HALTUSDT": rules("HALT", trading=False),
             "SHORTUSDT": rules("SHORT"), "LOWUSDT": rules("LOW"),
             "BTCBUSD": rules("BTC", quote="BUSD"),
@@ -38,11 +38,23 @@ class UniverseTests(unittest.TestCase):
         # 캔들 60개, 전일 거래대금 1e7도 제외
         self.assertEqual(select_universe({"AUSDT": rules("A")}, {"AUSDT": candles(1e7, n=60)}), [])
 
-    def test_is_excluded_suffix_rule(self):
-        self.assertFalse(is_excluded(rules("UP")))
-        self.assertTrue(is_excluded(rules("BTCUP")))
-        self.assertTrue(is_excluded(rules("ETHDOWN")))
-        self.assertFalse(is_excluded(rules("SOL")))
+    def test_leveraged_token_excluded_only_when_underlying_is_listed(self):
+        known = frozenset({"BTC", "JUP", "SYRUP", "UP"})
+        for base in ("BTCUP", "BTCDOWN", "BTCBULL", "BTCBEAR"):
+            self.assertTrue(is_excluded(rules(base), known), base)
+        for base in ("JUP", "SYRUP", "UP", "SOL"):
+            self.assertFalse(is_excluded(rules(base), known), base)
+        self.assertFalse(is_excluded(rules("BTCUP")))
+        self.assertFalse(is_excluded(rules("BTCUP"), frozenset()))
+        self.assertTrue(is_excluded(rules("USDC")))
+
+    def test_select_universe_keeps_jup_and_drops_btcup(self):
+        r = {"BTCUSDT": rules("BTC"), "BTCUPUSDT": rules("BTCUP"), "JUPUSDT": rules("JUP")}
+        c = {s: candles(5e8) for s in r}
+        out = select_universe(r, c)
+        self.assertIn("JUPUSDT", out)
+        self.assertIn("BTCUSDT", out)
+        self.assertNotIn("BTCUPUSDT", out)
 
     def test_returns_at_most_top_n(self):
         n = config.UNIVERSE_TOP_N + 5
