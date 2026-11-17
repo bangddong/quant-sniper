@@ -10,6 +10,8 @@
 
 [운영 대시보드 보기](https://github.com/rundevelrun/quant-sniper/tree/dashboard)
 
+> 코인(바이낸스 현물) 버전: [docs/coin-sniper.md](docs/coin-sniper.md)
+
 ## 설계 원칙
 
 - **규칙 우선**: 감정, 뉴스 추격, 수동 물타기를 주문 판단에 개입시키지 않습니다.
