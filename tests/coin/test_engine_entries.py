@@ -340,11 +340,17 @@ class EngineEntryTests(unittest.TestCase):
         eng.run_once(at(5))                                 # 실패 뒤 연속 3회
         self.assertEqual(len(calls(ex, "market_buy")), 1)
 
+    @staticmethod
+    def mark_suspect(eng, symbol: str) -> None:
+        """매수 의도가 유예 뒤 폐기된 종목으로 표시한다(BUY_DROPPED가 남기는 것과 같은 기록)."""
+        eng.risk_state.setdefault("suspect_symbols", []).append({"symbol": symbol, "since": T0.isoformat()})
+
     def test_symbol_with_unmanaged_exchange_balance_skipped(self):
         eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": 1.0})
         set_signal(ex, feed, SYM)
         set_signal(ex, feed, SYM2, open_ratio=0.93)
         eng.startup(T0)
+        self.mark_suspect(eng, SYM)
         reports = self.loops(eng, 0, 3)
         self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM2])
         self.assertEqual([e["reason"] for e in events(reports[2], "SKIP", SYM)], ["거래소에 미관리 잔고 있음"])
@@ -361,10 +367,12 @@ class EngineEntryTests(unittest.TestCase):
         self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM])
         self.assertIn(SYM, store.load("positions", {}))
 
-    def unmanaged_case(self, sol_balance: float):
+    def unmanaged_case(self, sol_balance: float, suspect: bool = True):
         eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": sol_balance})
         set_signal(ex, feed, SYM)
         eng.startup(T0)
+        if suspect:
+            self.mark_suspect(eng, SYM)
         reports = self.loops(eng, 0, 3)
         return ex, reports
 
@@ -377,6 +385,32 @@ class EngineEntryTests(unittest.TestCase):
         ex, reports = self.unmanaged_case(0.0499)            # 내림 0.049 × 100 = 4.9 < 5
         self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM])
         self.assertEqual(events(reports[2], "SKIP", SYM), [])
+
+    def test_prefunded_balance_of_unsuspected_symbol_does_not_block_buy(self):
+        ex, reports = self.unmanaged_case(1.0, suspect=False)   # 데모 계정에 미리 들어 있던 코인
+        self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], [SYM])
+        self.assertEqual(events(reports[2], "SKIP", SYM), [])
+
+    def test_prefunded_btc_does_not_block_btc_signal(self):
+        eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "BTC": 1.0})
+        set_signal(ex, feed, "BTCUSDT")
+        eng.startup(T0)
+        self.loops(eng, 0, 3)
+        self.assertEqual([b["symbol"] for b in calls(ex, "market_buy")], ["BTCUSDT"])
+
+    def test_buy_dropped_marks_symbol_suspect_and_later_signal_is_skipped(self):
+        eng, ex, feed, store = make_engine(test=self, balances={"USDT": 10000.0, "SOL": 1.0})
+        set_signal(ex, feed, SYM)
+        store.save("intents", add_intent({}, "cs-d-en-000000000000", SYM, "BUY", 1.0, "entry", "vbo", T0))
+        eng.startup(T0)
+        eng.run_once(T0)                                    # 결과 모름: 유예 중
+        drop_at = T0 + config.INTENT_NOT_FOUND_GRACE_SECONDS * SEC
+        eng.run_once(drop_at)                               # 유예 지나 폐기 → 의심 종목
+        suspects = store.load("risk_state", {})["suspect_symbols"]
+        self.assertEqual(suspects, [{"symbol": SYM, "since": drop_at.isoformat()}])
+        reports = [eng.run_once(drop_at + 30 * i * SEC) for i in range(1, 4)]
+        self.assertEqual(calls(ex, "market_buy"), [])       # 늦게 체결됐을 수 있는 SOL을 두 번 사지 않는다
+        self.assertIn("거래소에 미관리 잔고 있음", [e["reason"] for r in reports for e in events(r, "SKIP", SYM)])
 
     def test_no_entry_during_blackout(self):
         eng, ex, feed, store = self.build()

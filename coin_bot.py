@@ -277,10 +277,14 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
     if not positions:
         print("  (장부에 포지션 없음)")
 
+    suspects = sorted({str(s.get("symbol")) for s in risk_state.get("suspect_symbols") or []})
+    if suspects:
+        print(f"매수 주문을 확인하지 못하고 폐기한 종목(미관리 잔고가 있으면 매수를 건너뜀): {', '.join(suspects)}")
+        print("  거래소에서 이 종목의 잔고·주문 내역을 확인했으면 진행해 목록을 비웁니다.")
     if reset_capital and (kept or held_back):
         raise ReconcileError("포지션이 남아 있어 시작 자본을 재설정할 수 없습니다(원가가 이중으로 계산됩니다): "
                              + ", ".join(sorted(kept + held_back)))
-    if not removed and not reset_capital:
+    if not removed and not reset_capital and not suspects:
         if held_back:
             print("보류된 종목만 있어 장부는 그대로입니다. 봇을 실행해 미결 주문·보호 주문이 정리되게 한 뒤 다시 확인하세요.")
         else:
@@ -324,9 +328,13 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
         risk_state.update(starting_capital=capital, realized_pnl=0.0, peak_equity=capital,
                           day_open_equity=None, pending_equity_row=None,
                           segment_kind="capital", segment_base_equity=capital)
+    if suspects:
+        risk_state["suspect_symbols"] = []
     reasons = [f"{MANUAL_REASON}: {', '.join(removed)}"] if removed else [MANUAL_REASON]
     if reset_capital:
         reasons.append("시작 자본 재설정")
+    if suspects:
+        reasons.append(f"미관리 잔고 의심 해제: {', '.join(suspects)}")
     events = record_event(events, {"type": "SYSTEM", "symbol": "", "reason": "; ".join(reasons),
                                    "timestamp": now.isoformat(timespec="seconds")}, now)
 

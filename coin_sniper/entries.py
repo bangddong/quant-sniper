@@ -94,9 +94,12 @@ class EntryManager:
         return quote is not None and quote.day == today
 
     def _unmanaged_tradable(self, symbol: str, rule, price: float) -> bool:
-        """장부에 없는 기초 자산 잔고가 거래 가능한 양(1스텝 이상, 최소 주문 금액 이상)인가.
-        팔 수 없는 잔량(청산 뒤 남은 먼지)은 막지 않는다. 잔고는 이번 루프 조회값으로 본다."""
+        """의심 종목(매수 의도를 유예 뒤 폐기한 종목, risk_state.suspect_symbols)이고, 장부에 없는 기초 자산 잔고가
+        거래 가능한 양(1스텝 이상, 최소 주문 금액 이상)인가. 그 밖의 종목의 기존 잔고(데모 기본 지급 코인 등)는
+        막지 않는다(스펙 6.4: 봇이 사지 않은 자산은 무시). 팔 수 없는 잔량도 막지 않는다. 잔고는 이번 루프 조회값."""
         e = self.e
+        if not any(item.get("symbol") == symbol for item in e.risk_state.get("suspect_symbols") or []):
+            return False
         base = e.base_asset(symbol)
         if base not in e.unmanaged_assets:
             return False
@@ -125,7 +128,7 @@ class EntryManager:
         quote = e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
         if quote is None:
             return self._skip(symbol, SKIP_QUOTE)
-        if self._unmanaged_tradable(symbol, rule, quote.price):   # 늦게 체결된 매수일 수 있다: 두 번 사지 않는다
+        if self._unmanaged_tradable(symbol, rule, quote.price):   # 폐기한 매수가 늦게 체결됐을 수 있다: 두 번 사지 않는다
             return self._skip(symbol, SKIP_UNMANAGED)
         bot_cash, _ = account_value(e.risk_state, e.positions, {s: 0.0 for s in e.positions})
         if free_usdt < bot_cash:

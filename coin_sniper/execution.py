@@ -117,9 +117,10 @@ class Executor:
             age = (now - datetime.fromisoformat(intent["created_at"])).total_seconds()
             if age < INTENT_NOT_FOUND_GRACE_SECONDS:       # 조회 지연일 수 있다: 모름
                 return self._unknown(cid, now)
-            self._drop_intent(cid)                         # 유예가 지나도 없다: 주문된 적 없음
             if side == "BUY":                              # 늦게 체결되면 장부 모르는 코인이 생긴다
+                self._mark_suspect(symbol, now)            # 이 종목의 미관리 잔고는 그 체결일 수 있다
                 e._event("RISK", BUY_DROPPED_REASON, symbol)
+            self._drop_intent(cid)                         # 유예가 지나도 없다: 주문된 적 없음
             return Outcome("absent", cid, state)
         if state.executed_qty <= 0:
             self._drop_intent(cid)
@@ -135,6 +136,15 @@ class Executor:
             return self._unknown(cid, now, FEE_UNPRICED_REASON)
         e.metrics.record_order("filled" if full else "partial", now)
         return Outcome("filled" if full else "partial", cid, state)
+
+    def _mark_suspect(self, symbol: str, now: datetime) -> None:
+        """폐기한 매수 의도의 종목을 risk_state.suspect_symbols에 남긴다(저장). 이 종목만 미관리 잔고 검사로 매수를
+        건너뛴다(entries). 사람이 `coin_bot.py reconcile`로 확인하고 비운다."""
+        rs = self.e.risk_state
+        suspects = rs.setdefault("suspect_symbols", [])
+        if not any(item.get("symbol") == symbol for item in suspects):
+            suspects.append({"symbol": symbol, "since": now.isoformat()})
+            self.e.store.save("risk_state", rs)            # 의도를 지우기 전에 저장
 
     def _unknown(self, cid: str, now: datetime, why: str = "") -> Outcome:
         """결과를 모른다: 의도를 남기고 ORDER_UNCONFIRMED. 미확인 지표는 의도당 한 번만 센다."""

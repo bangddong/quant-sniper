@@ -239,6 +239,45 @@ class ReconcileTests(TempStateMixin, unittest.TestCase):
         self.assertEqual(self.snapshot_files(), before)
 
 
+class SuspectSymbolTests(TempStateMixin, unittest.TestCase):
+    """폐기한 매수의 의심 종목 목록: reconcile이 보여 주고 같은 확인으로 비운다 (F5)."""
+
+    def seed_suspects(self, positions=None):
+        self.seed(positions or {})
+        rs = self.store.load("risk_state", None)
+        rs["suspect_symbols"] = [{"symbol": "SOLUSDT", "since": "2026-11-17T09:00:00+00:00"}]
+        self.store.save("risk_state", rs)
+
+    def test_reconcile_prints_and_clears_suspects_after_confirmation(self):
+        self.seed_suspects()
+        ex, _ = world({"USDT": 10000.0, "SOL": 1.0})
+        prompts = []
+        with redirect_stdout(io.StringIO()) as out:
+            removed = coin_bot.reconcile(self.store, ex, NOW, False, confirm=lambda p: prompts.append(p) or True)
+        self.assertEqual(removed, [])
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("SOLUSDT", out.getvalue())
+        rs = self.store.load("risk_state", None)
+        self.assertEqual(rs["suspect_symbols"], [])
+        self.assertEqual(rs["segment_start"], "2026-11-01T00:00:00+00:00")   # 구간은 그대로
+        self.assertIn("SOLUSDT", self.store.load("events", None)[-1]["reason"])
+
+    def test_reconcile_keeps_suspects_when_declined(self):
+        self.seed_suspects()
+        ex, _ = world({"USDT": 10000.0})
+        before = self.snapshot_files()
+        with redirect_stdout(io.StringIO()), self.assertRaises(coin_bot.ReconcileAborted):
+            coin_bot.reconcile(self.store, ex, NOW, False, confirm=lambda p: False)
+        self.assertEqual(self.snapshot_files(), before)
+
+    def test_reconcile_clears_suspects_together_with_removal(self):
+        self.seed_suspects({"XRPUSDT": position("XRPUSDT", 50.0, 2.0)})
+        ex, _ = world({"USDT": 10000.0})
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(coin_bot.reconcile(self.store, ex, NOW, False), ["XRPUSDT"])
+        self.assertEqual(self.store.load("risk_state", None)["suspect_symbols"], [])
+
+
 class SegmentTests(unittest.TestCase):
     """수익률 구간: reconcile/--reset-capital 뒤 기간별·주간 수익률이 이전 구간 줄과 섞이지 않는다 (F3)."""
     T = utc(2026, 11, 17, 12)
