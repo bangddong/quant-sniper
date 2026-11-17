@@ -244,6 +244,25 @@ class EngineStateTests(unittest.TestCase):
         # 중단 시간: 직전 루프 이후 경과(2×주기 상한)를 사유별로 더한다
         self.assertEqual(eng.metrics.summary(T0, None)["halt_seconds"], {FEED_STALE: 60})
 
+    def test_feed_down_seconds_accumulate_while_feed_unhealthy(self):
+        eng, ex, feed, store = self.build()
+        feed.set_health(False, "disconnected")
+        for i in range(3):
+            eng.run_once(T0 + 30 * i * SEC)
+        self.assertEqual(eng.metrics.summary(T0, None)["feed_down_seconds"], 60)   # 첫 루프는 직전 구간이 없다
+
+    def test_feed_down_seconds_count_feed_stale_and_show_on_dashboard(self):
+        from coin_sniper.dashboard import render_dashboard
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        feed.set_quote("BTCUSDT", 90000.0, age=config.QUOTE_MAX_AGE_SECONDS + 1)   # 연결은 됐지만 시세가 멈춤
+        for i in range(1, 14):
+            eng.run_once(T0 + 30 * i * SEC)
+        now = T0 + 13 * 30 * SEC
+        self.assertEqual(eng.metrics.summary(now, None)["feed_down_seconds"], 360)   # 2번째 루프 판정부터 12구간
+        row = [line for line in render_dashboard(eng.snapshot(now)).splitlines() if "시세 끊김 시간" in line][0]
+        self.assertIn("0.1시간", row)
+
     def test_rate_limit_result_sets_halt_and_skips_calls_until_retry_after(self):
         eng, ex, feed, store = self.build()
         eng.run_once(T0)

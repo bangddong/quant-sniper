@@ -500,6 +500,9 @@ class Engine:
         seconds = min(max((now - prev).total_seconds(), 0.0), 2 * POLL_INTERVAL_SECONDS)
         for halt in self.halts.active():
             self.metrics.add_seconds(f"halt:{halt['code']}", seconds, now)
+        connected = self.feed.health()[0]
+        if not connected or self.halts.is_set(FEED_STALE):  # 직전 구간 동안 시세가 끊겼거나 멈춰 있었다
+            self.metrics.add_seconds("feed_down", seconds, now)
 
     def _save_state(self) -> None:
         s = self.store
