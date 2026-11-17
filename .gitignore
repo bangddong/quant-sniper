@@ -12,3 +12,4 @@ DASHBOARD.md
 *.tmp
 venv/
 .DS_Store
+state/
