@@ -304,6 +304,46 @@ class BinanceRestTest(unittest.TestCase):
                 for secret in (SECRET, KEY, sig):
                     self.assertNotIn(secret, text)
 
+    def test_order_post_unparseable_success_is_outcome_unknown_transient(self):
+        calls = []
+        ex, _ = make({"unexpected": 1}, calls=calls)
+        res = ex.market_buy("ETHUSDT", 0.5, "cid1")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.kind, "transient")
+        self.assertIn("get_order", res.error)
+        ex, _ = make({"unexpected": 1})
+        res = ex.place_stop("ETHUSDT", 0.5, 2900.0, 2871.0, "cid2")
+        self.assertEqual((res.ok, res.kind), (False, "transient"))
+        ex, _ = make({"unexpected": 1})
+        res = ex.cancel_order("ETHUSDT", "cid2")
+        self.assertEqual((res.ok, res.kind), (False, "transient"))
+        ex, _ = make(b"<html>")
+        res = ex.market_sell("ETHUSDT", 0.5, "cid3")
+        self.assertEqual((res.ok, res.kind), (False, "transient"))
+        self.assertIn("get_order", res.error)
+
+    def test_invalid_header_value_is_fatal_and_reported_once(self):
+        calls = []
+        ex, _ = make(ValueError(f"Invalid header value b'{KEY}\n'"), calls=calls)
+        res = ex.balances()
+        self.assertEqual((res.ok, res.kind), (False, "fatal"))
+        self.assertNotIn(KEY, res.error)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "account")
+        self.assertNotIn(KEY, repr(calls))
+
+    def test_unexpected_exceptions_become_transient_results(self):
+        for exc in (RecursionError("deep " + SECRET), RuntimeError(SECRET), UnicodeEncodeError("latin-1", "x", 0, 1, SECRET)):
+            calls = []
+            ex, _ = make(exc, calls=calls)
+            res = ex.server_time()
+            self.assertFalse(res.ok)
+            self.assertNotIn(SECRET, res.error)
+            self.assertIn(type(exc).__name__, res.error)
+            self.assertEqual(len(calls), 1)
+        ex, _ = make(RuntimeError("x"))
+        self.assertEqual(ex.server_time().kind, "transient")
+
     def test_urls_always_use_rest_base(self):
         ex, op = make({"serverTime": 5})
         ex.server_time()

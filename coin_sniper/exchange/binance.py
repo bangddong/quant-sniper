@@ -68,8 +68,20 @@ class BinanceExchange:
     def _send(self, name: str, method: str, path: str, params: dict,
               signed: bool) -> tuple[ApiResult, int | None]:
         """HTTP 한 번. on_call을 정확히 한 번 부른다. (결과, 거래소 오류 코드)를 돌려준다."""
-        result, code = self._send_once(method, path, params, signed)
+        try:
+            result, code = self._send_once(method, path, params, signed)
+        except Exception as exc:     # 공개 메서드는 절대 예외를 던지지 않는다. 메시지는 키 노출 방지를 위해 버린다.
+            result, code = self._unexpected(exc, signed), None
         return self._report(name, result), code
+
+    @staticmethod
+    def _unexpected(exc: Exception, signed: bool) -> ApiResult:
+        name = type(exc).__name__
+        header_problem = signed and (isinstance(exc, UnicodeEncodeError)
+                                     or (isinstance(exc, ValueError) and "header" in str(exc).lower()))
+        if header_problem:      # API 키 값 자체가 헤더로 보낼 수 없는 형식: 로컬 설정 문제
+            return _fail("fatal", f"invalid API key format for request header ({name})")
+        return _fail("transient", f"unexpected error: {name}")
 
     def _send_once(self, method: str, path: str, params: dict,
                    signed: bool) -> tuple[ApiResult, int | None]:
@@ -101,7 +113,8 @@ class BinanceExchange:
         try:
             return ApiResult(ok=True, value=json.loads(raw.decode("utf-8"))), None
         except (ValueError, UnicodeDecodeError):
-            return _fail("transient", "invalid JSON in response"), None
+            note = "; outcome unknown, reconcile via get_order" if method in ("POST", "DELETE") else ""
+            return _fail("transient", "invalid JSON in response" + note), None
 
     def _classify_http(self, status: int, body: bytes, headers) -> tuple[ApiResult, int | None]:
         code, msg = None, ""
@@ -178,12 +191,13 @@ class BinanceExchange:
         params = {"symbol": symbol, "side": "SELL", "type": "STOP_LOSS_LIMIT", "timeInForce": "GTC",
                   "quantity": _fmt(qty), "stopPrice": _fmt(stop_price), "price": _fmt(limit_price),
                   "newClientOrderId": client_id, "newOrderRespType": "FULL"}
-        return self._parse(self._call("order.post", "POST", "/api/v3/order", params), self._order_from)
+        return self._parse(self._call("order.post", "POST", "/api/v3/order", params), self._order_from,
+                           mutating=True)
 
     def cancel_order(self, symbol: str, client_id: str) -> ApiResult:
         res = self._call("order.delete", "DELETE", "/api/v3/order",
                          {"symbol": symbol, "origClientOrderId": client_id})
-        return self._parse(res, self._order_from)
+        return self._parse(res, self._order_from, mutating=True)
 
     def get_order(self, symbol: str, client_id: str) -> ApiResult:
         res, code = self._call_with_code("order.get", "GET", "/api/v3/order",
@@ -212,16 +226,20 @@ class BinanceExchange:
     def _market(self, symbol: str, side: str, qty: float, client_id: str) -> ApiResult:
         params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": _fmt(qty),
                   "newClientOrderId": client_id, "newOrderRespType": "FULL"}
-        return self._parse(self._call("order.post", "POST", "/api/v3/order", params), self._order_from)
+        return self._parse(self._call("order.post", "POST", "/api/v3/order", params), self._order_from,
+                           mutating=True)
 
     @staticmethod
-    def _parse(res: ApiResult, fn: Callable) -> ApiResult:
+    def _parse(res: ApiResult, fn: Callable, mutating: bool = False) -> ApiResult:
         """성공 응답을 변환한다. 모양이 예상과 다르면 0/빈 값으로 덮지 않고 실패로 돌려준다."""
         if not res.ok:
             return res
         try:
             return ApiResult(ok=True, value=fn(res.value))
         except (KeyError, TypeError, ValueError, ArithmeticError, IndexError, AttributeError) as exc:
+            if mutating:    # 주문이 거래소에 있을 수 있다: 거절로 오인하지 않도록 결과 불명으로 알린다
+                return _fail("transient", f"order response unparseable ({type(exc).__name__}); "
+                                          "outcome unknown, reconcile via get_order")
             return _fail("permanent", f"unexpected response shape: {type(exc).__name__}")
 
     @staticmethod
