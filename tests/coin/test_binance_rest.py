@@ -180,9 +180,9 @@ class BinanceRestTest(unittest.TestCase):
     def test_get_order_fills_fees_from_my_trades(self):
         order = dict(ORDER_FILLS)
         order.pop("fills")
-        trades = [{"commission": "0.0001", "commissionAsset": "ETH"},
-                  {"commission": "0.5", "commissionAsset": "BNB"},
-                  {"commission": "0.0002", "commissionAsset": "ETH"}]
+        trades = [{"qty": "0.2", "commission": "0.0001", "commissionAsset": "ETH"},
+                  {"qty": "0.1", "commission": "0.5", "commissionAsset": "BNB"},
+                  {"qty": "0.2", "commission": "0.0002", "commissionAsset": "ETH"}]
         ex, op = make(order, trades)
         res = ex.get_order("ETHUSDT", "cid1")
         self.assertTrue(res.ok)
@@ -191,6 +191,16 @@ class BinanceRestTest(unittest.TestCase):
         self.assertEqual(op.query(1)["orderId"], "99")
         self.assertAlmostEqual(res.value.fees["ETH"], 0.0003)
         self.assertAlmostEqual(res.value.fees["BNB"], 0.5)
+
+    def test_get_order_with_execution_but_no_trade_rows_is_transient(self):
+        order = dict(ORDER_FILLS)
+        order.pop("fills")
+        for rows in ([], [{"qty": "0.3", "commission": "0.0001", "commissionAsset": "ETH"}]):   # 없음, 일부만
+            ex, _ = make(order, rows)
+            res = ex.get_order("ETHUSDT", "cid1")
+            self.assertFalse(res.ok)                         # 수수료 {}로 체결을 확정하지 않는다
+            self.assertEqual(res.kind, "transient")
+            self.assertEqual(res.error, "체결 내역 미반영")
 
     def test_get_order_without_execution_skips_my_trades(self):
         order = dict(ORDER_FILLS, status="NEW", executedQty="0", cummulativeQuoteQty="0")

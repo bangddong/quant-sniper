@@ -212,10 +212,15 @@ class BinanceExchange:
         if state.executed_qty > 0:
             trades = self._call("myTrades", "GET", "/api/v3/myTrades",
                                 {"symbol": symbol, "orderId": order_id})
-            fees = self._parse(trades, self._fees_from_trades)
+            fees = self._parse(trades, lambda rows: (self._fees_from_trades(rows),
+                                                     sum(Decimal(str(r["qty"])) for r in rows)))
             if not fees.ok:
                 return fees
-            state.fees = fees.value
+            fee_map, traded = fees.value
+            if traded < Decimal(repr(state.executed_qty)) - Decimal("1e-12"):
+                # 주문은 체결됐는데 체결 내역이 아직 없거나 모자란다: 수수료를 모르는 채로 확정하지 않는다
+                return _fail("transient", "체결 내역 미반영")
+            state.fees = fee_map
         return ApiResult(ok=True, value=state)
 
     def open_orders(self, symbol: str | None = None) -> ApiResult:
