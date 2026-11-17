@@ -316,49 +316,67 @@ class Executor:
         """어떤 중단 상태에서도 돈다. balances·equity·캔들은 믿지 않는다(positions, rules, feed만)."""
         e = self.e
         busy = {i["symbol"] for i in e.intents.values()}  # 결과를 모르는 주문이 있으면 그 종목은 손대지 않는다
-        cancel_failed = False
         for symbol in sorted(e.positions):
             if symbol not in e.positions or symbol in busy:
                 continue
             try:
-                cancel_failed = self._manage_position(symbol, now) or cancel_failed
+                self._manage_position(symbol, now)
             except self._passthrough:
                 raise
             except Exception as exc:                       # 한 종목의 오류가 다른 종목 청산을 막지 않는다
                 e._loop_failed = True
                 e._event("ERROR", f"exits {symbol}: {type(exc).__name__}: {exc}", symbol)
                 e._set_halt(LOOP_ERROR, f"루프 단계 오류(exits {symbol}): {type(exc).__name__}")
-        if not cancel_failed:
-            e._clear_halt(PROTECTIVE_CANCEL)
+        self._derive_cancel_halt()
         e.store.save("positions", e.positions)
 
-    def _manage_position(self, symbol: str, now: datetime) -> bool:
-        """한 포지션 처리. 보호 주문 취소에 실패했으면 True."""
+    def _derive_cancel_halt(self) -> None:
+        """PROTECTIVE_CANCEL은 장부 상태에서 정한다: 취소 실패 표시나 최종 상태를 모르는 "canceled" 기록이
+        하나라도 남아 있으면 건다. 건너뛴 포지션도 기록이 남아 있으므로 풀리지 않는다(확인돼야 풀린다)."""
+        e = self.e
+        items = []
+        for symbol in sorted(e.positions):
+            prot = e.positions[symbol].get("protective") or {}
+            if prot.get("state") == "canceled":
+                items.append(f"{symbol}: 취소된 보호 주문의 최종 상태 미확인")
+            elif prot.get("cancel_failed"):
+                items.append(f"{symbol}: 보호 주문 취소 실패 ({prot['cancel_failed']})")
+        if items:
+            e._set_halt(PROTECTIVE_CANCEL, "; ".join(items))
+        else:
+            e._clear_halt(PROTECTIVE_CANCEL)
+
+    def _manage_position(self, symbol: str, now: datetime) -> None:
         e = self.e
         rule = e.rules.get(symbol)
         if rule is None:                                   # 수량·가격 단위를 모른다: 주문도 반영도 하지 않는다
             e._event("RISK", "종목 규칙 없음: 주문 보류", symbol)
-            return False
+            return
         enabled = config.PROTECTIVE_STOPS_ENABLED
         if enabled and e.positions[symbol].get("protective"):
+            # 취소된 주문의 최종 상태를 모르면 남은 수량도 모른다: 팔지도, 새로 걸지도 않는다(중단은 유지)
             if not self._check_protective(symbol, now) or symbol not in e.positions:
-                return False
+                return
         pos = e.positions[symbol]
         quote = e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
         if quote is None:
             e._event("RISK", "실시간 시세 없음: 청산 판단 보류", symbol)
-            return False
+            return
         if self._is_dust(rule, float(pos["qty"]), quote.price):
-            return self._dust_exit(symbol, now)
+            self._dust_exit(symbol, now)
+            return
         pos["highest_price"] = max(float(pos["highest_price"]), quote.price)
         stop, reason = update_stop(pos, quote.price)
         if quote.price > stop:
             reason = TIME_STOP_REASON if time_stop_due(pos, now) else None
         if reason is not None:
-            return self._exit(symbol, rule, reason, quote.price, now)
-        if not enabled:
-            return False
-        return self._ensure_protective(symbol, rule, stop, now)
+            self._exit(symbol, rule, reason, quote.price, now)
+            return
+        prot = pos.get("protective")
+        if prot and prot.pop("cancel_failed", None):       # 확인된 주문이 걸려 있고 취소할 이유도 사라졌다
+            e.store.save("positions", e.positions)
+        if enabled:
+            self._ensure_protective(symbol, rule, stop, now)
 
     def _release_protective(self, symbol: str, now: datetime) -> str | None:
         """팔기 전에 보호 주문을 푼다. None이면 계속 진행, 아니면 _cancel_protective의 결과(진행 중단)."""
@@ -370,24 +388,19 @@ class Executor:
             return None
         return result
 
-    def _exit(self, symbol: str, rule: SymbolRules, reason: str, price: float, now: datetime) -> bool:
+    def _exit(self, symbol: str, rule: SymbolRules, reason: str, price: float, now: datetime) -> None:
         e = self.e
-        blocked = self._release_protective(symbol, now)
-        if blocked is not None:
-            return blocked == "failed"
+        if self._release_protective(symbol, now) is not None:
+            return
         qty = floor_to_step(e.positions[symbol]["qty"], rule.step_size)
         if self._is_dust(rule, float(e.positions[symbol]["qty"]), price):
             self._close_dust(symbol, now)                  # 보호 주문의 부분 체결 뒤 남은 게 잔량일 수 있다
         elif qty > 0:
             self.execute_market(symbol, "SELL", qty, "exit", reason, now, ref_price=price)
-        return False
 
-    def _dust_exit(self, symbol: str, now: datetime) -> bool:
-        blocked = self._release_protective(symbol, now)
-        if blocked is not None:
-            return blocked == "failed"
-        self._close_dust(symbol, now)
-        return False
+    def _dust_exit(self, symbol: str, now: datetime) -> None:
+        if self._release_protective(symbol, now) is None:
+            self._close_dust(symbol, now)
 
     def _check_protective(self, symbol: str, now: datetime) -> bool:
         """거래소의 보호 주문 상태를 장부에 맞춘다. 조회 실패면 False(이번 루프는 이 종목을 건너뛴다).
@@ -417,8 +430,8 @@ class Executor:
         return True
 
     def _cancel_protective(self, symbol: str, now: datetime) -> str:
-        """"ok" | "failed"(PROTECTIVE_CANCEL 설정) | "filled"(이미 체결: 거래소 손절로 반영)
-        | "pending"(취소는 됐지만 체결 조회 실패: "canceled"로 남기고 이번 루프는 팔지 않는다).
+        """"ok" | "failed"(취소 실패 표시 → PROTECTIVE_CANCEL) | "filled"(이미 체결: 거래소 손절로 반영)
+        | "pending"(취소는 됐지만 최종 상태 미확인: "canceled"로 남기고 팔지 않는다 → PROTECTIVE_CANCEL).
         취소 응답의 체결 정보는 쓰지 않는다(수수료가 없다). 체결은 get_order로 확인한다."""
         e = self.e
         prot = e.positions[symbol]["protective"]
@@ -430,22 +443,27 @@ class Executor:
                 self._apply_external(symbol, got.value, EXCHANGE_STOP_REASON, now)
                 self._clear_protective(symbol, cid)
                 return "filled"
-            e._set_halt(PROTECTIVE_CANCEL, f"보호 주문 취소 실패: {symbol} ({res.error})")
+            prot["cancel_failed"] = res.error or "취소 실패"
+            e.store.save("positions", e.positions)
+            e._set_halt(PROTECTIVE_CANCEL, f"{symbol}: 보호 주문 취소 실패 ({res.error})")
             return "failed"
+        prot.pop("cancel_failed", None)
         prot["state"] = "canceled"
         e.store.save("positions", e.positions)             # 죽어도 다음 루프가 체결 확인부터 한다
         return "ok" if self._settle_canceled(symbol, now) else "pending"
 
     def _settle_canceled(self, symbol: str, now: datetime) -> bool:
-        """취소된 보호 주문의 체결분을 get_order(수수료 포함)로 확인해 반영하고 기록을 지운다. 조회 실패면 False."""
+        """취소된 보호 주문의 최종 상태를 get_order(수수료 포함)로 확인해 체결분을 반영하고 기록을 지운다.
+        조회 성공 + 존재 + 최종 상태일 때만 정산한다. 그 밖(실패·없음·최종 아님)은 기록을 그대로 두고 False.
+        유예 후 삭제는 없다: 거래소가 취소를 확인했으니 주문은 있다."""
         e = self.e
         cid = e.positions[symbol]["protective"]["client_id"]
         res = e._call("get_order", symbol, cid)
-        if not res.ok:
-            e._event("RISK", f"취소된 보호 주문 조회 실패: {res.error}", symbol)
+        st = res.value if res.ok else None
+        if st is None or not st.exists or not st.is_final:
+            e._event("RISK", "취소된 보호 주문 최종 상태 미확인: 매도 보류", symbol)
             return False
-        st = res.value
-        if st.exists and st.executed_qty > 0:
+        if st.executed_qty > 0:
             reason = EXCHANGE_STOP_REASON if st.status == "FILLED" else EXCHANGE_STOP_PARTIAL_REASON
             self._apply_external(symbol, st, reason, now)
         self._clear_protective(symbol, cid)
@@ -459,23 +477,19 @@ class Executor:
             pos["protective"] = None
             e.store.save("positions", e.positions)
 
-    def _ensure_protective(self, symbol: str, rule: SymbolRules, stop: float, now: datetime) -> bool:
+    def _ensure_protective(self, symbol: str, rule: SymbolRules, stop: float, now: datetime) -> None:
         e = self.e
         stop_price = floor_to_tick(stop, rule.tick_size)
         limit_price = floor_to_tick(float(_dec(stop_price) * (1 - _dec(STOP_LIMIT_OFFSET_PCT))), rule.tick_size)
         prot = e.positions[symbol].get("protective")
         if prot:
             if prot.get("state") != "open" or stop_price < prot["stop_price"] * (1 + STOP_REPLACE_MIN_MOVE_PCT):
-                return False
-            result = self._cancel_protective(symbol, now)
-            if result == "failed":
-                return True
-            if result != "ok" or symbol not in e.positions:
-                return False
+                return
+            if self._cancel_protective(symbol, now) != "ok" or symbol not in e.positions:
+                return
         qty = floor_to_step(e.positions[symbol]["qty"], rule.step_size)
         if qty > 0:
             self._place_protective(symbol, qty, stop_price, limit_price)
-        return False
 
     def _place_protective(self, symbol: str, qty: float, stop_price: float, limit_price: float) -> None:
         e = self.e

@@ -521,17 +521,76 @@ class EngineExitTests(unittest.TestCase):
         r = eng.run_once(T0 + 30 * SEC)
         self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
 
-    def test_lookup_failure_after_cancel_defers_sell_and_applies_partial_once(self):
-        eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
-        seen = ex.get_order(SYM, cid).value                  # 1단계 확인 때 돌려줄 상태(부분 체결 중)
-        ex.fail_next("get_order", ApiResult(True, value=seen))
-        ex.fail_next("get_order", TRANSIENT)                 # 취소 직후 조회 실패
-        eng.run_once(T0 + 30 * SEC)
+    def assert_unsettled(self, ex, store, r):
+        """취소된 보호 주문의 최종 상태를 모르는 동안: 중단, 진입 불가, 매도 없음, 기록 유지, 반영 없음."""
+        self.assertIn(PROTECTIVE_CANCEL, codes(r))
+        self.assertIn(SYM, [h for h in r.halts if h["code"] == PROTECTIVE_CANCEL][0]["detail"])
+        self.assertFalse(r.entry_allowed)
         self.assertEqual(calls(ex, "market_sell"), [])
         self.assertEqual(store.load("positions", {})[SYM]["protective"]["state"], "canceled")
         self.assertEqual(self.trades(store), [])
+        self.assertEqual(calls(ex, "place_stop")[1:], [])    # 새 보호 주문도 걸지 않는다
+
+    def test_lookup_failure_after_cancel_keeps_halt_until_settled(self):
+        eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
+        seen = ex.get_order(SYM, cid).value                  # 1단계 확인 때 돌려줄 상태(부분 체결 중)
+        ex.fail_next("get_order", ApiResult(True, value=seen))
+        ex.fail_next("get_order", TRANSIENT, times=3)        # 취소 직후부터 세 루프 내내 조회 실패
+        for i in (1, 2, 3):
+            r = eng.run_once(T0 + 30 * i * SEC)
+            self.assert_unsettled(ex, store, r)
+        r = eng.run_once(T0 + 120 * SEC)                     # 조회 회복 → 부분 체결 한 번, 나머지 매도
+        self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
+        self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
+
+    def test_canceled_record_not_settled_by_missing_lookup(self):
+        eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
+        seen = ex.get_order(SYM, cid).value
+        ex.fail_next("get_order", ApiResult(True, value=seen))
+        ex.hide_order_for(1)                                 # 취소 직후 조회: 거래소가 모른다고 답함
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assert_unsettled(ex, store, r)
+        r = eng.run_once(T0 + 30 * SEC + config.INTENT_NOT_FOUND_GRACE_SECONDS * SEC)
+        self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
+        self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
+
+    def test_canceled_record_not_settled_by_non_final_lookup(self):
+        eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
+        seen = ex.get_order(SYM, cid).value                  # PARTIALLY_FILLED (최종 아님)
+        ex.fail_next("get_order", ApiResult(True, value=seen), times=2)   # 취소 뒤에도 늦은 상태가 보인다
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assert_unsettled(ex, store, r)
         r = eng.run_once(T0 + 60 * SEC)
         self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
+        self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
+
+    def test_cancel_failure_halt_kept_when_position_skipped_for_missing_quote(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        self.price(ex, feed, 92.0)
+        ex.fail_next("cancel_order", TRANSIENT)
+        self.assertIn(PROTECTIVE_CANCEL, codes(eng.run_once(T0 + 30 * SEC)))
+        feed.set_quote(SYM, 92.0, age=config.QUOTE_MAX_AGE_SECONDS + 1)
+        r = eng.run_once(T0 + 60 * SEC)                      # 시세가 없어 건너뜀: 해결된 게 아니다
+        self.assertIn(PROTECTIVE_CANCEL, codes(r))
+        self.assertEqual(calls(ex, "market_sell"), [])
+        feed.set_quote(SYM, 92.0)
+        r = eng.run_once(T0 + 90 * SEC)
+        self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
+        self.assertEqual(len(self.trades(store)), 1)
+
+    def test_unsettled_canceled_record_does_not_block_other_exits(self):
+        eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
+        add_position(eng, ex, "XRPUSDT", 10.0, 3.0)          # SOL 뒤에 처리된다. 손절 2.85, 현재가 2.0
+        self.price(ex, feed, 2.0, "XRPUSDT")
+        seen = ex.get_order(SYM, cid).value
+        ex.fail_next("get_order", ApiResult(True, value=seen))
+        ex.fail_next("get_order", TRANSIENT)
+        r = eng.run_once(T0 + 30 * SEC)
+        self.assertIn(PROTECTIVE_CANCEL, codes(r))
+        self.assertEqual([t["symbol"] for t in self.trades(store)], ["XRPUSDT"])
+        self.assertEqual([p["symbol"] for p in calls(ex, "market_sell")], ["XRPUSDT"])
+        self.assertEqual(store.load("positions", {})[SYM]["protective"]["state"], "canceled")
 
     def test_crash_between_cancel_and_partial_journal_applies_fill_once(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
