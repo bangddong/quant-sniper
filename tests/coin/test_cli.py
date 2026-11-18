@@ -382,6 +382,31 @@ class SegmentTests(unittest.TestCase):
         rows = eng2.store.load("equity_history", [])
         self.assertEqual([(r["day"], r["segment"]) for r in rows], [("2026-11-17", old_segment)])
 
+    def test_same_day_reconcile_write_off_does_not_trip_daily_loss_or_drawdown(self):
+        # 같은 날 정리로 원가 100(평가액의 10%)이 사라져도 일일 손실(-4%)·낙폭(-8% 감속) 판정은 정리 뒤 평가액부터 잰다.
+        # 다른 포지션(ETH)이 남아 있어 --reset-capital을 쓸 수 없는 경우다
+        from coin_sniper.halts import DAILY_LOSS, DRAWDOWN
+        from helpers import add_position, restart_engine
+        eng, ex, feed, store = self.engine()
+        add_position(eng, ex, "ETHUSDT", 0.1, 3000.0)
+        eng.positions["SOLUSDT"] = position("SOLUSDT", 1.0, 100.0)          # 거래소에 없는 포지션
+        eng.store.save("positions", eng.positions)
+        eng.run_once(self.T)
+        self.reconcile(eng, ex, self.T + timedelta(seconds=60), False)
+        eng2 = restart_engine(eng, self.T + timedelta(seconds=90))
+        eng2.run_once(self.T + timedelta(seconds=90))
+        self.assertAlmostEqual(eng2.equity, 900.0)
+        self.assertFalse(eng2.halts.is_set(DAILY_LOSS))
+        self.assertFalse(eng2.halts.is_set(DRAWDOWN))
+        self.assertEqual(eng2.size_multiplier, 1.0)
+        self.assertAlmostEqual(eng2.risk_state["day_open_equity"], 900.0)
+        self.assertAlmostEqual(eng2.risk_state["peak_equity"], 900.0)
+        ex.set_price("ETHUSDT", 2600.0)                                     # 정리 뒤 실제 손실은 그대로 잡는다
+        feed.set_quote("ETHUSDT", 2600.0)
+        eng2.run_once(self.T + timedelta(seconds=120))
+        self.assertAlmostEqual(eng2.equity, 860.0, delta=1.0)               # 수수료만큼 차이
+        self.assertTrue(eng2.halts.is_set(DAILY_LOSS))                      # 860/900 − 1 ≈ −4.4%
+
     def test_old_state_without_equity_segment_stamp_is_handled_by_reconcile(self):
         # 이 수정 전에 저장된 상태(last_equity만 있고 그 구간 표시가 없음)도 정리 뒤 새 구간에 섞이지 않는다
         from helpers import restart_engine

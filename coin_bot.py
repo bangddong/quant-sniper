@@ -416,6 +416,9 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
             pending["segment"] = old_segment
         risk_state["segment_start"] = now.isoformat()
         risk_state.update(segment_kind="reconcile", segment_base_equity=None)   # 봇이 다음 첫 평가액으로 채운다
+        # 위험 기준도 새로 잡는다: 정리로 사라진 원가가 일일 손실·낙폭으로 판정되면 남은 포지션 때문에
+        # --reset-capital도 못 쓰는 상태로 신규 매수가 묶인다. 봇이 다음 첫 평가액으로 채운다
+        risk_state.update(day_open_equity=None, peak_equity=None)
     if reset_capital:
         risk_state.update(starting_capital=capital, realized_pnl=0.0, peak_equity=capital,
                           day_open_equity=None, pending_equity_row=None,
