@@ -261,8 +261,9 @@ class Engine:
             old = rs.get("pending_equity_row")
             if old:                                        # 아직 못 쓴 줄은 BTC 없이 남긴다
                 self._append_equity_row(old["day"], old["equity"], None, old.get("segment"))
-            rs["pending_equity_row"] = {"day": rs["day"], "equity": float(rs["last_equity"]),
-                                        "segment": rs.get("segment_start")}   # 그 평가액이 속한 구간
+            # 그 평가액을 잰 구간. 멈춘 사이 정리로 구간이 바뀌었으면 지금 구간이 아니라 이전 구간 줄이다(F3)
+            segment = rs.get("last_equity_segment") or rs.get("segment_start")
+            rs["pending_equity_row"] = {"day": rs["day"], "equity": float(rs["last_equity"]), "segment": segment}
         rs["day"] = today
         rs["day_open_equity"] = None                       # 오늘 첫 평가액으로 7단계에서 정한다
         self._clear_halt(DAILY_LOSS)
@@ -510,6 +511,7 @@ class Engine:
             return
         self.cash, self.equity = account_value(rs, self.positions, prices)
         rs["last_equity"] = self.equity
+        rs["last_equity_segment"] = rs.get("segment_start")   # 날짜가 바뀔 때 이 평가액을 어느 구간 줄로 남길지
         if rs.get("segment_base_equity") is None:          # 정리로 구간이 새로 시작됐다: 그 뒤 첫 평가액이 기준
             rs["segment_base_equity"] = self.equity
         if rs.get("day_open_equity") is None:

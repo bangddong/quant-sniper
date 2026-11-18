@@ -409,6 +409,11 @@ def reconcile(store: StateStore, exchange: Exchange, now: datetime, reset_capita
         for row in history:
             if old_segment and not row.get("segment"):
                 row["segment"] = old_segment
+        if risk_state.get("last_equity") is not None and not risk_state.get("last_equity_segment"):
+            risk_state["last_equity_segment"] = old_segment   # 표시 없는 예전 상태: 정리 전 평가액은 이전 구간 것이다
+        pending = risk_state.get("pending_equity_row")
+        if pending and not pending.get("segment"):
+            pending["segment"] = old_segment
         risk_state["segment_start"] = now.isoformat()
         risk_state.update(segment_kind="reconcile", segment_base_equity=None)   # 봇이 다음 첫 평가액으로 채운다
     if reset_capital:

@@ -342,6 +342,65 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual(snap["returns"]["start"]["kind"], "reconcile")
         self.assertIn("| 구간 시작 대비 (2026-11-17부터) | +3.33% | - |", coin_bot.render_dashboard(snap))
 
+    def test_reset_capital_across_utc_midnight_shows_no_fake_return(self):
+        # 봇을 멈춘 채 UTC 0시를 넘긴 뒤 재설정·재시작: 어제 평가액(850)은 이전 구간 줄로 남고 새 구간에 섞이지 않는다
+        from helpers import restart_engine
+        eng, ex, feed, store = self.engine()
+        old_segment = eng.risk_state["segment_start"]
+        eng.risk_state["realized_pnl"] = -150.0
+        eng.run_once(self.T)
+        self.assertEqual(eng.equity, 850.0)
+        next_day = utc(2026, 11, 18, 0, 30)
+        self.reconcile(eng, ex, next_day, True)
+        eng2 = restart_engine(eng, next_day + timedelta(seconds=30))
+        eng2.run_once(next_day + timedelta(seconds=30))
+        self.assertEqual(eng2.equity, 1000.0)
+        snap = eng2.snapshot(next_day + timedelta(seconds=30))
+        for key in ("1d", "7d", "30d", "all"):
+            self.assertIsNone(snap["returns"][key]["bot"], key)            # +17.65% 같은 가짜 수익률이 없다
+        self.assertEqual((snap["returns"]["start"]["kind"], snap["returns"]["start"]["bot"]), ("capital", 0.0))
+        rows = eng2.store.load("equity_history", [])
+        self.assertEqual([(r["day"], r["equity"], r["segment"]) for r in rows],
+                         [("2026-11-17", 850.0, old_segment)])               # 어제 줄은 이전 구간으로 남는다
+
+    def test_reconcile_across_utc_midnight_keeps_yesterday_in_previous_segment(self):
+        from helpers import restart_engine
+        eng, ex, feed, store = self.engine()
+        old_segment = eng.risk_state["segment_start"]
+        eng.positions["SOLUSDT"] = position("SOLUSDT", 1.0, 100.0)          # 거래소에 없는 포지션
+        eng.store.save("positions", eng.positions)
+        eng.run_once(self.T)
+        self.assertAlmostEqual(eng.equity, 1000.0)
+        next_day = utc(2026, 11, 18, 0, 30)
+        self.reconcile(eng, ex, next_day, False)
+        eng2 = restart_engine(eng, next_day + timedelta(seconds=30))
+        eng2.run_once(next_day + timedelta(seconds=30))
+        self.assertAlmostEqual(eng2.equity, 900.0)
+        snap = eng2.snapshot(next_day + timedelta(seconds=30))
+        self.assertIsNone(snap["returns"]["1d"]["bot"])                     # 1000 → 900 가짜 손실도 없다
+        self.assertAlmostEqual(snap["returns"]["start"]["bot"], 0.0)
+        rows = eng2.store.load("equity_history", [])
+        self.assertEqual([(r["day"], r["segment"]) for r in rows], [("2026-11-17", old_segment)])
+
+    def test_old_state_without_equity_segment_stamp_is_handled_by_reconcile(self):
+        # 이 수정 전에 저장된 상태(last_equity만 있고 그 구간 표시가 없음)도 정리 뒤 새 구간에 섞이지 않는다
+        from helpers import restart_engine
+        eng, ex, feed, store = self.engine()
+        old_segment = eng.risk_state["segment_start"]
+        eng.risk_state["realized_pnl"] = -150.0
+        eng.run_once(self.T)
+        rs = eng.store.load("risk_state", {})
+        rs.pop("last_equity_segment", None)
+        eng.store.save("risk_state", rs)
+        next_day = utc(2026, 11, 18, 0, 30)
+        self.reconcile(eng, ex, next_day, True)
+        eng2 = restart_engine(eng, next_day + timedelta(seconds=30))
+        eng2.run_once(next_day + timedelta(seconds=30))
+        snap = eng2.snapshot(next_day + timedelta(seconds=30))
+        self.assertIsNone(snap["returns"]["1d"]["bot"])
+        rows = eng2.store.load("equity_history", [])
+        self.assertEqual([(r["day"], r["segment"]) for r in rows], [("2026-11-17", old_segment)])
+
     def test_reconcile_stamps_old_rows_with_previous_segment(self):
         eng, ex, feed, store = self.engine()
         first = eng.risk_state["segment_start"]
