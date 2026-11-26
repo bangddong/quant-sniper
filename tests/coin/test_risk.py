@@ -63,8 +63,8 @@ class RiskTests(unittest.TestCase):
     def test_stop_ratchets_and_never_moves_down(self):
         pos = {"buy_price": 100.0, "stop_loss_pct": 0.07, "trailing_gap_pct": 0.05,
                "highest_price": 100.0, "stop_price": 93.0, "trailing_active": False}
-        self.assertEqual(update_stop(pos, 105.9)[0], 93.0)
-        self.assertEqual(update_stop(pos, 106.0)[0], 101.5)
+        self.assertEqual(update_stop(pos, 103.9)[0], 93.0)
+        self.assertEqual(update_stop(pos, 104.0)[0], 101.5)
         self.assertAlmostEqual(update_stop(pos, 112.0)[0], 106.4)
         self.assertTrue(pos["trailing_active"])
         self.assertAlmostEqual(update_stop(pos, 108.0)[0], 106.4)

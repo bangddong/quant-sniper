@@ -16,7 +16,7 @@ from typing import Callable
 
 from coin_sniper import config
 from coin_sniper.config import (
-    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
+    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, DRAWDOWN_AUTO_RESET_DAYS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
     MAX_POSITIONS, MIN_STOP_LOSS_PCT, POLL_INTERVAL_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
     RECON_ESCALATE_SECONDS, UNIVERSE_FETCH_PAUSE_SECONDS, UNIVERSE_MIN_COUNT,
     UNIVERSE_RETRY_SECONDS, Settings,
@@ -523,11 +523,33 @@ class Engine:
                 self._set_halt(DAILY_LOSS, f"일일 손실 {daily_return:.2%}")
         peak, self.drawdown, self.size_multiplier, halted = drawdown_controls(
             self.equity, rs.get("peak_equity"))
+        if not halted:
+            rs["drawdown_flat_since"] = None
+        elif self._drawdown_reset_due(rs):
+            # 포지션이 없으면 평가액이 움직이지 않아 회복으로는 영원히 풀리지 않는다 → 고점을 다시 잡는다
+            old_peak = peak
+            peak, self.drawdown, self.size_multiplier, halted = drawdown_controls(self.equity, None)
+            self._event("RISK", f"낙폭 중단 자동 해제: 포지션 없이 {DRAWDOWN_AUTO_RESET_DAYS}일 — "
+                                f"고점 {old_peak:.2f} → {peak:.2f} 재설정")
         rs["peak_equity"] = peak
         if halted:
             self._set_halt(DRAWDOWN, f"고점 대비 낙폭 {self.drawdown:.2%}")
         else:
             self._clear_halt(DRAWDOWN)
+
+    def _drawdown_reset_due(self, rs: dict) -> bool:
+        """낙폭 중단 상태에서 포지션·미확정 주문 없이 DRAWDOWN_AUTO_RESET_DAYS가 지났는가(시작 시각은 rs에 저장)."""
+        if self.positions or self.intents:
+            rs["drawdown_flat_since"] = None
+            return False
+        since = rs.get("drawdown_flat_since")
+        if since is None:
+            rs["drawdown_flat_since"] = self._now.isoformat()
+            return False
+        if self._now - datetime.fromisoformat(since) < timedelta(days=DRAWDOWN_AUTO_RESET_DAYS):
+            return False
+        rs["drawdown_flat_since"] = None
+        return True
 
     # ---- 중단, 이벤트, 저장 ------------------------------------------------------------
     def _set_halt(self, code: str, detail: str) -> None:

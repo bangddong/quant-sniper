@@ -224,6 +224,36 @@ class EngineStateTests(unittest.TestCase):
         self.assertNotIn(DRAWDOWN, codes(r2))
         self.assertEqual(store.load("risk_state", {})["peak_equity"], 1200)
 
+    def test_drawdown_halt_auto_resets_after_flat_period(self):
+        # 포지션이 없으면 평가액이 그대로라 회복으로는 영원히 안 풀린다 → N일 뒤 고점 재설정
+        rs = {"starting_capital": 1000.0, "realized_pnl": 0.0, "peak_equity": 1200.0,
+              "day": "2026-11-17", "day_open_equity": None, "segment_start": T0.isoformat()}
+        eng, ex, feed, store = self.build(risk_state=rs)
+        days = timedelta(days=config.DRAWDOWN_AUTO_RESET_DAYS)
+        r = eng.run_once(T0)
+        self.assertIn(DRAWDOWN, codes(r))
+        r2 = eng.run_once(T0 + days - SEC)
+        self.assertIn(DRAWDOWN, codes(r2))
+        self.assertEqual(store.load("risk_state", {})["peak_equity"], 1200)
+        r3 = eng.run_once(T0 + days)
+        self.assertNotIn(DRAWDOWN, codes(r3))
+        saved = store.load("risk_state", {})
+        self.assertEqual(saved["peak_equity"], 1000)
+        self.assertIsNone(saved["drawdown_flat_since"])
+        self.assertTrue(any(e["type"] == "RISK" and "자동 해제" in e["reason"] for e in r3.events))
+
+    def test_drawdown_auto_reset_timer_does_not_run_while_position_held(self):
+        rs = {"starting_capital": 1000.0, "realized_pnl": 0.0, "peak_equity": 1200.0,
+              "day": "2026-11-17", "day_open_equity": None, "segment_start": T0.isoformat()}
+        eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
+                                          risk_state=rs, balances={"USDT": 10000.0, "SOL": 1.0})
+        r = eng.run_once(T0)
+        self.assertIn(DRAWDOWN, codes(r))
+        self.assertIsNone(store.load("risk_state", {}).get("drawdown_flat_since"))
+        r2 = eng.run_once(T0 + timedelta(days=1))
+        self.assertIn(DRAWDOWN, codes(r2))
+        self.assertIsNone(store.load("risk_state", {}).get("drawdown_flat_since"))
+
     def test_feed_unhealthy_sets_feed_stale(self):
         eng, ex, feed, store = self.build(positions={"SOLUSDT": position("SOLUSDT", 1.0, 100)},
                                           balances={"USDT": 10000.0, "SOL": 1.0})
