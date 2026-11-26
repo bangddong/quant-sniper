@@ -6,6 +6,9 @@ import urllib.error
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from unittest import mock
+
+from coin_sniper import config
 from coin_sniper.config import Settings
 from coin_sniper.exchange.binance import BinanceExchange
 from coin_sniper.models import OrderState
@@ -177,10 +180,21 @@ class BinanceRestTest(unittest.TestCase):
         self.assertEqual(op.query()["quantity"], "0.00001")
         self.assertEqual(op.query()["side"], "SELL")
 
-    def test_place_stop_sends_stop_loss_limit(self):
+    def test_place_stop_default_is_market_stop_loss_without_price(self):
         resp = dict(ORDER_FILLS, side="SELL", status="NEW", executedQty="0", cummulativeQuoteQty="0", fills=[])
         ex, op = make(resp)
         res = ex.place_stop("ETHUSDT", 0.5, 2900.0, 2871.0, "cid2")
+        self.assertTrue(res.ok)
+        q = op.query()
+        self.assertEqual((q["type"], q["side"], q["stopPrice"], q["newClientOrderId"]), ("STOP_LOSS", "SELL", "2900", "cid2"))
+        self.assertNotIn("price", q)
+        self.assertNotIn("timeInForce", q)
+
+    def test_place_stop_sends_stop_loss_limit(self):
+        resp = dict(ORDER_FILLS, side="SELL", status="NEW", executedQty="0", cummulativeQuoteQty="0", fills=[])
+        ex, op = make(resp)
+        with mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT"):
+            res = ex.place_stop("ETHUSDT", 0.5, 2900.0, 2871.0, "cid2")
         self.assertTrue(res.ok)
         q = op.query()
         self.assertEqual((q["type"], q["timeInForce"], q["side"]), ("STOP_LOSS_LIMIT", "GTC", "SELL"))

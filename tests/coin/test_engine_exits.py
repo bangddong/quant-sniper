@@ -187,6 +187,7 @@ class EngineExitTests(unittest.TestCase):
         self.assertEqual((prot["stop_price"], prot["limit_price"], prot["qty"]), (93.01, 92.07, 1.0))
 
     # ---- 거래소 손절 -----------------------------------------------------------------
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_exchange_stop_filled_first_is_recorded_as_sell(self):
         eng, ex, feed, store = self.build()
         eng.run_once(T0)
@@ -203,6 +204,18 @@ class EngineExitTests(unittest.TestCase):
         self.assertAlmostEqual(t["net_pnl"], 94.05 * 0.999 - 100.0)
         self.assertEqual(store.load("positions", {}), {})
         self.assertEqual(calls(ex, "market_sell"), [])
+
+    def test_market_exchange_stop_recorded_at_fill_price(self):
+        eng, ex, feed, store = self.build()
+        eng.run_once(T0)
+        self.price(ex, feed, 94.0)
+        ex.trigger_stops()
+        eng.run_once(T0 + 30 * SEC)
+        t = self.trades(store)[0]
+        self.assertEqual(t["reason"], "거래소 손절")
+        self.assertAlmostEqual(t["price"], 94.0)
+        self.assertAlmostEqual(t["net_pnl"], 94.0 * 0.999 - 100.0)
+        self.assertEqual(store.load("positions", {}), {})
 
     def test_exchange_stop_filled_during_bot_exit_is_recorded_once(self):
         eng, ex, feed, store = self.build()
@@ -516,6 +529,7 @@ class EngineExitTests(unittest.TestCase):
         received = ex.balances().value["USDT"][0] - usdt_before
         self.assertAlmostEqual(r.cash, cash_before + received)
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_bot_exit_with_partially_filled_stop_records_real_fee_then_sells_rest(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
         r = eng.run_once(T0 + 30 * SEC)
@@ -531,6 +545,7 @@ class EngineExitTests(unittest.TestCase):
         self.assertEqual(self.trades(store), [])
         self.assertEqual(calls(ex, "place_stop")[1:], [])    # 새 보호 주문도 걸지 않는다
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_lookup_failure_after_cancel_keeps_halt_until_settled(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
         seen = ex.get_order(SYM, cid).value                  # 1단계 확인 때 돌려줄 상태(부분 체결 중)
@@ -543,6 +558,7 @@ class EngineExitTests(unittest.TestCase):
         self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
         self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_canceled_record_not_settled_by_missing_lookup(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
         seen = ex.get_order(SYM, cid).value
@@ -554,6 +570,7 @@ class EngineExitTests(unittest.TestCase):
         self.check_partial_then_sell(ex, store, r, usdt_before, cash_before)
         self.assertNotIn(PROTECTIVE_CANCEL, codes(r))
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_canceled_record_not_settled_by_non_final_lookup(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
         seen = ex.get_order(SYM, cid).value                  # PARTIALLY_FILLED (최종 아님)
@@ -592,6 +609,7 @@ class EngineExitTests(unittest.TestCase):
         self.assertEqual([p["symbol"] for p in calls(ex, "market_sell")], ["XRPUSDT"])
         self.assertEqual(store.load("positions", {})[SYM]["protective"]["state"], "canceled")
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_crash_between_cancel_and_partial_journal_applies_fill_once(self):
         eng, ex, feed, store, cid, usdt_before, cash_before = self.partially_stopped()
         real_save = store.save

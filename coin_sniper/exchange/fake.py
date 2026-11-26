@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Callable, Iterable
 
+from coin_sniper import config
 from coin_sniper.models import ApiResult, OrderState, Quote, SymbolRules
 from coin_sniper.risk import floor_to_step
 
@@ -41,6 +42,7 @@ class _Order:
     qty: Decimal
     stop_price: float = 0.0
     limit_price: float = 0.0
+    order_type: str = "STOP_LOSS_LIMIT"
 
 
 def _api(fn: Callable) -> Callable:
@@ -113,7 +115,7 @@ class FakeExchange:
         self._hidden = int(n_calls)
 
     def trigger_stops(self, fill_ratio: float = 1.0) -> None:
-        """발동 조건(가격 ≤ 발동가)인 NEW 손절 주문을 지정가로 체결한다. fill_ratio < 1이면
+        """발동 조건(가격 ≤ 발동가)인 NEW 손절 주문을 체결한다: STOP_LOSS_LIMIT은 지정가, STOP_LOSS는 현재가. fill_ratio < 1이면
         floor_to_step(수량 × 비율)만 체결되고 PARTIALLY_FILLED로 남는다(나머지는 잠긴 채, 취소 가능)."""
         for order in self._orders.values():
             state = order.state
@@ -125,7 +127,8 @@ class FakeExchange:
             rule = self._rules[state.symbol]
             executed = order.qty if fill_ratio >= 1.0 else _d(
                 floor_to_step(float(order.qty) * fill_ratio, rule.step_size))
-            quote_qty = executed * _d(order.limit_price)
+            fill_price = price if order.order_type == "STOP_LOSS" else order.limit_price
+            quote_qty = executed * _d(fill_price)
             fee = quote_qty * self._fee_rate
             self._account(rule.base)[1] -= executed
             self._account(rule.quote)[0] += quote_qty - fee
@@ -244,7 +247,7 @@ class FakeExchange:
         account[1] += want
         state = OrderState(client_id=client_id, symbol=symbol, side="SELL", status="NEW")
         self._orders[client_id] = _Order(state=state, qty=want, stop_price=float(stop_price),
-                                         limit_price=float(limit_price))
+                                         limit_price=float(limit_price), order_type=config.PROTECTIVE_STOP_TYPE)
         return ApiResult(ok=True, value=_snap(state))
 
     @_api

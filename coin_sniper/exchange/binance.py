@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Callable
 from urllib.parse import urlencode
 
+from coin_sniper import config
 from coin_sniper.config import (ASSET_TAGS_MIN_ENTRIES, ASSET_TAGS_URL, DEFAULT_BAN_RETRY_SECONDS,
                                 HTTP_TIMEOUT_SECONDS, QUOTE_ASSET, RECV_WINDOW_MS, Settings)
 from coin_sniper.models import ApiResult, OrderState, SymbolRules
@@ -207,9 +208,12 @@ class BinanceExchange:
 
     def place_stop(self, symbol: str, qty: float, stop_price: float, limit_price: float,
                    client_id: str) -> ApiResult:
-        params = {"symbol": symbol, "side": "SELL", "type": "STOP_LOSS_LIMIT", "timeInForce": "GTC",
-                  "quantity": _fmt(qty), "stopPrice": _fmt(stop_price), "price": _fmt(limit_price),
+        """보호 매도 주문. 종류는 config.PROTECTIVE_STOP_TYPE: STOP_LOSS면 limit_price를 쓰지 않는다(발동 시 시장가)."""
+        params = {"symbol": symbol, "side": "SELL", "type": config.PROTECTIVE_STOP_TYPE,
+                  "quantity": _fmt(qty), "stopPrice": _fmt(stop_price),
                   "newClientOrderId": client_id, "newOrderRespType": "FULL"}
+        if config.PROTECTIVE_STOP_TYPE == "STOP_LOSS_LIMIT":
+            params.update(timeInForce="GTC", price=_fmt(limit_price))
         return self._parse(self._call("order.post", "POST", "/api/v3/order", params), self._order_from,
                            mutating=True)
 

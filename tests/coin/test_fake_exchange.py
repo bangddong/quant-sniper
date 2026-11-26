@@ -1,4 +1,7 @@
 import unittest
+from unittest import mock
+
+from coin_sniper import config
 
 from coin_sniper.exchange.fake import FakeExchange, FakeFeed
 from coin_sniper.models import ApiResult, SymbolRules
@@ -182,6 +185,16 @@ class StopTests(unittest.TestCase):
         self.assertIn("-2011", ex.cancel_order("ABCUSDT", "p1").error)
         self.assertEqual(bal(ex)["ABC"], (5.0, 0.0))
 
+    def test_market_stop_fills_at_current_price_even_below_limit(self):
+        ex = make({"USDT": 0.0, "ABC": 5.0})
+        ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")   # 기본 STOP_LOSS: 지정가는 쓰지 않는다
+        ex.set_price("ABCUSDT", 80.0)                    # 갭으로 지정가 아래까지
+        ex.trigger_stops()
+        o = ex.get_order("ABCUSDT", "p1").value
+        self.assertEqual(o.status, "FILLED")
+        self.assertAlmostEqual(o.quote_qty, 160.0)
+
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_trigger_fills_at_limit_price_when_price_at_or_below_stop(self):
         ex = make({"USDT": 0.0, "ABC": 5.0})
         ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")
@@ -410,6 +423,7 @@ class FeedTests(unittest.TestCase):
 
 
 class PartialStopAndLagTests(unittest.TestCase):
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_partial_trigger_keeps_remainder_locked_and_open(self):
         ex = make({"USDT": 0.0, "ABC": 5.0})
         ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")
@@ -428,6 +442,7 @@ class PartialStopAndLagTests(unittest.TestCase):
         ex.trigger_stops()                          # 부분 체결된 주문은 다시 발동하지 않는다
         self.assertAlmostEqual(ex.get_order("ABCUSDT", "p1").value.executed_qty, 0.8)
 
+    @mock.patch.object(config, "PROTECTIVE_STOP_TYPE", "STOP_LOSS_LIMIT")   # 지정가 체결을 고정하는 테스트
     def test_cancel_partial_unlocks_remainder_and_reports_no_fees(self):
         ex = make({"USDT": 0.0, "ABC": 5.0})
         ex.place_stop("ABCUSDT", 2.0, 90.0, 89.0, "p1")

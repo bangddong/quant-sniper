@@ -38,7 +38,8 @@ ORDER_CONFIRM_TIMEOUT_SECONDS = 20; CANDLE_COUNT = 70   # 주문 하나의 체�
 ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS = 5   # 전송이 일시 오류로 실패한 주문의 확인 기한
 INTENT_NOT_FOUND_GRACE_SECONDS = 60     # 조회에 안 보이는 주문을 "주문된 적 없음"으로 볼 때까지의 유예
 PROTECTIVE_STOPS_ENABLED = True          # 데모 확인 스크립트(3번) 결과로 확정할 것 — 아직 미확인
-STOP_LIMIT_OFFSET_PCT = 0.01             # 손절 주문의 지정가 = 발동가 × (1 - 0.01)
+PROTECTIVE_STOP_TYPE = "STOP_LOSS"       # 거래소 보호 주문: STOP_LOSS = 발동 시 시장가(갭에도 체결) | STOP_LOSS_LIMIT
+STOP_LIMIT_OFFSET_PCT = 0.01             # STOP_LOSS_LIMIT일 때만: 지정가 = 발동가 × (1 - 0.01)
 STOP_REPLACE_MIN_MOVE_PCT = 0.005
 RECON_ESCALATE_SECONDS = 600
 SLIPPAGE_ESTIMATE_PCT = 0.001

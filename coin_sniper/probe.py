@@ -18,7 +18,7 @@ from typing import Callable
 
 import env_loader
 from coin_sniper.config import (
-    CANDLE_COUNT, MIN_HISTORY_DAYS, MIN_PREV_DAY_QUOTE_VOLUME, QUOTE_ASSET, UNIVERSE_MIN_COUNT,
+    CANDLE_COUNT, MIN_HISTORY_DAYS, MIN_PREV_DAY_QUOTE_VOLUME, PROTECTIVE_STOP_TYPE, QUOTE_ASSET, UNIVERSE_MIN_COUNT,
     UNIVERSE_TOP_N, Settings, SettingsError, load_settings,
 )
 from coin_sniper.exchange.binance import BinanceExchange
@@ -215,7 +215,8 @@ def _check_stop(ex, feed, sleep, clock, ctx) -> tuple[str, str]:
         if ctx.get("stop_id"):
             raise _Fail(f"{exc} (손절 주문 {client_id}이 열려 있을 수 있음)") from None
         raise
-    return "PASS", (f"STOP_LOSS_LIMIT 매도 수락 (수량 {qty:.10g}, 발동가 {stop:.10g}, 지정가 {limit:.10g}, "
+    shown = f"지정가 {limit:.10g}, " if PROTECTIVE_STOP_TYPE == "STOP_LOSS_LIMIT" else ""
+    return "PASS", (f"{PROTECTIVE_STOP_TYPE} 매도 수락 (수량 {qty:.10g}, 발동가 {stop:.10g}, {shown}"
                     f"등록 직후 상태 {placed.value.status}), 미체결 조회에 보임, 취소 {cancelled}, 취소 후 사라짐")
 
 
