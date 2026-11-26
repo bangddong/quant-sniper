@@ -76,6 +76,26 @@ ORDER_FILLS = {
 
 
 class BinanceRestTest(unittest.TestCase):
+    def test_asset_tags_parse_public_products(self):
+        products = [{"s": f"C{i}USDT", "tags": ["defi"]} for i in range(100)]
+        products += [{"s": "NVDABUSDT", "tags": ["bStocks"]}, {"s": "XUSDT", "tags": None}]
+        ex, op = make({"code": "000000", "data": products})
+        res = ex.asset_tags()
+        self.assertTrue(res.ok)
+        self.assertEqual(res.value["NVDABUSDT"], ["bStocks"])
+        self.assertEqual(res.value["XUSDT"], [])
+        self.assertTrue(op.requests[0].full_url.startswith("https://www.binance.com/bapi/"))
+        self.assertNotIn("X-mbx-apikey", op.requests[0].headers)
+
+    def test_asset_tags_failures_are_transient(self):
+        for item in (urllib.error.URLError("down"), http(403, {"msg": "blocked"}), b"<html>",
+                     {"data": [{"s": "AUSDT", "tags": []}]}):                 # 잘린 응답
+            ex, _ = make(item)
+            res = ex.asset_tags()
+            self.assertFalse(res.ok, item)
+            self.assertEqual(res.kind, "transient")
+            self.assertEqual(res.retry_after, 0.0)
+
     def test_signed_request_has_key_header_timestamp_and_signature(self):
         ex, op = make({"balances": [{"asset": "USDT", "free": "10.5", "locked": "1"}]})
         res = ex.balances()

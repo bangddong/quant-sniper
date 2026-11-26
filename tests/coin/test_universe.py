@@ -48,6 +48,15 @@ class UniverseTests(unittest.TestCase):
         self.assertFalse(is_excluded(rules("BTCUP"), frozenset()))
         self.assertTrue(is_excluded(rules("USDC")))
 
+    def test_new_stable_and_commodity_bases_excluded(self):
+        for base in ("USD1", "RLUSD", "U", "USDE", "XAUT"):
+            self.assertTrue(is_excluded(rules(base)), base)
+
+    def test_tag_excluded_symbols_dropped(self):
+        r = {"NVDABUSDT": rules("NVDAB"), "ARBUSDT": rules("ARB"), "SOLUSDT": rules("SOL")}
+        c = {s: candles(5e8) for s in r}
+        self.assertEqual(sorted(select_universe(r, c, frozenset({"NVDABUSDT"}))), ["ARBUSDT", "SOLUSDT"])
+
     def test_select_universe_keeps_jup_and_drops_btcup(self):
         r = {"BTCUSDT": rules("BTC"), "BTCUPUSDT": rules("BTCUP"), "JUPUSDT": rules("JUP")}
         c = {s: candles(5e8) for s in r}

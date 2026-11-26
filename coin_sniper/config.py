@@ -22,7 +22,14 @@ DRAWDOWN_AUTO_RESET_DAYS = 14   # 낙폭 중단 중 포지션·미확정 주문 
 UNIVERSE_TOP_N = 20; UNIVERSE_MIN_COUNT = 5; MIN_HISTORY_DAYS = 70
 UNIVERSE_RETRY_SECONDS = 600; UNIVERSE_FETCH_PAUSE_SECONDS = 0.1
 MIN_PREV_DAY_QUOTE_VOLUME = 20_000_000
-EXCLUDED_BASES = frozenset({"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "EURI", "AEUR", "PAXG", "WBTC", "WBETH"})
+EXCLUDED_BASES = frozenset({"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "EURI", "AEUR", "PAXG", "WBTC", "WBETH",
+                            # 2026-11-26 상위 거래대금에 들어온 스테이블·원자재(태그 조회가 안 될 때도 빠지게 고정)
+                            "USD1", "RLUSD", "U", "USDE", "USDS", "XUSD", "BFUSD", "RWUSD", "XAUT"})
+# 바이낸스 분류 태그로 빼는 것: 토큰화 주식(bStocks, 신규 상장이 잦아 이름 목록으로는 못 따라간다)·스테이블·원자재.
+# 출처는 문서화되지 않은 공개 웹 API다. 실패하면 마지막 성공 결과를 쓰고, 그것도 없으면 감시 종목을 정하지 않는다.
+EXCLUDED_TAGS = frozenset({"bStocks", "stablecoin", "tCommodities"})
+ASSET_TAGS_URL = "https://www.binance.com/bapi/asset/v2/public/asset-service/product/get-products?includeEtf=true"
+ASSET_TAGS_MIN_ENTRIES = 100   # 이보다 적으면 잘린 응답으로 보고 실패 처리
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 ENTRY_BLACKOUT_MINUTES = 15; SIGNAL_CONFIRMATIONS = 3
 POLL_INTERVAL_SECONDS = 30; QUOTE_MAX_AGE_SECONDS = 15

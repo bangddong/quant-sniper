@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - Windows
 
 STATE_NAMES = frozenset({
     "positions", "trades", "intents", "risk_state", "universe",
-    "events", "metrics", "equity_history", "halts", "dust",
+    "events", "metrics", "equity_history", "halts", "dust", "asset_exclusions",
 })
 _MODE_CODES = {"demo": "d", "live": "l"}
 _KIND_CODES = {"entry": "en", "exit": "ex", "protective": "pr"}

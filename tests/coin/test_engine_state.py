@@ -91,6 +91,36 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(calls_named(ex, "symbol_rules"), 2)
         self.assertEqual(store.load("universe", {})["date"], "2026-11-18")
 
+    def test_universe_drops_tagged_symbols_and_saves_them(self):
+        eng, ex, feed, store = self.build()
+        ex.tags = {"DOGEUSDT": ["bStocks"], "ETHUSDT": ["Layer1_Layer2"]}
+        eng.run_once(T0)
+        uni = store.load("universe", {})
+        self.assertNotIn("DOGEUSDT", uni["symbols"])
+        self.assertIn("ETHUSDT", uni["symbols"])
+        self.assertEqual(store.load("asset_exclusions", {})["symbols"], ["DOGEUSDT"])
+        self.assertFalse(any(n == "daily_candles" and p["symbol"] == "DOGEUSDT" for n, p in ex.calls))
+
+    def test_tag_failure_falls_back_to_saved_exclusions(self):
+        eng, ex, feed, store = self.build()
+        ex.tags = {"DOGEUSDT": ["bStocks"]}
+        eng.run_once(T0)
+        ex.tags = {}
+        ex.fail_next("asset_tags", ApiResult(False, kind="transient", error="HTTP 403"))
+        r = eng.run_once(utc(2026, 11, 18, 1))
+        self.assertNotIn(UNIVERSE, codes(r))
+        self.assertNotIn(RATE_LIMIT, codes(r))
+        self.assertNotIn("DOGEUSDT", store.load("universe", {})["symbols"])
+        self.assertTrue(any(e["type"] == "ERROR" and "저장분 사용" in e["reason"] for e in r.events))
+
+    def test_tag_failure_without_saved_exclusions_blocks_universe(self):
+        eng, ex, feed, store = self.build()
+        ex.fail_next("asset_tags", ApiResult(False, kind="transient", error="HTTP 429"))
+        r = eng.run_once(T0)
+        self.assertIn(UNIVERSE, codes(r))
+        self.assertNotIn(RATE_LIMIT, codes(r))                 # 거래소 호출 한도가 아니다
+        self.assertEqual(store.load("universe", {}), {"date": "2026-11-17", "symbols": []})
+
     def test_universe_failure_blocks_entries_without_fallback(self):
         eng, ex, feed, store = self.build()
         eng.run_once(T0)                                   # 오늘 목록 성공

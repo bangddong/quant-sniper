@@ -82,6 +82,7 @@ class FakeExchange:
         self._fee_asset: tuple[str, Decimal] | None = None   # 수수료를 낼 제3 자산과 그 USDT 가격
         self._hidden = 0                   # 남은 "조회 지연" get_order 횟수
         self.calls: list[tuple[str, dict]] = []
+        self.tags: dict[str, list[str]] = {}   # asset_tags() 응답
 
     # ---- 테스트 조작 ------------------------------------------------------------
     def set_price(self, symbol: str, price: float) -> None:
@@ -205,6 +206,10 @@ class FakeExchange:
     @_api
     def symbol_rules(self) -> ApiResult:
         return ApiResult(ok=True, value=dict(self._rules))
+
+    @_api
+    def asset_tags(self) -> ApiResult:
+        return ApiResult(ok=True, value={s: list(t) for s, t in self.tags.items()})
 
     @_api
     def daily_candles(self, symbol: str, limit: int) -> ApiResult:

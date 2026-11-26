@@ -16,7 +16,7 @@ from typing import Callable
 
 from coin_sniper import config
 from coin_sniper.config import (
-    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, DRAWDOWN_AUTO_RESET_DAYS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
+    CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, DRAWDOWN_AUTO_RESET_DAYS, EXCLUDED_TAGS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
     MAX_POSITIONS, MIN_STOP_LOSS_PCT, POLL_INTERVAL_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
     RECON_ESCALATE_SECONDS, UNIVERSE_FETCH_PAUSE_SECONDS, UNIVERSE_MIN_COUNT,
     UNIVERSE_RETRY_SECONDS, Settings,
@@ -340,8 +340,11 @@ class Engine:
         if not res.ok:
             return [], f"종목 규칙 조회 실패: {res.error}"
         self.rules = dict(res.value)
+        tagged = self._tag_excluded_symbols()
+        if tagged is None:
+            return [], "자산 분류 태그 조회 실패(저장된 분류 없음)"
         known_bases = frozenset(r.base for r in self.rules.values())
-        wanted = [s for s, r in self.rules.items() if not is_excluded(r, known_bases)]
+        wanted = [s for s, r in self.rules.items() if s not in tagged and not is_excluded(r, known_bases)]
         if MARKET_PROXY_SYMBOL not in wanted:
             wanted.append(MARKET_PROXY_SYMBOL)
         self._candles, self._candles_day = {}, today
@@ -351,8 +354,24 @@ class Engine:
             got = self._call("daily_candles", symbol, CANDLE_COUNT)
             if got.ok and got.value:                       # 실패한 종목만 뺀다
                 self._candles[symbol] = got.value
-        symbols = select_universe(self.rules, self._candles)
+        symbols = select_universe(self.rules, self._candles, tagged)
         return symbols, f"감시 종목 {len(symbols)}개 < 최소 {UNIVERSE_MIN_COUNT}개"
+
+    def _tag_excluded_symbols(self) -> frozenset[str] | None:
+        """분류 태그(EXCLUDED_TAGS)로 뺄 심볼. 조회에 실패하면 마지막 성공 결과, 그것도 없으면 None(선정하지 않는다).
+        거래소 API가 아니므로 _call(호출 한도·치명 판정)을 거치지 않는다."""
+        try:
+            res = self.exchange.asset_tags()
+        except Exception as exc:
+            res = ApiResult(ok=False, kind="transient", error=f"{type(exc).__name__}: {exc}")
+        if res.ok:
+            symbols = sorted(s for s, tags in res.value.items() if EXCLUDED_TAGS & set(tags))
+            self.store.save("asset_exclusions", {"fetched_at": self._now.isoformat(), "symbols": symbols})
+            return frozenset(symbols)
+        cached = self.store.load("asset_exclusions", None)
+        note = f"{cached['fetched_at']} 저장분 사용" if cached else "저장분 없음 — 감시 종목 선정 보류"
+        self._event("ERROR", f"자산 분류 태그 조회 실패: {res.error} — {note}")
+        return frozenset(cached["symbols"]) if cached else None
 
     # ---- 3·4단계: 계좌와 대조 ---------------------------------------------------------
     def _sync_account(self) -> None:

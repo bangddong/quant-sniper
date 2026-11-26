@@ -9,6 +9,7 @@ from coin_sniper.models import ApiResult, Quote
 class Exchange(Protocol):
     def server_time(self) -> ApiResult: ...                                   # value: int(ms)
     def symbol_rules(self) -> ApiResult: ...                                  # value: dict[str, SymbolRules]
+    def asset_tags(self) -> ApiResult: ...                                    # value: dict[str, list[str]] 심볼 → 분류 태그
     def daily_candles(self, symbol: str, limit: int) -> ApiResult: ...        # value: list[dict], 과거→현재, 마지막은 진행 중인 봉
     def balances(self) -> ApiResult: ...                                      # value: dict[str, tuple[float, float]] (free, locked)
     def market_buy(self, symbol: str, qty: float, client_id: str) -> ApiResult: ...    # value: OrderState

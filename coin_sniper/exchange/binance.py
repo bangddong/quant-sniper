@@ -18,8 +18,8 @@ from decimal import Decimal
 from typing import Callable
 from urllib.parse import urlencode
 
-from coin_sniper.config import (DEFAULT_BAN_RETRY_SECONDS, HTTP_TIMEOUT_SECONDS, QUOTE_ASSET,
-                                RECV_WINDOW_MS, Settings)
+from coin_sniper.config import (ASSET_TAGS_MIN_ENTRIES, ASSET_TAGS_URL, DEFAULT_BAN_RETRY_SECONDS,
+                                HTTP_TIMEOUT_SECONDS, QUOTE_ASSET, RECV_WINDOW_MS, Settings)
 from coin_sniper.models import ApiResult, OrderState, SymbolRules
 
 _FATAL_CODES = {-2014, -2015}
@@ -174,6 +174,20 @@ class BinanceExchange:
     def symbol_rules(self) -> ApiResult:
         res = self._call("exchangeInfo", "GET", "/api/v3/exchangeInfo", signed=False)
         return self._parse(res, self._rules_from_info)
+
+    def asset_tags(self) -> ApiResult:
+        """심볼 → 바이낸스 분류 태그. 거래소 API가 아닌 공개 웹 API(문서화되지 않음)라 서명·호출 한도 판정 없이 부르고,
+        어떤 실패든 transient로 돌려준다(엔진은 저장된 직전 결과로 대체한다)."""
+        request = urllib.request.Request(ASSET_TAGS_URL, headers={"User-Agent": "coin-sniper"})
+        try:
+            with self._opener(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                data = json.loads(response.read())
+            tags = {p["s"]: [str(t) for t in (p.get("tags") or [])] for p in data["data"]}
+        except Exception as exc:
+            return _fail("transient", self._scrub(f"asset tags: {type(exc).__name__}: {exc}"))
+        if len(tags) < ASSET_TAGS_MIN_ENTRIES:
+            return _fail("transient", f"asset tags: 항목 {len(tags)}개 < {ASSET_TAGS_MIN_ENTRIES}개(잘린 응답)")
+        return ApiResult(ok=True, value=tags)
 
     def daily_candles(self, symbol: str, limit: int) -> ApiResult:
         res = self._call("klines", "GET", "/api/v3/klines",
