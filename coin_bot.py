@@ -92,6 +92,7 @@ def _banner(settings: Settings, risk_state: dict) -> None:
     print(f"REST: {settings.rest_base}")
     print(f"시세: {settings.stream_base}")
     print(f"상태 폴더: {settings.state_dir}")
+    print(f"전략: {settings.strategy}")
     if risk_state:                                        # 저장된 값이 실제로 쓰인다(설정값은 재설정 때만 반영)
         stored = float(risk_state.get("starting_capital") or 0.0)
         segment = risk_state.get("segment_start")

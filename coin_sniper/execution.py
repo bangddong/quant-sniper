@@ -23,12 +23,12 @@ from coin_sniper import config
 from coin_sniper.config import (
     INTENT_NOT_FOUND_GRACE_SECONDS, MAX_HOLD_HOURS, ORDER_CONFIRM_AFTER_SEND_FAILURE_SECONDS,
     ORDER_CONFIRM_TIMEOUT_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
-    STOP_LIMIT_OFFSET_PCT, STOP_REPLACE_MIN_MOVE_PCT,
+    STOP_LIMIT_OFFSET_PCT, STOP_REPLACE_MIN_MOVE_PCT, STRATEGY_TREND,
 )
 from coin_sniper.halts import LOOP_ERROR, MAINTENANCE, ORDER_UNCONFIRMED, PROTECTIVE_CANCEL
 from coin_sniper.ledger import add_intent, new_client_id
 from coin_sniper.models import ApiResult, OrderState, SymbolRules
-from coin_sniper.risk import floor_to_step, floor_to_tick, is_tradable_amount, time_stop_due, update_stop
+from coin_sniper.risk import floor_to_step, floor_to_tick, is_tradable_amount, time_stop_due, trend_trim_qty, update_stop
 
 TIME_STOP_REASON = f"타임스탑 ({MAX_HOLD_HOURS}시간 경과)"
 EXCHANGE_STOP_REASON = "거래소 손절"
@@ -36,6 +36,8 @@ EXCHANGE_STOP_PARTIAL_REASON = "거래소 손절(부분)"
 BUY_DROPPED_REASON = "매수 주문 미확인 폐기: 거래소 잔고 확인 필요"
 FEE_UNPRICED_REASON = "수수료 자산 가격 모름"
 MISMATCH_HOLD_REASON = "장부·거래소 수량 불일치: 주문 보류"
+TREND_EXIT_REASON = "추세 이탈(주간 판단)"
+TREND_TRIM_REASON = "비중 축소(주간 판단)"
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
 
 
@@ -472,6 +474,9 @@ class Executor:
         stop, reason = update_stop(pos, quote.price)
         if quote.price > stop:
             reason = TIME_STOP_REASON if time_stop_due(pos, now) else None
+            if reason is None and pos.get("strategy") == STRATEGY_TREND:
+                if self._trend_rebalance(symbol, rule, pos, quote.price, now):
+                    return
         if reason is not None:
             self._exit(symbol, rule, reason, quote.price, now)
             return
@@ -480,6 +485,32 @@ class Executor:
             e.store.save("positions", e.positions)
         if enabled:
             self._ensure_protective(symbol, rule, stop, now)
+
+    def _trend_rebalance(self, symbol: str, rule: SymbolRules, pos: dict, price: float, now: datetime) -> bool:
+        """추세 포지션의 주간 판단 실행. True면 이번 루프에 이 종목 주문 절차를 탔다(보호 주문 갱신은 다음 루프).
+        목표 0 = 전량 청산(그 주 어느 날이든 팔릴 때까지). 비중 축소는 판단일 당일 한 번만(백테스트와 같다).
+        판단이 없으면(지난주 것뿐) 아무것도 하지 않는다: 모르면 거래하지 않는다."""
+        e = self.e
+        plan = e.trend_plan_now(now)
+        if plan is None or symbol not in plan["targets"]:
+            return False
+        target = float(plan["targets"][symbol])
+        if target <= 0:
+            self._exit(symbol, rule, TREND_EXIT_REASON, price, now)
+            return True
+        today = now.astimezone(timezone.utc).date().isoformat()
+        equity = e.risk_state.get("last_equity")
+        if today != plan["week"] or symbol in plan.get("trimmed", []) or not equity:
+            return False
+        qty = trend_trim_qty(float(pos["qty"]), price, float(equity), target, rule)
+        if qty <= 0:
+            return False
+        if self._release_protective(symbol, now) is not None:
+            return True                                    # 보호 주문이 아직 수량을 잡고 있다: 다음 루프에 다시
+        plan.setdefault("trimmed", []).append(symbol)      # 보내기 전에 저장: 결과와 상관없이 그 주에는 다시 줄이지 않는다
+        e.store.save("risk_state", e.risk_state)
+        self.execute_market(symbol, "SELL", qty, "exit", TREND_TRIM_REASON, now, ref_price=price)
+        return True
 
     def _release_protective(self, symbol: str, now: datetime) -> str | None:
         """팔기 전에 보호 주문을 푼다. None이면 계속 진행, 아니면 _cancel_protective의 결과(진행 중단)."""

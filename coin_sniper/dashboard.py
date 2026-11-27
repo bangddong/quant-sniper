@@ -23,7 +23,7 @@ KST = timezone(timedelta(hours=9), "KST")
 COMMIT_MESSAGE = "dashboard: rolling 7-day snapshot"
 RECONCILE_COMMAND = "python coin_bot.py reconcile"
 STATUS_KO = {"running": "정상 운영", "halted": "신규 매수 중단", "error": "루프 오류"}
-STRATEGY_KO = {"rsi_recovery": "RSI 회복", "vbo": "변동성 돌파"}
+STRATEGY_KO = {"rsi_recovery": "RSI 회복", "vbo": "변동성 돌파", "trend": "추세(주간)"}
 HALT_KO = {
     "account_fetch": "계좌 조회 실패", "feed_stale": "시세 지연", "maintenance": "거래소 점검·일시 오류",
     "rate_limit": "호출 한도", "universe": "감시 종목 없음", "daily_loss": "일일 손실 한도",
@@ -206,6 +206,20 @@ def _watch_section(s: dict) -> list[str]:
     return lines
 
 
+def _trend_section(s: dict) -> list[str]:
+    plan = s.get("trend_plan")
+    if s.get("strategy") != "trend" and not plan:
+        return []
+    if not plan:
+        return ["", "### 추세 주간 판단", "", "> 이번 주 판단 전(전일까지 확정 종가가 필요합니다)."]
+    targets = plan.get("targets") or {}
+    rows = [(sym, _pct(w * 100, False) if w else "보유 안 함",
+             "예" if sym in (plan.get("entered") or []) else "-",
+             "예" if sym in (plan.get("trimmed") or []) else "-") for sym, w in targets.items()]
+    return ["", f"### 추세 주간 판단 ({_md(plan.get('week'))} 주)", "", *_table(
+        ["종목", "목표 비중", "이번 주 매수 시도", "이번 주 비중 축소"], "lrll", rows, "판단 없음")]
+
+
 def _risk_section(s: dict) -> list[str]:
     return ["", "### 위험 관리", "", *_table(
         ["고점 대비 낙폭", "일일 손실 한도 기준 수익률 (오늘 첫 평가 대비)", "주문 배율", "열린 위험 합계", "남은 슬롯"],
@@ -321,7 +335,7 @@ def render_dashboard(snapshot: dict) -> str:
     s = snapshot
     lines = [f"# Coin Sniper Dashboard  [{str(s.get('mode', 'demo')).upper()}]", "",
              f"> 마지막 갱신: **{_kst(s.get('now')) or '-'} KST**", ""]
-    lines += _status_section(s) + _watch_section(s) + _risk_section(s) + _positions_section(s)
+    lines += _status_section(s) + _watch_section(s) + _trend_section(s) + _risk_section(s) + _positions_section(s)
     lines += _returns_section(s) + _errors_section(s) + _events_section(s)
     lines += ["", "> 인증정보와 계좌 식별정보는 기록하지 않습니다.", ""]
     return "\n".join(lines)

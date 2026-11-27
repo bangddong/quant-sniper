@@ -49,6 +49,20 @@ DASHBOARD_MIN_INTERVAL_SECONDS = 300; DASHBOARD_HEARTBEAT_SECONDS = 1800   # 변
 DASHBOARD_PUBLISH_TIMEOUT_SECONDS = 60   # git 명령 하나의 최대 시간(멈춘 push가 매매를 막지 않게)
 DASHBOARD_BRANCH = "dashboard"           # 게시 브랜치 기본값(환경 변수 COIN_DASHBOARD_BRANCH로 바꾼다)
 
+# ---- 추세 전략(COIN_STRATEGY=trend): BTC·ETH 시계열 모멘텀, 주 1회 판단 ----
+# 근거: 2026-11-27 사전 고정 백테스트(2018-01~2026-11, 8개 기간). 구현형(월요일 판단·줄이기만·비상 손절 25%)
+# t +3.35, 연 +18%, 최대 낙폭 27% (BTC 보유 연 +18%, 낙폭 81%). 파라미터를 결과에 맞춰 고치지 않는다.
+STRATEGY_BREAKOUT = "breakout"; STRATEGY_TREND = "trend"
+TREND_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+TREND_LOOKBACK_DAYS = 28                 # 확정 종가가 28일 전 종가보다 높으면 보유
+TREND_VOL_WINDOW_DAYS = 30               # 일간 수익률 30개의 표준편차 × √365 = 연환산 변동성
+TREND_VOL_TARGET = 0.10                  # 코인당 비중 = min(TREND_MAX_WEIGHT, 0.10 / 연환산 변동성)
+TREND_MAX_WEIGHT = 0.50
+TREND_REBALANCE_WEEKDAY = 0              # 월요일(UTC). 판단은 전일까지의 확정 종가로
+TREND_TRIM_RATIO = 1.5                   # 보유 가치가 목표의 1.5배를 넘으면 목표까지 일부 매도(늘리는 매수는 하지 않는다)
+TREND_STOP_LOSS_PCT = 0.25               # 거래소 비상 손절(고정, 따라 올라가지 않는다). 전략 청산은 주간 판단이 한다
+TREND_EQUITY_HALT_DRAWDOWN_PCT = 0.35    # 추세 전략의 낙폭 중단(백테스트 최대 27%보다 넓게: 이걸 넘으면 가정이 깨진 것)
+
 _ENDPOINTS = {
     "demo": ("https://demo-api.binance.com", "wss://demo-stream.binance.com/ws"),
     "live": ("https://api.binance.com", "wss://stream.binance.com:9443/ws"),
@@ -74,6 +88,7 @@ class Settings:
     dashboard_branch: str = DASHBOARD_BRANCH
     # 데모 전용: BTC 시장 필터를 건너뛴다. 수익 검증이 아니라 하락장에서도 주문·청산 흐름을 실제로 돌려 보기 위한 것.
     demo_ignore_market_filter: bool = False
+    strategy: str = STRATEGY_BREAKOUT       # COIN_STRATEGY: breakout(일봉 돌파·RSI, 기본) | trend(BTC·ETH 주간 추세)
 
     def require_keys(self) -> None:
         for value in (self.api_key, self.api_secret):
@@ -96,6 +111,11 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     ignore_market = _flag(env.get("COIN_DEMO_IGNORE_MARKET_FILTER", "false"))
     if ignore_market and mode != "demo":
         raise SettingsError("COIN_DEMO_IGNORE_MARKET_FILTER 는 demo 모드에서만 쓸 수 있습니다")
+    strategy = env.get("COIN_STRATEGY", STRATEGY_BREAKOUT).strip().lower() or STRATEGY_BREAKOUT
+    if strategy not in (STRATEGY_BREAKOUT, STRATEGY_TREND):
+        raise SettingsError(f"알 수 없는 COIN_STRATEGY: {strategy!r} ({STRATEGY_BREAKOUT} 또는 {STRATEGY_TREND})")
+    if ignore_market and strategy != STRATEGY_BREAKOUT:
+        raise SettingsError("COIN_DEMO_IGNORE_MARKET_FILTER 는 breakout 전략에서만 쓸 수 있습니다")
     prefix = f"BINANCE_{mode.upper()}"
     rest_base, stream_base = _ENDPOINTS[mode]
     try:
@@ -113,4 +133,5 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         auto_git_push=_flag(env.get("AUTO_GIT_PUSH", "false")),
         dashboard_branch=env.get("COIN_DASHBOARD_BRANCH", "").strip() or DASHBOARD_BRANCH,
         demo_ignore_market_filter=ignore_market,
+        strategy=strategy,
     )

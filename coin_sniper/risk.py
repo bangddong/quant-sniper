@@ -51,11 +51,14 @@ def position_open_risk(pos: dict) -> float:
     return max(0.0, loss)
 
 
-def drawdown_controls(equity: float, peak: float | None) -> tuple[float, float, float, bool]:
-    """(고점, 낙폭, 신규 주문 배율, 중단 여부)."""
+def drawdown_controls(equity: float, peak: float | None,
+                      strategy: str = config.STRATEGY_BREAKOUT) -> tuple[float, float, float, bool]:
+    """(고점, 낙폭, 신규 주문 배율, 중단 여부). 추세 전략은 축소 없이 넓은 중단 기준만 쓴다."""
     equity = max(float(equity or 0), 0.0)
     peak = max(float(peak if peak is not None else equity), equity)
     drawdown = (peak - equity) / peak if peak else 0.0
+    if strategy == config.STRATEGY_TREND:
+        return peak, drawdown, 1.0, drawdown >= config.TREND_EQUITY_HALT_DRAWDOWN_PCT
     halted = drawdown >= config.EQUITY_HALT_DRAWDOWN_PCT
     multiplier = 0.5 if drawdown >= config.EQUITY_SLOWDOWN_DRAWDOWN_PCT else 1.0
     return peak, drawdown, multiplier, halted
@@ -90,7 +93,10 @@ def update_stop(pos: dict, high_water: float) -> tuple[float, str]:
     highest = max(_d(pos["highest_price"]), _d(high_water))
     pos["highest_price"] = float(highest)
     one = Decimal(1)
-    if highest >= buy * (one + _d(config.TRAIL_TRIGGER_PCT)):
+    if pos.get("strategy") == config.STRATEGY_TREND:    # 비상 손절만: 따라 올라가지 않는다(청산은 주간 판단)
+        level = buy * (one - _d(pos["stop_loss_pct"]))
+        reason = "비상 손절"
+    elif highest >= buy * (one + _d(config.TRAIL_TRIGGER_PCT)):
         level = highest * (one - _d(pos["trailing_gap_pct"]))
         pos["trailing_active"] = True
         reason = "고점 추적 트레일링 스탑"
@@ -106,5 +112,34 @@ def update_stop(pos: dict, high_water: float) -> tuple[float, str]:
 
 
 def time_stop_due(pos: dict, now: datetime) -> bool:
+    if pos.get("strategy") == config.STRATEGY_TREND:    # 추세 전략은 보유 기간 제한이 없다
+        return False
     entry = datetime.fromisoformat(pos["entry_time"])
     return now >= entry + timedelta(hours=config.MAX_HOLD_HOURS)
+
+
+def size_trend_entry(equity: float, cash: float, price: float, weight: float, rules: SymbolRules) -> float:
+    """추세 전략 매수 수량: 평가액 × 목표 비중, 현금 이하(스텝 내림). 최소 주문 금액 미만이면 0."""
+    inputs = (equity, cash, price, weight)
+    if not all(math.isfinite(v) and v > 0 for v in inputs):
+        return 0.0
+    qty = min(_d(equity) * _d(min(weight, config.TREND_MAX_WEIGHT)), _d(cash)) / _d(price)
+    floored = _floor(float(qty), rules.step_size)
+    if _d(floored) * _d(price) < _d(rules.min_notional):
+        return 0.0
+    return floored
+
+
+def trend_trim_qty(qty: float, price: float, equity: float, weight: float, rules: SymbolRules) -> float:
+    """보유 가치가 목표(평가액 × 비중)의 TREND_TRIM_RATIO배를 넘으면 목표까지 줄일 매도 수량(스텝 내림), 아니면 0.
+    목표 비중이 0이면 전량 청산 대상이므로 여기서는 0(청산 경로가 따로 판다)."""
+    inputs = (qty, price, equity, weight)
+    if not all(math.isfinite(v) and v > 0 for v in inputs):
+        return 0.0
+    value, target = _d(qty) * _d(price), _d(equity) * _d(weight)
+    if value <= target * _d(config.TREND_TRIM_RATIO):
+        return 0.0
+    sell = _floor(float((value - target) / _d(price)), rules.step_size)
+    if _d(sell) * _d(price) < _d(rules.min_notional):
+        return 0.0
+    return sell

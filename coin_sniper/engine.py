@@ -18,7 +18,7 @@ from coin_sniper import config
 from coin_sniper.config import (
     CANDLE_COUNT, DAILY_KILL_SWITCH_PCT, DEFAULT_BAN_RETRY_SECONDS, DRAWDOWN_AUTO_RESET_DAYS, EXCLUDED_TAGS, MARKET_PROXY_SYMBOL, MAX_HOLD_HOURS,
     MAX_POSITIONS, MIN_STOP_LOSS_PCT, POLL_INTERVAL_SECONDS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS,
-    RECON_ESCALATE_SECONDS, UNIVERSE_FETCH_PAUSE_SECONDS, UNIVERSE_MIN_COUNT,
+    RECON_ESCALATE_SECONDS, STRATEGY_TREND, TREND_SYMBOLS, UNIVERSE_FETCH_PAUSE_SECONDS, UNIVERSE_MIN_COUNT,
     UNIVERSE_RETRY_SECONDS, Settings,
 )
 from coin_sniper.exchange.base import Exchange, Feed
@@ -33,7 +33,7 @@ from coin_sniper.ledger import StateStore, record_event_merged
 from coin_sniper.metrics import Metrics, append_equity, period_returns
 from coin_sniper.models import ApiResult, SymbolRules
 from coin_sniper.risk import account_value, drawdown_controls, position_open_risk, size_entry
-from coin_sniper.strategy import in_entry_blackout
+from coin_sniper.strategy import in_entry_blackout, trend_target, trend_week
 from coin_sniper.universe import is_excluded, select_universe
 
 
@@ -122,6 +122,9 @@ class Engine:
         if self.settings.demo_ignore_market_filter:      # live에서는 load_settings가 거부한다
             self._now = now
             self._event("SYSTEM", "데모 설정: BTC 시장 필터 꺼짐 — 하락장에서도 진입한다(수익 검증용 아님)")
+        if self.settings.strategy == STRATEGY_TREND:
+            self._now = now
+            self._event("SYSTEM", "전략: 추세(BTC·ETH 주간 판단) — 기존 돌파 전략 포지션은 원래 규칙대로 청산한다")
         if self.halts.is_set(FATAL):                       # 사람이 원인을 고치고 재시작했다(7.4). 남아 있으면 첫 호출에서 다시 걸린다
             self._now = now
             self.halts.clear(FATAL)
@@ -184,6 +187,7 @@ class Engine:
             ("exits", self._manage_exits, (now,)),                 # 5 (Task 11)
             ("universe", self._refresh_universe_if_due, (now,)),   # 6 감시 종목
             ("candles", self._prepare_candles, (now,)),            # 6 캔들 + 평가액 기록
+            ("trend", self._trend_plan, (now,)),                   # 6b 추세 전략 주간 판단(주문 없음)
             ("equity", self._evaluate_equity, ()),                 # 7
         )
         limited = False
@@ -328,7 +332,7 @@ class Engine:
         except Exception as exc:                           # 호출 한도 포함: 실패로 남기고 다시 올린다
             self._universe_failed(today, f"감시 종목 선정 오류: {type(exc).__name__}")
             raise
-        if len(symbols) >= UNIVERSE_MIN_COUNT:
+        if len(symbols) >= (len(TREND_SYMBOLS) if self.trend_mode else UNIVERSE_MIN_COUNT):
             self.universe = {"date": today, "symbols": symbols}
             self._universe_detail = ""
         else:
@@ -343,6 +347,9 @@ class Engine:
         if not res.ok:
             return [], f"종목 규칙 조회 실패: {res.error}"
         self.rules = dict(res.value)
+        if self.trend_mode:                                # 고정 종목: 거래 가능한 것만(하나라도 빠지면 선정 실패)
+            symbols = [s for s in TREND_SYMBOLS if s in self.rules and self.rules[s].trading]
+            return symbols, f"추세 전략 종목 거래 불가: {sorted(set(TREND_SYMBOLS) - set(symbols))}"
         tagged = self._tag_excluded_symbols()
         if tagged is None:
             return [], "자산 분류 태그 조회 실패(저장된 분류 없음)"
@@ -505,6 +512,41 @@ class Engine:
             out = (out + [live])[-CANDLE_COUNT:]
         return out
 
+    # ---- 6b단계: 추세 전략 주간 판단 ---------------------------------------------------------
+    @property
+    def trend_mode(self) -> bool:
+        return self.settings.strategy == STRATEGY_TREND
+
+    def _trend_plan(self, now: datetime) -> None:
+        """이번 주 목표 비중을 risk_state.trend_plan에 정한다(주에 한 번). 주문은 내지 않는다:
+        매수는 진입 단계, 매도(추세 이탈·비중 축소)는 다음 루프 청산 단계가 한다. 추세 전략 모드이거나
+        추세 포지션이 남아 있을 때만(전략을 바꿔도 추세 포지션이 주간 판단 없이 남지 않게). 판단은 판단일 전날까지의
+        확정 종가로만 한다. 한 종목이라도 판단할 수 없으면 정하지 않는다(다음 루프에 다시)."""
+        held = any(p.get("strategy") == STRATEGY_TREND for p in self.positions.values())
+        if not (self.trend_mode or held):
+            return
+        week = trend_week(now)
+        plan = self.risk_state.get("trend_plan")
+        if plan and plan.get("week") == week:
+            return
+        targets = {}
+        for symbol in TREND_SYMBOLS:
+            candles = self.candles(symbol, now)
+            weight = trend_target(candles, week) if candles else None
+            if weight is None:
+                return
+            targets[symbol] = round(weight, 4)
+        self.risk_state["trend_plan"] = {"week": week, "targets": targets, "computed_at": now.isoformat(),
+                                         "entered": [], "trimmed": []}
+        self.store.save("risk_state", self.risk_state)
+        text = ", ".join(f"{s} {w:.0%}" if w else f"{s} 보유 안 함" for s, w in targets.items())
+        self._event("SYSTEM", f"추세 주간 판단({week}): {text}")
+
+    def trend_plan_now(self, now: datetime) -> dict | None:
+        """이번 주 판단(없거나 지난주 것이면 None)."""
+        plan = self.risk_state.get("trend_plan")
+        return plan if plan and plan.get("week") == trend_week(now) else None
+
     # ---- 7단계: 평가액, 낙폭, 일일 손실 ------------------------------------------------
     def _evaluate_equity(self) -> None:
         rs = self.risk_state
@@ -544,13 +586,13 @@ class Engine:
             if daily_return <= -DAILY_KILL_SWITCH_PCT:
                 self._set_halt(DAILY_LOSS, f"일일 손실 {daily_return:.2%}")
         peak, self.drawdown, self.size_multiplier, halted = drawdown_controls(
-            self.equity, rs.get("peak_equity"))
+            self.equity, rs.get("peak_equity"), self.settings.strategy)
         if not halted:
             rs["drawdown_flat_since"] = None
         elif self._drawdown_reset_due(rs):
             # 포지션이 없으면 평가액이 움직이지 않아 회복으로는 영원히 풀리지 않는다 → 고점을 다시 잡는다
             old_peak = peak
-            peak, self.drawdown, self.size_multiplier, halted = drawdown_controls(self.equity, None)
+            peak, self.drawdown, self.size_multiplier, halted = drawdown_controls(self.equity, None, self.settings.strategy)
             self._event("RISK", f"낙폭 중단 자동 해제: 포지션 없이 {DRAWDOWN_AUTO_RESET_DAYS}일 — "
                                 f"고점 {old_peak:.2f} → {peak:.2f} 재설정")
         rs["peak_equity"] = peak
@@ -643,7 +685,8 @@ class Engine:
         open_buys = sum(1 for i in self.intents.values() if i.get("side") == "BUY")
         day_open = rs.get("day_open_equity")
         return {
-            "mode": self.settings.mode, "now": now.isoformat(), "status": status,
+            "mode": self.settings.mode, "strategy": self.settings.strategy, "trend_plan": copy.deepcopy(rs.get("trend_plan")),
+            "now": now.isoformat(), "status": status,
             "entry_allowed": self.entry_allowed(now), "halts": halts,
             "feed_connected": bool(connected), "feed_error": feed_error or "",
             "last_quote_at": (datetime.fromtimestamp(proxy_last.received_at, timezone.utc).isoformat()
@@ -711,7 +754,8 @@ class Engine:
                 "return_pct": (price - buy) / buy * 100 if price and buy else None,
                 "initial_stop": buy * (1 - float(pos["stop_loss_pct"])), "stop_price": float(pos["stop_price"]),
                 "protective": protective, "protective_state": prot.get("state"),
-                "hours_left": max(0.0, MAX_HOLD_HOURS - held), "trailing_active": bool(pos.get("trailing_active")),
+                "hours_left": None if pos.get("strategy") == STRATEGY_TREND else max(0.0, MAX_HOLD_HOURS - held),
+                "trailing_active": bool(pos.get("trailing_active")),
                 "strategy": pos.get("strategy")}
 
     def _returns(self, btc_now: float | None) -> dict:

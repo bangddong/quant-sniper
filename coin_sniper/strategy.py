@@ -7,7 +7,8 @@ from coin_sniper.config import (
     ATR_PERIOD, ATR_STOP_MULTIPLIER, ENTRY_BLACKOUT_MINUTES, MARKET_MA_PERIOD,
     MAX_ENTRY_DAY_RETURN_PCT, MAX_STOP_LOSS_PCT, MAX_TRAIL_GAP_PCT,
     MAX_UPPER_WICK_RATIO, MIN_STOP_LOSS_PCT, MIN_TRAIL_GAP_PCT, RSI_BUY_THRESHOLD,
-    RSI_PERIOD, RSI_RECOVERY_THRESHOLD, SIGNAL_CONFIRMATIONS, VBO_K,
+    RSI_PERIOD, RSI_RECOVERY_THRESHOLD, SIGNAL_CONFIRMATIONS, STRATEGY_TREND, TREND_LOOKBACK_DAYS,
+    TREND_MAX_WEIGHT, TREND_REBALANCE_WEEKDAY, TREND_VOL_TARGET, TREND_VOL_WINDOW_DAYS, VBO_K,
     VOLUME_CONFIRM_MULTIPLIER,
 )
 
@@ -197,3 +198,34 @@ def in_entry_blackout(now: datetime) -> bool:
     now = now.astimezone(timezone.utc)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return now - midnight < timedelta(minutes=ENTRY_BLACKOUT_MINUTES)
+
+
+# ---- 추세 전략 (COIN_STRATEGY=trend) ---------------------------------------------------
+def trend_week(now: datetime) -> str | None:
+    """이번 주 판단일(TREND_REBALANCE_WEEKDAY, UTC) 날짜. 오늘이 판단일 이후면 그 주의 판단일."""
+    today = now.astimezone(timezone.utc).date()
+    return (today - timedelta(days=(today.weekday() - TREND_REBALANCE_WEEKDAY) % 7)).isoformat()
+
+
+def trend_target(candles: list[dict], today: str) -> float | None:
+    """확정 일봉(날짜 < today)만으로 정한 목표 비중. 0이면 보유하지 않는다. 판단할 수 없으면 None.
+    보유 조건: 마지막 확정 종가 > TREND_LOOKBACK_DAYS일 전 종가. 비중 = min(최대, 목표 변동성 / 연환산 변동성)."""
+    done = [c for c in candles if c.get("date", "") < today]
+    need = max(TREND_LOOKBACK_DAYS, TREND_VOL_WINDOW_DAYS) + 1
+    if len(done) < need or done[-1].get("date") != _previous_day(today):
+        return None                                    # 어제 봉이 없다: 모름
+    closes = [float(c["close"]) for c in done]
+    if any(not (x > 0) for x in closes[-need:]):
+        return None
+    if closes[-1] <= closes[-1 - TREND_LOOKBACK_DAYS]:
+        return 0.0
+    rets = [closes[i] / closes[i - 1] - 1 for i in range(len(closes) - TREND_VOL_WINDOW_DAYS, len(closes))]
+    mean = sum(rets) / len(rets)
+    vol = (sum((r - mean) ** 2 for r in rets) / len(rets)) ** 0.5 * 365 ** 0.5
+    if not vol > 0:
+        return None
+    return min(TREND_MAX_WEIGHT, TREND_VOL_TARGET / vol)
+
+
+def _previous_day(today: str) -> str:
+    return (datetime.fromisoformat(today) - timedelta(days=1)).date().isoformat()

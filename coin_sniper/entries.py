@@ -14,8 +14,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from coin_sniper import config
-from coin_sniper.config import MARKET_PROXY_SYMBOL, MAX_POSITIONS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS, SIGNAL_CONFIRMATIONS
-from coin_sniper.risk import account_value, is_tradable_amount, position_open_risk, size_entry
+from coin_sniper.config import (
+    MARKET_PROXY_SYMBOL, MAX_POSITIONS, QUOTE_ASSET, QUOTE_MAX_AGE_SECONDS, SIGNAL_CONFIRMATIONS, STRATEGY_TREND,
+    TREND_STOP_LOSS_PCT, TREND_SYMBOLS,
+)
+from coin_sniper.risk import account_value, is_tradable_amount, position_open_risk, size_entry, size_trend_entry
 from coin_sniper.strategy import confirm_persistent_signals, day_progress, evaluate_signals
 
 SKIP_HELD = "이미 보유 중"
@@ -26,6 +29,7 @@ SKIP_RULE = "종목 규칙 없음"
 SKIP_QUOTE = "실시간 시세 없음"
 SKIP_SIZE = "투자·위험 한도 또는 최소 주문 금액 미달"
 RISK_LOW_USDT = "실제 USDT가 봇 현금보다 적음"
+NO_TREND_PLAN = "이번 주 추세 판단 없음"
 
 
 def _dec(value: float) -> Decimal:
@@ -64,6 +68,9 @@ class EntryManager:
         if e.equity is None or e.cash is None or e.balances is None:
             self.not_evaluated_reason = "평가액·현금·계좌 잔고 모름"
             return                                         # 모르면 평가하지 않는다(end_loop가 초기화)
+        if e.trend_mode:
+            self._run_trend(now)
+            return
         today = now.astimezone(timezone.utc).date().isoformat()
         if not self._live(MARKET_PROXY_SYMBOL, today):
             self.not_evaluated_reason = "시장 프록시 실시간 시세 없음"
@@ -89,6 +96,64 @@ class EntryManager:
             free_usdt -= spent
             if stop:
                 break
+
+    def _run_trend(self, now: datetime) -> None:
+        """추세 전략 진입: 이번 주 판단에서 목표 비중이 있는 종목을 산다. 종목마다 그 주에 한 번만 시도한다
+        (비상 손절로 나간 종목을 같은 주에 다시 사지 않는다). 다른 전략이 이미 보유 중이면 그 포지션이 끝난 뒤 산다.
+        연속 확인은 쓰지 않는다: 판단이 확정 종가로만 정해져 루프마다 바뀌지 않는다."""
+        e = self.e
+        plan = e.trend_plan_now(now)
+        if plan is None:
+            self.not_evaluated_reason = NO_TREND_PLAN
+            return
+        self.evaluated = True
+        wanted = [s for s in TREND_SYMBOLS if float(plan["targets"].get(s, 0)) > 0]
+        self.raw = self.confirmed = len(wanted)
+        free_usdt = float(e.balances.get(QUOTE_ASSET, (0.0, 0.0))[0])
+        for symbol in wanted:
+            if symbol in plan.get("entered", []):
+                continue
+            spent, stop = self._try_trend_entry(symbol, float(plan["targets"][symbol]), plan, free_usdt, now)
+            free_usdt -= spent
+            if stop:
+                break
+
+    def _try_trend_entry(self, symbol: str, weight: float, plan: dict, free_usdt: float,
+                         now: datetime) -> tuple[float, bool]:
+        e = self.e
+        if symbol in e.positions:
+            return self._skip(symbol, SKIP_HELD)
+        if any(i["symbol"] == symbol for i in e.intents.values()):
+            return self._skip(symbol, SKIP_INTENT)
+        rule = e.rules.get(symbol)
+        if rule is None or not rule.trading:
+            return self._skip(symbol, SKIP_RULE)
+        quote = e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
+        if quote is None:
+            return self._skip(symbol, SKIP_QUOTE)
+        if self._unmanaged_tradable(symbol, rule, quote.price):
+            return self._skip(symbol, SKIP_UNMANAGED)
+        bot_cash, _ = account_value(e.risk_state, e.positions, {s: 0.0 for s in e.positions})
+        if free_usdt < bot_cash:
+            e._event("RISK", RISK_LOW_USDT)
+        qty = size_trend_entry(e.equity, min(bot_cash, free_usdt), quote.price, weight, rule)
+        if qty == 0:
+            return self._skip(symbol, SKIP_SIZE)
+        extra = {"stop_loss_pct": TREND_STOP_LOSS_PCT, "trailing_gap_pct": 0.0, "strategy": STRATEGY_TREND,
+                 "target_weight": weight}
+        plan.setdefault("entered", []).append(symbol)      # 보내기 전에 저장: 결과와 상관없이 그 주에는 다시 사지 않는다
+        e.store.save("risk_state", e.risk_state)
+        outcome = e.executor.execute_market(symbol, "BUY", qty, "entry", STRATEGY_TREND, now,
+                                            ref_price=quote.price, extra=extra)
+        if outcome.status in ("filled", "partial"):
+            pos = e.positions.get(symbol)
+            if pos is None:
+                return 0.0, True
+            self._protect(symbol, rule, pos, quote.price, now)
+            return float(pos["cost"]), False
+        if outcome.status == "rejected":
+            return 0.0, False
+        return 0.0, True
 
     def _live(self, symbol: str, today: str) -> bool:
         quote = self.e.feed.quote(symbol, QUOTE_MAX_AGE_SECONDS)
