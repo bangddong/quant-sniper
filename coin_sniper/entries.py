@@ -77,7 +77,8 @@ class EntryManager:
             candles = e.candles(symbol, now)
             if candles:
                 candles_by_symbol[symbol] = candles
-        signals = evaluate_signals(candles_by_symbol, market, day_progress(now))
+        signals = evaluate_signals(candles_by_symbol, market, day_progress(now),
+                                   require_favorable_market=not e.settings.demo_ignore_market_filter)
         confirmed, self.confirmations = confirm_persistent_signals(
             signals, self.confirmations, SIGNAL_CONFIRMATIONS)
         self.evaluated = True                              # 확인까지 끝난 루프만 평가한 루프다

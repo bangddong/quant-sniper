@@ -72,6 +72,8 @@ class Settings:
     starting_capital: float
     auto_git_push: bool
     dashboard_branch: str = DASHBOARD_BRANCH
+    # 데모 전용: BTC 시장 필터를 건너뛴다. 수익 검증이 아니라 하락장에서도 주문·청산 흐름을 실제로 돌려 보기 위한 것.
+    demo_ignore_market_filter: bool = False
 
     def require_keys(self) -> None:
         for value in (self.api_key, self.api_secret):
@@ -91,6 +93,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     if mode == "live" and not _flag(env.get("COIN_LIVE_TRADING_ENABLED", "false")):
         raise SettingsError("live 모드는 COIN_LIVE_TRADING_ENABLED=true 가 필요합니다 "
                             "(주식 봇의 LIVE_TRADING_ENABLED는 코인 봇에 쓰이지 않습니다)")
+    ignore_market = _flag(env.get("COIN_DEMO_IGNORE_MARKET_FILTER", "false"))
+    if ignore_market and mode != "demo":
+        raise SettingsError("COIN_DEMO_IGNORE_MARKET_FILTER 는 demo 모드에서만 쓸 수 있습니다")
     prefix = f"BINANCE_{mode.upper()}"
     rest_base, stream_base = _ENDPOINTS[mode]
     try:
@@ -107,4 +112,5 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         starting_capital=capital,
         auto_git_push=_flag(env.get("AUTO_GIT_PUSH", "false")),
         dashboard_branch=env.get("COIN_DASHBOARD_BRANCH", "").strip() or DASHBOARD_BRANCH,
+        demo_ignore_market_filter=ignore_market,
     )

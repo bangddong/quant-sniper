@@ -77,10 +77,11 @@ def _risk_fields(atr: float, entry_price: float) -> tuple[float, float]:
 
 
 def evaluate_signals(candles_by_symbol: dict[str, list[dict]], market_candles: list[dict],
-                     day_progress: float) -> list[dict]:
-    """전 종목 일봉을 분석해 매수 신호를 score 오름차순(RSI 우선)으로 반환한다."""
+                     day_progress: float, require_favorable_market: bool = True) -> list[dict]:
+    """전 종목 일봉을 분석해 매수 신호를 score 오름차순(RSI 우선)으로 반환한다.
+    require_favorable_market=False 는 데모 전용 설정(COIN_DEMO_IGNORE_MARKET_FILTER)에서만 쓴다."""
     candidates: list[dict] = []
-    if not is_favorable_market(market_candles):
+    if require_favorable_market and not is_favorable_market(market_candles):
         return candidates
 
     for symbol, candles in candles_by_symbol.items():

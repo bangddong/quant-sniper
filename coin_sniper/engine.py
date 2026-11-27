@@ -119,6 +119,9 @@ class Engine:
         self.events = s.load("events", [])
         self.equity_history = s.load("equity_history", [])
         self.halts = HaltBoard.from_dict(s.load("halts", {}))
+        if self.settings.demo_ignore_market_filter:      # live에서는 load_settings가 거부한다
+            self._now = now
+            self._event("SYSTEM", "데모 설정: BTC 시장 필터 꺼짐 — 하락장에서도 진입한다(수익 검증용 아님)")
         if self.halts.is_set(FATAL):                       # 사람이 원인을 고치고 재시작했다(7.4). 남아 있으면 첫 호출에서 다시 걸린다
             self._now = now
             self.halts.clear(FATAL)

@@ -43,6 +43,14 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(SettingsError):
             cfg.require_keys()
 
+    def test_market_filter_bypass_is_off_by_default_and_demo_only(self):
+        self.assertFalse(load_settings({}).demo_ignore_market_filter)
+        self.assertTrue(load_settings({"COIN_DEMO_IGNORE_MARKET_FILTER": "true"}).demo_ignore_market_filter)
+        with self.assertRaises(SettingsError) as ctx:          # 실거래에서는 켤 수 없다(조용히 무시하지 않고 시작을 거부)
+            load_settings({"MODE": "live", "COIN_LIVE_TRADING_ENABLED": "true",
+                           "COIN_DEMO_IGNORE_MARKET_FILTER": "true"})
+        self.assertIn("COIN_DEMO_IGNORE_MARKET_FILTER", str(ctx.exception))
+
     def test_unknown_mode_rejected(self):
         with self.assertRaises(SettingsError):
             load_settings({"MODE": "paper"})

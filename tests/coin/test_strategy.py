@@ -73,6 +73,12 @@ class StrategyTests(unittest.TestCase):
         falling = [candle(200 - i) for i in range(70)]
         self.assertEqual(evaluate_signals({"CCCUSDT": candles}, falling, 1.0), [])
 
+    def test_market_filter_can_be_skipped(self):
+        falling = [candle(200 - i) for i in range(70)]
+        self.assertEqual(evaluate_signals({"BBBUSDT": vbo_candles()}, falling, 1.0), [])
+        signals = evaluate_signals({"BBBUSDT": vbo_candles()}, falling, 1.0, require_favorable_market=False)
+        self.assertEqual([s["strategy"] for s in signals], ["vbo"])
+
     def test_stop_and_trail_clamped_to_coin_ranges(self):
         low_vol = vbo_candles(half_spread=0.5)
         sig = evaluate_signals({"LOWUSDT": low_vol}, rising_market(), 1.0)[0]

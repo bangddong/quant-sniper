@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -70,6 +71,23 @@ class EngineEntryTests(unittest.TestCase):
         self.assertEqual(buys[0]["symbol"], SYM)
         self.assertIn(SYM, store.load("positions", {}))
         self.assertEqual(len(events(r, "BUY", SYM)), 1)
+
+    def test_falling_market_blocks_entries_unless_demo_bypass(self):
+        for bypass, expected in ((False, 0), (True, 1)):
+            with self.subTest(bypass=bypass):
+                eng, ex, feed, store = make_engine(test=self)
+                set_signal(ex, feed, SYM)
+                ex.set_candles("BTCUSDT", trending_candles(70, 120000.0, -400.0))   # 하락하는 60일선 아래
+                eng.settings = dataclasses.replace(eng.settings, demo_ignore_market_filter=bypass)
+                eng.startup(T0)
+                self.loops(eng, 0, 3)
+                self.assertEqual(len(calls(ex, "market_buy")), expected)
+
+    def test_demo_bypass_announced_at_startup(self):
+        eng, ex, feed, store = make_engine(test=self)
+        eng.settings = dataclasses.replace(eng.settings, demo_ignore_market_filter=True)
+        eng.startup(T0)
+        self.assertTrue(any("시장 필터" in e["reason"] for e in eng.events if e["type"] == "SYSTEM"))
 
     def test_confirmations_reset_when_loop_not_evaluated(self):
         eng, ex, feed, store = self.build()
@@ -267,8 +285,8 @@ class EngineEntryTests(unittest.TestCase):
         from coin_sniper import entries
         real = entries.evaluate_signals
 
-        def doubled(*args):
-            out = real(*args)
+        def doubled(*args, **kwargs):
+            out = real(*args, **kwargs)
             for sig in out:
                 sig["entry_price"] *= 2                     # 캔들 종가가 아니라 실시간 시세로 정해야 한다
             return out
