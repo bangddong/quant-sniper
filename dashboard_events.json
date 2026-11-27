@@ -1,0 +1,141 @@
+[
+  {
+    "type": "RISK",
+    "symbol": "",
+    "reason": "BTCUSDT 시세 없음",
+    "timestamp": "2026-11-27T00:48:36+00:00",
+    "count": 4
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-25T04:23:08+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-26T00:32:19+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-26T01:03:57+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "데모 설정: BTC 시장 필터 꺼짐 — 하락장에서도 진입한다(수익 검증용 아님)",
+    "timestamp": "2026-11-27T00:48:36+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-27T00:49:06+00:00",
+    "count": 1
+  },
+  {
+    "type": "BUY",
+    "symbol": "BTCUSDT",
+    "reason": "rsi_recovery",
+    "timestamp": "2026-11-27T02:27:38+00:00",
+    "qty": 0.00145,
+    "price": 61593.54,
+    "count": 1
+  },
+  {
+    "type": "BUY",
+    "symbol": "ETHUSDT",
+    "reason": "rsi_recovery",
+    "timestamp": "2026-11-27T02:27:38+00:00",
+    "qty": 0.0423,
+    "price": 1730.0800000000002,
+    "count": 1
+  },
+  {
+    "type": "SKIP",
+    "symbol": "BTCUSDT",
+    "reason": "이미 보유 중",
+    "timestamp": "2026-11-27T02:31:38+00:00",
+    "count": 1
+  },
+  {
+    "type": "BUY",
+    "symbol": "BNBUSDT",
+    "reason": "rsi_recovery",
+    "timestamp": "2026-11-27T02:31:38+00:00",
+    "qty": 0.13689725,
+    "price": 563.25,
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "전략: 추세(BTC·ETH 주간 판단) — 기존 돌파 전략 포지션은 원래 규칙대로 청산한다",
+    "timestamp": "2026-11-27T04:37:45+00:00",
+    "count": 1
+  },
+  {
+    "type": "RISK",
+    "symbol": "BNBUSDT",
+    "reason": "실시간 시세 없음: 청산 판단 보류",
+    "timestamp": "2026-11-27T05:51:17+00:00",
+    "count": 2
+  },
+  {
+    "type": "RISK",
+    "symbol": "BTCUSDT",
+    "reason": "실시간 시세 없음: 청산 판단 보류",
+    "timestamp": "2026-11-27T05:51:17+00:00",
+    "count": 2
+  },
+  {
+    "type": "RISK",
+    "symbol": "ETHUSDT",
+    "reason": "실시간 시세 없음: 청산 판단 보류",
+    "timestamp": "2026-11-27T05:51:17+00:00",
+    "count": 2
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "추세 주간 판단(2026-11-23): BTCUSDT 보유 안 함, ETHUSDT 보유 안 함",
+    "timestamp": "2026-11-27T04:37:45+00:00",
+    "count": 1
+  },
+  {
+    "type": "RISK",
+    "symbol": "",
+    "reason": "BTCUSDT 시세 없음; 보유 종목 시세 없음: BTCUSDT, ETHUSDT, BNBUSDT",
+    "timestamp": "2026-11-27T05:51:17+00:00",
+    "count": 2
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-27T04:38:15+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "전략: 추세(BTC·ETH 주간 판단) — 기존 돌파 전략 포지션은 원래 규칙대로 청산한다",
+    "timestamp": "2026-11-27T05:51:17+00:00",
+    "count": 1
+  },
+  {
+    "type": "SYSTEM",
+    "symbol": "",
+    "reason": "중단 해제: feed_stale",
+    "timestamp": "2026-11-27T05:51:47+00:00",
+    "count": 1
+  }
+]

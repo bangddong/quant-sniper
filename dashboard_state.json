@@ -1,0 +1,270 @@
+{
+  "mode": "demo",
+  "strategy": "trend",
+  "trend_plan": {
+    "week": "2026-11-23",
+    "targets": {
+      "BTCUSDT": 0.0,
+      "ETHUSDT": 0.0
+    },
+    "computed_at": "2026-11-27T04:37:45.839327+00:00",
+    "entered": [],
+    "trimmed": []
+  },
+  "now": "2026-11-27T05:51:47.940756+00:00",
+  "status": "running",
+  "entry_allowed": false,
+  "halts": [],
+  "feed_connected": true,
+  "feed_error": "",
+  "last_quote_at": "2026-11-27T05:51:48.071898+00:00",
+  "last_account_sync": "2026-11-27T05:51:47.940756+00:00",
+  "last_loop_at": "2026-11-27T05:51:47.940756+00:00",
+  "commit": "8c7cd65",
+  "universe_date": "2026-11-27",
+  "universe": [
+    {
+      "symbol": "BTCUSDT",
+      "price": 61720.52,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "이미 보유 중"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "price": 1741.05,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "이미 보유 중"
+    },
+    {
+      "symbol": "ZECUSDT",
+      "price": 760.32,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "SOLUSDT",
+      "price": 73.15,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "XRPUSDT",
+      "price": 0.9698,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "NEARUSDT",
+      "price": 3.121,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "BNBUSDT",
+      "price": 566.39,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "이미 보유 중"
+    },
+    {
+      "symbol": "MMTUSDT",
+      "price": 0.1845,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "INITUSDT",
+      "price": 0.13339,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "PEPEUSDT",
+      "price": 3.59e-06,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    },
+    {
+      "symbol": "SUIUSDT",
+      "price": 0.6864,
+      "max_qty": 0.0,
+      "eligible": false,
+      "reason": "투자·위험 한도 또는 최소 주문 금액 미달 (손절폭 4% 가정)"
+    }
+  ],
+  "signal_progress": [],
+  "entries_not_evaluated_reason": "진입 허용 조건 미충족",
+  "equity": 1000.89824333,
+  "cash": 760.2198409,
+  "starting_capital": 1000.0,
+  "drawdown_pct": 0.08265322,
+  "daily_return_pct": 0.08982433,
+  "size_multiplier": 1.0,
+  "open_risk_pct": 1.99690549,
+  "free_slots": 0,
+  "positions": [
+    {
+      "symbol": "BTCUSDT",
+      "qty": 0.00145,
+      "buy_price": 61593.54,
+      "price": 61720.52,
+      "return_pct": 0.20615798,
+      "initial_stop": 56776.925172,
+      "stop_price": 56776.925172,
+      "protective": "on",
+      "protective_state": "open",
+      "hours_left": 164.59725818,
+      "trailing_active": false,
+      "strategy": "rsi_recovery"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "qty": 0.0423,
+      "buy_price": 1730.08,
+      "price": 1741.05,
+      "return_pct": 0.63407472,
+      "initial_stop": 1564.684352,
+      "stop_price": 1564.684352,
+      "protective": "on",
+      "protective_state": "open",
+      "hours_left": 164.59725818,
+      "trailing_active": false,
+      "strategy": "rsi_recovery"
+    },
+    {
+      "symbol": "BNBUSDT",
+      "qty": 0.13689725,
+      "buy_price": 563.25,
+      "price": 566.39,
+      "return_pct": 0.55747892,
+      "initial_stop": 519.372825,
+      "stop_price": 519.372825,
+      "protective": "on",
+      "protective_state": "open",
+      "hours_left": 164.66393925,
+      "trailing_active": false,
+      "strategy": "rsi_recovery"
+    }
+  ],
+  "unmanaged_assets": [
+    "USDC"
+  ],
+  "protective_stops_enabled": true,
+  "metrics": {
+    "24h": {
+      "api_total": 2346,
+      "api_failed": 0,
+      "api_fail_rate": 0.0,
+      "api_transient": 0,
+      "api_permanent": 0,
+      "orders_sent": 3,
+      "orders_rejected": 0,
+      "orders_unconfirmed": 0,
+      "orders_partial": 0,
+      "feed_reconnects": 0,
+      "feed_down_seconds": 143.304168,
+      "halt_seconds": {
+        "feed_stale": 90.021279
+      },
+      "offline_seconds": 0,
+      "loops_ok": 703,
+      "loops_failed": 0,
+      "uptime_pct": 99.92,
+      "restarts": 3
+    },
+    "7d": {
+      "api_total": 9124,
+      "api_failed": 0,
+      "api_fail_rate": 0.0,
+      "api_transient": 0,
+      "api_permanent": 0,
+      "orders_sent": 3,
+      "orders_rejected": 0,
+      "orders_unconfirmed": 0,
+      "orders_partial": 0,
+      "feed_reconnects": 0,
+      "feed_down_seconds": 360.431609,
+      "halt_seconds": {
+        "feed_stale": 180.05153
+      },
+      "offline_seconds": 0,
+      "loops_ok": 5967,
+      "loops_failed": 0,
+      "uptime_pct": 92.32,
+      "restarts": 9
+    },
+    "all": {
+      "api_total": 9124,
+      "api_failed": 0,
+      "api_fail_rate": 0.0,
+      "api_transient": 0,
+      "api_permanent": 0,
+      "orders_sent": 3,
+      "orders_rejected": 0,
+      "orders_unconfirmed": 0,
+      "orders_partial": 0,
+      "feed_reconnects": 0,
+      "feed_down_seconds": 360.431609,
+      "halt_seconds": {
+        "feed_stale": 180.05153
+      },
+      "offline_seconds": 0,
+      "loops_ok": 5967,
+      "loops_failed": 0,
+      "uptime_pct": 92.32,
+      "restarts": 9
+    }
+  },
+  "returns": {
+    "1d": {
+      "bot": 0.09,
+      "btc": 1.88,
+      "base_day": "2026-11-26"
+    },
+    "7d": {
+      "bot": null,
+      "btc": null,
+      "base_day": null
+    },
+    "30d": {
+      "bot": null,
+      "btc": null,
+      "base_day": null
+    },
+    "all": {
+      "bot": 0.09,
+      "btc": 2.09,
+      "base_day": "2026-11-25"
+    },
+    "start": {
+      "bot": 0.08982433,
+      "btc": null,
+      "base_day": "2026-11-25",
+      "kind": "initial"
+    }
+  },
+  "weekly_equity": [],
+  "performance_stats": {
+    "closed": 0,
+    "win_rate": null,
+    "avg_win_pct": null,
+    "avg_loss_pct": null,
+    "profit_factor": null,
+    "max_loss_streak": 0,
+    "total_net_pnl": 0,
+    "total_fees_usdt": 0.17976604,
+    "fees_unpriced_assets": [],
+    "avg_slippage_pct": -0.00058638,
+    "max_drawdown_pct": 0.0,
+    "by_strategy": {}
+  }
+}
