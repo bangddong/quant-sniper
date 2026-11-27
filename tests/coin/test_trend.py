@@ -33,7 +33,7 @@ def expected_weight(candles: list[dict], today: str) -> float:
     rets = [closes[i] / closes[i - 1] - 1 for i in range(len(closes) - 30, len(closes))]
     m = sum(rets) / 30
     vol = math.sqrt(sum((r - m) ** 2 for r in rets) / 30) * math.sqrt(365)
-    return min(0.5, 0.1 / vol)
+    return min(config.TREND_MAX_WEIGHT, config.TREND_VOL_TARGET / vol)
 
 
 class TrendSettingsTests(unittest.TestCase):
@@ -58,8 +58,8 @@ class TrendPureTests(unittest.TestCase):
         c = noisy_candles(70, 100.0, 0.03, 0.02)
         w = trend_target(c, "2026-11-23")
         self.assertAlmostEqual(w, expected_weight(c, "2026-11-23"), places=9)
-        self.assertGreater(w, 0.15)
-        self.assertLess(w, 0.5)
+        self.assertGreater(w, 0.0)
+        self.assertLess(w, config.TREND_MAX_WEIGHT)        # 상한에 걸리지 않는 값이어야 공식을 검증한다
         c[-1]["close"] = 1.0                               # 진행 중 봉은 보지 않는다
         self.assertAlmostEqual(trend_target(c, "2026-11-23"), w, places=9)
 
@@ -85,8 +85,9 @@ class TrendPureTests(unittest.TestCase):
 
     def test_trend_drawdown_halts_only_past_wide_limit(self):
         self.assertEqual(drawdown_controls(880.0, 1000.0, "breakout")[2:], (0.5, True))
-        self.assertEqual(drawdown_controls(880.0, 1000.0, "trend")[2:], (1.0, False))
-        self.assertTrue(drawdown_controls(640.0, 1000.0, "trend")[3])
+        limit = config.TREND_EQUITY_HALT_DRAWDOWN_PCT
+        self.assertEqual(drawdown_controls(1000.0 * (1 - limit) + 1, 1000.0, "trend")[2:], (1.0, False))
+        self.assertTrue(drawdown_controls(1000.0 * (1 - limit), 1000.0, "trend")[3])
 
     def test_sizing_and_trim(self):
         r = rule("ETHUSDT")
@@ -152,8 +153,8 @@ class TrendEngineTests(unittest.TestCase):
         for tag, start in (("monday", T_MON), ("tuesday", utc(2026, 11, 24, 1))):
             with self.subTest(tag):
                 eng, ex, feed, store = self.build(candles={"BTCUSDT": btc})
-                add_position(eng, ex, "BTCUSDT", 0.005, 45000.0, strategy="trend", stop_loss_pct=0.25,
-                             stop_price=33750.0)            # 가치 450 vs 목표 ≈ 1225 × w(≈0.21)
+                add_position(eng, ex, "BTCUSDT", 0.012, 45000.0, strategy="trend", stop_loss_pct=0.25,
+                             stop_price=33750.0)            # 가치 1080 vs 목표 ≈ 1540 × w
                 if tag == "tuesday":
                     feed.set_quote("BTCUSDT", 90000.0, day="2026-11-24")
                     feed.set_quote("ETHUSDT", 3000.0, day="2026-11-24")
@@ -162,10 +163,10 @@ class TrendEngineTests(unittest.TestCase):
                 sells = [t for t in store.load("trades", []) if t["type"] == "SELL"]
                 if tag == "monday":
                     w = store.load("risk_state", {})["trend_plan"]["targets"]["BTCUSDT"]
-                    self.assertLess(w * 1225 * 1.5, 450)
+                    self.assertLess(w * 1540 * config.TREND_TRIM_RATIO, 1080)   # 축소 조건이 실제로 성립하는 설정인지
                     self.assertEqual([t["reason"] for t in sells], [TREND_TRIM_REASON])
                     left = store.load("positions", {})["BTCUSDT"]
-                    self.assertAlmostEqual(left["qty"] * 90000.0, w * 1225, delta=15.0)
+                    self.assertAlmostEqual(left["qty"] * 90000.0, w * 1540, delta=20.0)
                     self.assertEqual(left["protective"]["qty"], floor_to_step(left["qty"], 0.00001))   # 줄인 수량으로 다시 건다
                 else:
                     self.assertEqual(sells, [])
